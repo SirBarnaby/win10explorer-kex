@@ -2,7 +2,7 @@
 // Half-screen arithmetic and eligibility approach adapted from RectangleWin:
 // Copyright 2022 Ahmet Alp Balkan, Apache-2.0. See vendor/rectanglewin-reference.
 // RectangleWin's eligibility filter cites Microsoft PowerToys, MIT licensed.
-// The state machine, frame compensation, tray and verification below are new.
+// The state machine, frame compensation and verification below are new.
 #include "Patch.h"
 #ifndef UNICODE
 #define UNICODE
@@ -27,18 +27,12 @@
 namespace {
 constexpr const wchar_t* kClass = patch::SnapWindowClass;
 constexpr wchar_t kTestClass[] = L"Win10NativePatch.NativeSnap.Test.v1";
-constexpr UINT kTrayMessage = WM_APP + 11;
-constexpr UINT kTrayId = 1;
-constexpr UINT kPause = 101, kHelp = 102, kExit = 103, kOptions=104, kGestures=105;
 enum class Action { Left, Right, Up, Down };
-struct State { DWORD pid{}; RECT last{}; SIZE restore{}; int side{}, row{}; bool maximized{}, captureOnRestore{}; };
+struct State { DWORD pid{}; RECT last{}; int side{}; bool maximized{}; };
 struct Bounds { RECT outer{}, frame{}, work{}, monitor{}; HMONITOR display{}; };
 std::map<HWND, State> states;
 HWND mainWindow{};
-NOTIFYICONDATA tray{sizeof(tray)};
-UINT taskbarCreated{};
-unsigned trayRetries{};
-bool paused = false, registered = false, arranging = false;
+bool arranging = false;
 bool reloadingKeys=false;
 struct Binding {int id;DWORD modifiers,key;Action action;};
 std::vector<Binding> activeBindings;
@@ -151,22 +145,6 @@ bool Restore(HWND h) {
     }
     return true;
 }
-SIZE RestoreSize(HWND h, const Bounds& b, bool tiled) {
-    long width=Width(b.frame), height=Height(b.frame);
-    if (IsZoomed(h) || tiled) {
-        WINDOWPLACEMENT placement{sizeof(placement)};
-        if (GetWindowPlacement(h,&placement)) {
-            width=Width(placement.rcNormalPosition)-(Width(b.outer)-Width(b.frame));
-            height=Height(placement.rcNormalPosition)-(Height(b.outer)-Height(b.frame));
-        }
-    }
-    // An external snap may have overwritten its normal rect; use a useful floating size.
-    if (width<100 || width>Width(b.work)*85/100 || height<80 || height>Height(b.work)*85/100 ||
-        (tiled && abs(width-Width(b.work)/2)<5 && (abs(height-Height(b.work))<5||abs(height-Height(b.work)/2)<5))) {
-        width=Width(b.work)*7/10; height=Height(b.work)*7/10;
-    }
-    return SIZE{width,height};
-}
 bool MoveFrame(HWND h, RECT wanted, Bounds& actual) {
     if (!Restore(h) || !ReadBounds(h,actual)) return false;
     SIZE minimum;
@@ -220,33 +198,16 @@ bool Apply(HWND h, Action action, bool test=false) {
         found->second.maximized!=!!IsZoomed(h) || !Near(found->second.last,b.frame))) {
         states.erase(found); found=states.end();
     }
-    if (found==states.end()) {
-        State s; s.pid=pid; s.last=b.frame; s.restore=RestoreSize(h,b,side!=0);
-        s.captureOnRestore=IsZoomed(h)||(isWindowArranged&&isWindowArranged(h));
-        s.side=side;s.row=row;s.maximized=IsZoomed(h);states[h]=s;
-    } else if (!side) {side=found->second.side;row=found->second.row;}
-    State& s=states[h];
-    if (action==Action::Up && side==0) {
-        if (!(GetWindowLongPtr(h,GWL_STYLE)&WS_MAXIMIZEBOX)) return false;
-        if (!IsZoomed(h)) ShowWindowAsync(h,SW_MAXIMIZE);
-        if (!WaitState(h,true) || !ReadBounds(h,b)) return false;
-        s.maximized=true;s.side=0;s.row=0;s.last=b.frame;return true;
-    }
-    // A window first seen maximized/native-snapped has different non-client
-    // margins. Measure its real restored frame rather than subtracting those
-    // maximized margins from WINDOWPLACEMENT's normal outer rectangle.
-    if (s.captureOnRestore) {
-        if (!Restore(h)||!ReadBounds(h,b)) return false;
-        s.restore=RestoreSize(h,b,false);s.captureOnRestore=false;
-    }
+    if (found!=states.end() && !side) side=found->second.side;
     bool vertical=action==Action::Up||action==Action::Down;
-    bool center=(vertical&&side==0)||(action==Action::Right&&side<0)||(action==Action::Left&&side>0);
-    int targetSide=center?0:vertical?side:(action==Action::Left?-1:1);
-    int targetRow=center?0:vertical?(action==Action::Up?-1:1):row;
-    RECT target=center?Center(b.work,s.restore):targetRow?Quarter(b.work,targetSide>0,targetRow>0):Half(b.work,targetSide>0);
+    // Vertical gestures only refine an existing side; they do not choose a side,
+    // restore to the centre, maximize, or minimize a floating window.
+    if (vertical && !side) return true;
+    int targetSide=vertical?side:(action==Action::Left?-1:1);
+    int targetRow=vertical?(action==Action::Up?-1:1):0;
+    RECT target=targetRow?Quarter(b.work,targetSide>0,targetRow>0):Half(b.work,targetSide>0);
     if (!MoveFrame(h,target,b)) return false;
-    s.side=targetSide;s.row=targetRow;s.maximized=false;s.last=b.frame;
-    // Keep original dimensions, including across repeated Down and maximize/restore.
+    State& s=states[h];s.pid=pid;s.side=targetSide;s.maximized=false;s.last=b.frame;
     for (auto i=states.begin();i!=states.end();) {
         if (!IsWindow(i->first)) i=states.erase(i); else ++i;
     }
@@ -269,7 +230,7 @@ void Output(const std::string& text) {
 std::vector<Binding> RequestedBindings(const patch::Config& config,bool privateActive) {
     std::vector<Binding> result;constexpr Action actions[]={Action::Left,Action::Up,Action::Right,Action::Down};
     if(privateActive)for(int i=0;i<4;i++)result.push_back({101+i,patch::GestureModifiers,patch::GestureKeys[i],actions[i]});
-    if((config.flags&patch::KeyboardShortcuts)&&!paused)for(int i=0;i<4;i++)result.push_back({201+i,config.keyboardModifiers,config.keyboardKeys[i],actions[i]});
+    if(config.flags&patch::KeyboardShortcuts)for(int i=0;i<4;i++)result.push_back({201+i,config.keyboardModifiers,config.keyboardKeys[i],actions[i]});
     return result;
 }
 bool RegisterSet(HWND h,const std::vector<Binding>& keys) {
@@ -279,7 +240,7 @@ bool RegisterSet(HWND h,const std::vector<Binding>& keys) {
 }
 void PublishInputs(HWND h) {
     DWORD inputs=0;
-    if(!paused)for(const auto& b:activeBindings) {
+    for(const auto& b:activeBindings) {
         if(b.id>=201)inputs|=patch::KeyboardShortcuts;
         else if(activeConfig.flags&patch::TouchpadGestures)inputs|=patch::TouchpadGestures;
     }
@@ -291,17 +252,17 @@ bool RegisterKeys(HWND h,bool silent=false) {
     auto config=patch::LoadConfig();auto status=patch::ReadGestureStatus();auto wanted=RequestedBindings(config,status.privateBindingsActive);
     auto before=activeBindings;for(const auto& b:before)UnregisterHotKey(h,b.id);
     if(!RegisterSet(h,wanted)) {
-        bool recovered=RegisterSet(h,before);activeBindings=recovered?before:std::vector<Binding>{};registered=!activeBindings.empty();
+        bool recovered=RegisterSet(h,before);activeBindings=recovered?before:std::vector<Binding>{};
         PublishInputs(h);
         lastError=recovered?L"A snapping shortcut is already in use. The previous working shortcuts were kept. Choose another combination in Options.":L"A snapping shortcut is already in use, and the previous shortcuts could not be restored. Review the conflicting shortcut utility in Options.";
         if(!silent)MessageBoxW(h,lastError.c_str(),L"Native Snap",MB_ICONERROR|MB_OK);
         return false;
     }
-    activeBindings=std::move(wanted);activeConfig=config;registered=!activeBindings.empty();PublishInputs(h);return true;
+    activeBindings=std::move(wanted);activeConfig=config;PublishInputs(h);return true;
 }
 void UnregisterKeys(HWND h) {
     RemovePropW(h,L"Win10NativePatch.ActiveInputs.v2");
-    for(const auto& b:activeBindings)UnregisterHotKey(h,b.id);activeBindings.clear();registered=false;
+    for(const auto& b:activeBindings)UnregisterHotKey(h,b.id);activeBindings.clear();
 }
 void RemoveIdleStartup() {
     // Only remove our exact native command; never touch the v1 migration route
@@ -312,46 +273,16 @@ void RemoveIdleStartup() {
     if(RegQueryValueExW(key,L"Win10NativePatch.NativeSnap.v2",nullptr,&type,reinterpret_cast<BYTE*>(command),&size)==ERROR_SUCCESS&&type==REG_SZ&&size>=sizeof(wchar_t)&&command[size/sizeof(wchar_t)-1]==0&&!_wcsicmp(command,expected.c_str()))RegDeleteValueW(key,L"Win10NativePatch.NativeSnap.v2");
     RegCloseKey(key);
 }
-void Tray(bool add) {
-    tray.hWnd=mainWindow; tray.uID=kTrayId;
-    tray.uFlags=NIF_MESSAGE|NIF_ICON|NIF_TIP;
-    tray.uCallbackMessage=kTrayMessage;
-    tray.hIcon=static_cast<HICON>(LoadImage(GetModuleHandle(nullptr),MAKEINTRESOURCE(paused?102:101),IMAGE_ICON,
-        GetSystemMetrics(SM_CXSMICON),GetSystemMetrics(SM_CYSMICON),LR_SHARED));
-    lstrcpyn(tray.szTip,paused?L"Native Snap — paused":!(activeConfig.flags&DWORD(patch::TouchpadGestures|patch::KeyboardShortcuts))?L"Native Snap — restoring Windows gestures":L"Native Snap — active",128);
-    bool success=Shell_NotifyIcon(add?NIM_ADD:NIM_MODIFY,&tray)!=FALSE;
-    if (add && success) {tray.uVersion=NOTIFYICON_VERSION_4; Shell_NotifyIcon(NIM_SETVERSION,&tray);}
-    if(success){trayRetries=0;KillTimer(mainWindow,1);}
-    else if(++trayRetries<=3)SetTimer(mainWindow,1,5000,nullptr);
-    else {KillTimer(mainWindow,1);patch::Log(L"NativeSnap",L"Tray icon registration is unavailable; waiting for the next taskbar-created event.");}
-}
-void Help(HWND h) {
-    MessageBox(h,L"Native Snap\n\nLeft / Right: snap to that half. Repeating stays there.\nFrom a side, Up / Down chooses that top / bottom corner.\nRepeating Down keeps the bottom corner visible.\nThe opposite horizontal direction restores a centered floating window.\nFrom a floating window, Up maximizes; Down restores and centers.\nDown never minimizes.\n\nThree-finger gestures and optional keyboard shortcuts are independent. Open Options to change them. The ordinary Windows + Arrow shortcuts stay unchanged.\n\nPause suspends snapping. Turn touchpad gestures off in Options to restore your previous Windows assignments.",
-        L"Native Snap",MB_OK|MB_ICONINFORMATION);
-}
-void Menu(HWND h) {
-    HMENU menu=CreatePopupMenu();
-    AppendMenu(menu,MF_STRING,kOptions,L"Options...");
-    AppendMenu(menu,MF_STRING|((activeConfig.flags&patch::TouchpadGestures)?MF_CHECKED:0),kGestures,L"Three-finger snapping");
-    AppendMenu(menu,MF_STRING,kPause,paused?L"Resume snapping":L"Pause snapping");
-    AppendMenu(menu,MF_STRING,kHelp,L"How to use Native Snap");
-    AppendMenu(menu,MF_SEPARATOR,0,nullptr);AppendMenu(menu,MF_STRING,kExit,L"Turn off snapping");
-    POINT p; GetCursorPos(&p); SetForegroundWindow(h);
-    UINT command=TrackPopupMenu(menu,TPM_RETURNCMD|TPM_RIGHTBUTTON,p.x,p.y,0,h,nullptr);
-    DestroyMenu(menu); PostMessage(h,WM_NULL,0,0);
-    if (command) SendMessage(h,WM_COMMAND,command,0);
-}
 LRESULT CALLBACK WindowProc(HWND h, UINT message, WPARAM w, LPARAM l) {
-    if (message==taskbarCreated && taskbarCreated) {trayRetries=0;Tray(true);return 0;}
     if(message==patch::SettingsChangedMessage()) {
         if(arranging||reloadingKeys)return 2; // Busy, retry without changing the request.
-        bool ok=RegisterKeys(h,true);Tray(false);
+        bool ok=RegisterKeys(h,true);
         if(ok&&activeBindings.empty()&&!(activeConfig.flags&patch::KeyboardShortcuts)){RemoveIdleStartup();PostMessageW(h,WM_CLOSE,0,0);}
         return ok?1:0;
     }
     switch(message) {
     case WM_HOTKEY:
-        if (!paused && !arranging) {
+        if (!arranging) {
             auto binding=std::find_if(activeBindings.begin(),activeBindings.end(),[&](const Binding& b){return b.id==static_cast<int>(w);});
             if(binding==activeBindings.end())return 0;Action action=binding->action;
             if(binding->id<201&&!(activeConfig.flags&patch::TouchpadGestures))return 0;
@@ -360,30 +291,9 @@ LRESULT CALLBACK WindowProc(HWND h, UINT message, WPARAM w, LPARAM l) {
             arranging=false;
         }
         return 0;
-    case kTrayMessage:
-        if (LOWORD(l)==WM_CONTEXTMENU || LOWORD(l)==WM_RBUTTONUP || LOWORD(l)==NIN_SELECT || LOWORD(l)==NIN_KEYSELECT) Menu(h);
-        else if (LOWORD(l)==WM_LBUTTONDBLCLK) Help(h);
-        return 0;
-    case WM_COMMAND:
-        if (LOWORD(w)==kPause) {
-            paused=!paused;if(!RegisterKeys(h))paused=!paused;
-            PublishInputs(h);
-            Tray(false);
-            patch::NotifySettingsChanged();
-        } else if(LOWORD(w)==kOptions)patch::OpenOptions(h);
-        else if(LOWORD(w)==kGestures){auto config=patch::LoadConfig();config.flags^=patch::TouchpadGestures;patch::GestureStatus status;std::wstring error;if(!patch::ApplyConfig(config,status,error))MessageBoxW(h,error.c_str(),L"Native Snap",MB_OK|MB_ICONERROR);}
-        else if (LOWORD(w)==kHelp) Help(h);
-        else if (LOWORD(w)==kExit) {
-            auto config=patch::LoadConfig();config.flags&=~DWORD(patch::TouchpadGestures|patch::KeyboardShortcuts);
-            patch::GestureStatus status;std::wstring error;
-            if(!patch::ApplyConfig(config,status,error))MessageBoxW(h,error.c_str(),L"Native Snap",MB_OK|MB_ICONERROR);
-            else if(status.state==patch::EffectiveState::Pending)MessageBoxW(h,L"Snapping is off. Sign out and sign back in to finish restoring Windows gestures. The private receiver remains available until then.",L"Sign-in required",MB_OK|MB_ICONINFORMATION);
-        }
-        return 0;
     case WM_CLOSE: DestroyWindow(h);return 0;
-    case WM_DESTROY: UnregisterKeys(h);Shell_NotifyIcon(NIM_DELETE,&tray);PostQuitMessage(0);return 0;
+    case WM_DESTROY: UnregisterKeys(h);PostQuitMessage(0);return 0;
     case WM_DISPLAYCHANGE: states.clear();return 0;
-    case WM_TIMER: if(w==1)Tray(true);return 0;
     }
     return DefWindowProc(h,message,w,l);
 }
@@ -406,7 +316,7 @@ bool ParseAction(const std::wstring& text, Action& action) {
 int SelfTest(HINSTANCE instance, const std::wstring& path) {
     HWND originalForeground=GetForegroundWindow();
     std::vector<std::pair<std::string,bool>> checks;
-    auto check=[&](const char* name,bool success){checks.emplace_back(name,success);};
+    auto check=[&](const std::string& name,bool success){checks.emplace_back(name,success);};
     RECT synthetic{-1921,-100,0,981};
     RECT left=Half(synthetic,false), right=Half(synthetic,true);
     check("negative_odd_half_partition",left.left==-1921 && left.right==right.left && right.right==0 && Width(left)+Width(right)==1921);
@@ -423,35 +333,49 @@ int SelfTest(HINSTANCE instance, const std::wstring& path) {
     Bounds before{},after{};
     if(h) {
         ShowWindow(h,SW_SHOWNOACTIVATE);UpdateWindow(h);Pump();ReadBounds(h,before);
-        SIZE original{Width(before.frame),Height(before.frame)};
-        check("left_matches_visible_workarea",Apply(h,Action::Left,true)&&ReadBounds(h,after)&&Near(after.frame,Half(after.work,false),2));
-        RECT first=after.frame;
-        check("repeated_left_is_stable",Apply(h,Action::Left,true)&&ReadBounds(h,after)&&Near(first,after.frame,0));
-        check("opposite_restores_center",Apply(h,Action::Right,true)&&ReadBounds(h,after)&&Near(after.frame,Center(after.work,original),2));
-        check("next_right_snaps_right",Apply(h,Action::Right,true)&&ReadBounds(h,after)&&Near(after.frame,Half(after.work,true),2));
-        check("down_from_right_chooses_bottom_right_without_minimize",Apply(h,Action::Down,true)&&!IsIconic(h)&&ReadBounds(h,after)&&Near(after.frame,Quarter(after.work,true,true),2));
-        first=after.frame;
-        check("repeated_down_is_stable",Apply(h,Action::Down,true)&&!IsIconic(h)&&ReadBounds(h,after)&&Near(first,after.frame,0));
-        check("up_from_floating_maximizes",Apply(h,Action::Left,true)&&Apply(h,Action::Up,true)&&IsZoomed(h));
-        check("repeated_up_stays_maximized",Apply(h,Action::Up,true)&&IsZoomed(h));
-        check("down_from_maximized_restores_size",Apply(h,Action::Down,true)&&!IsIconic(h)&&!IsZoomed(h)&&ReadBounds(h,after)&&Near(after.frame,Center(after.work,original),2));
-        check("captioned_left_down_down_stays_bottom_left",Apply(h,Action::Left,true)&&Apply(h,Action::Down,true)&&Apply(h,Action::Down,true)&&!IsIconic(h)&&ReadBounds(h,after)&&Near(after.frame,Quarter(after.work,false,true),2));
-        check("captioned_left_up_is_top_left",Apply(h,Action::Up,true)&&!IsZoomed(h)&&ReadBounds(h,after)&&Near(after.frame,Quarter(after.work,false,false),2));
-        check("captioned_right_up_up_stays_top_right",Apply(h,Action::Right,true)&&Apply(h,Action::Right,true)&&Apply(h,Action::Up,true)&&Apply(h,Action::Up,true)&&!IsZoomed(h)&&ReadBounds(h,after)&&Near(after.frame,Quarter(after.work,true,false),2));
-        // Invalidate state through an external move of this isolated window.
-        SetWindowPos(h,nullptr,before.work.left+60,before.work.top+70,700,480,SWP_NOACTIVATE|SWP_NOZORDER);Pump();ReadBounds(h,after);
-        SIZE manual{Width(after.frame),Height(after.frame)};
-        check("manual_move_invalidates_old_restore",Apply(h,Action::Left,true)&&Apply(h,Action::Right,true)&&ReadBounds(h,after)&&Near(after.frame,Center(after.work,manual),2));
-        ShowWindowAsync(h,SW_MAXIMIZE);WaitState(h,true);states.erase(h);
-        check("previously_maximized_window_restores_real_frame",Apply(h,Action::Down,true)&&ReadBounds(h,after)&&Near(after.frame,Center(after.work,manual),2));
-        // Simulate an external window manager placing it in a half, without stored state.
-        states.erase(h);Bounds external;MoveFrame(h,Half(after.work,false),external);states.erase(h);
-        check("external_half_opposite_centers",Apply(h,Action::Right,true)&&ReadBounds(h,after)&&!Near(after.frame,Half(after.work,true))&&abs((after.frame.left+after.frame.right)-(after.work.left+after.work.right))<=1);
+        // Every destination is seeded without saved state, as if another window
+        // manager had placed it there. Exercise all four actions from each one.
+        struct Tile {const char* name;int side,row;};
+        const Tile tiles[]={{"left_half",-1,0},{"right_half",1,0},
+            {"top_left",-1,-1},{"bottom_left",-1,1},
+            {"top_right",1,-1},{"bottom_right",1,1}};
+        const Action actions[]={Action::Left,Action::Right,Action::Up,Action::Down};
+        const char* actionNames[]={"left","right","up","down"};
+        for(const auto& tile:tiles)for(size_t i=0;i<4;i++) {
+            states.erase(h);Bounds seeded;
+            RECT source=tile.row?Quarter(before.work,tile.side>0,tile.row>0):Half(before.work,tile.side>0);
+            bool seededOk=MoveFrame(h,source,seeded);states.erase(h);
+            bool vertical=actions[i]==Action::Up||actions[i]==Action::Down;
+            int targetSide=vertical?tile.side:(actions[i]==Action::Left?-1:1);
+            int targetRow=vertical?(actions[i]==Action::Up?-1:1):0;
+            RECT expected=targetRow?Quarter(before.work,targetSide>0,targetRow>0):Half(before.work,targetSide>0);
+            check(std::string("transition_")+tile.name+"_"+actionNames[i],
+                seededOk&&Apply(h,actions[i],true)&&!IsIconic(h)&&!IsZoomed(h)&&
+                ReadBounds(h,after)&&Near(after.frame,expected,2));
+        }
+        states.erase(h);Bounds floating;
+        bool floatingOk=MoveFrame(h,before.frame,floating);states.erase(h);
+        RECT first=floating.frame;
+        check("floating_up_leaves_window_unchanged",floatingOk&&Apply(h,Action::Up,true)&&!IsIconic(h)&&!IsZoomed(h)&&ReadBounds(h,after)&&Near(first,after.frame,0));
+        check("floating_repeated_up_leaves_window_unchanged",Apply(h,Action::Up,true)&&!IsIconic(h)&&!IsZoomed(h)&&ReadBounds(h,after)&&Near(first,after.frame,0));
+        // Reset independently so a failed Up test cannot mask Down behavior.
+        states.erase(h);floatingOk=MoveFrame(h,before.frame,floating);states.erase(h);first=floating.frame;
+        check("floating_down_leaves_window_unchanged",floatingOk&&Apply(h,Action::Down,true)&&!IsIconic(h)&&!IsZoomed(h)&&ReadBounds(h,after)&&Near(first,after.frame,0));
+        check("floating_repeated_down_leaves_window_unchanged",Apply(h,Action::Down,true)&&!IsIconic(h)&&!IsZoomed(h)&&ReadBounds(h,after)&&Near(first,after.frame,0));
+        check("saved_corner_right_selects_right_half",Apply(h,Action::Left,true)&&Apply(h,Action::Down,true)&&Apply(h,Action::Right,true)&&ReadBounds(h,after)&&Near(after.frame,Half(after.work,true),2));
+        check("saved_corner_left_selects_left_half",Apply(h,Action::Up,true)&&Apply(h,Action::Left,true)&&ReadBounds(h,after)&&Near(after.frame,Half(after.work,false),2));
+        // Invalidate saved tile state through an external move of this window.
+        SetWindowPos(h,nullptr,before.work.left+60,before.work.top+70,700,480,SWP_NOACTIVATE|SWP_NOZORDER);Pump();ReadBounds(h,after);first=after.frame;
+        check("manual_move_invalidates_saved_side_for_up",Apply(h,Action::Up,true)&&!IsIconic(h)&&!IsZoomed(h)&&ReadBounds(h,after)&&Near(first,after.frame,0));
+        check("manual_move_invalidates_saved_side_for_down",Apply(h,Action::Down,true)&&!IsIconic(h)&&!IsZoomed(h)&&ReadBounds(h,after)&&Near(first,after.frame,0));
+        check("floating_right_selects_right_half",Apply(h,Action::Right,true)&&ReadBounds(h,after)&&Near(after.frame,Half(after.work,true),2));
         SetWindowLongPtr(h,GWLP_USERDATA,1);
         testMinimum={Width(before.work)*6/10,Height(before.work)*8/10};
-        check("application_minimum_is_respected",Apply(h,Action::Down,true)&&ReadBounds(h,after)&&Width(after.outer)>=testMinimum.cx&&Height(after.outer)>=testMinimum.cy);
+        check("application_minimum_keeps_bottom_and_right_edges",Apply(h,Action::Down,true)&&ReadBounds(h,after)&&Width(after.outer)>=testMinimum.cx&&Height(after.outer)>=testMinimum.cy&&abs(after.frame.bottom-after.work.bottom)<=2&&abs(after.frame.right-after.work.right)<=2);
         first=after.frame;
         check("minimum_size_repeated_down_is_stable",Apply(h,Action::Down,true)&&ReadBounds(h,after)&&Near(first,after.frame,0));
+        check("minimum_size_horizontal_resets_to_left_half",Apply(h,Action::Left,true)&&ReadBounds(h,after)&&Width(after.outer)>=testMinimum.cx&&abs(after.frame.left-after.work.left)<=2&&abs(after.frame.top-after.work.top)<=2&&abs(after.frame.bottom-after.work.bottom)<=2);
+        check("minimum_size_keeps_bottom_and_left_edges",Apply(h,Action::Down,true)&&ReadBounds(h,after)&&Width(after.outer)>=testMinimum.cx&&Height(after.outer)>=testMinimum.cy&&abs(after.frame.bottom-after.work.bottom)<=2&&abs(after.frame.left-after.work.left)<=2);
         SetWindowLongPtr(h,GWLP_USERDATA,0);
         LONG_PTR style=GetWindowLongPtr(h,GWL_STYLE);
         SetWindowLongPtr(h,GWL_STYLE,style&~WS_THICKFRAME);
@@ -466,23 +390,22 @@ int SelfTest(HINSTANCE instance, const std::wstring& path) {
         check("left_down_is_bottom_left",Apply(h,Action::Down,true)&&ReadBounds(h,after)&&Near(after.frame,Quarter(after.work,false,true),2));
         first=after.frame;
         check("left_down_down_stays_visible_bottom_left",Apply(h,Action::Down,true)&&!IsIconic(h)&&ReadBounds(h,after)&&Near(first,after.frame,0));
-        check("left_down_left_preserves_corner",Apply(h,Action::Left,true)&&ReadBounds(h,after)&&Near(first,after.frame,0));
+        check("left_down_left_selects_left_half",Apply(h,Action::Left,true)&&ReadBounds(h,after)&&Near(after.frame,Half(after.work,false),2));
         check("left_corner_up_is_top_left",Apply(h,Action::Up,true)&&ReadBounds(h,after)&&Near(after.frame,Quarter(after.work,false,false),2));
         first=after.frame;
         check("left_up_up_is_stable",Apply(h,Action::Up,true)&&ReadBounds(h,after)&&Near(first,after.frame,0));
-        check("left_corner_opposite_centers",Apply(h,Action::Right,true)&&ReadBounds(h,after)&&Near(after.frame,Center(after.work,states[h].restore),2));
-        check("right_up_is_top_right",Apply(h,Action::Right,true)&&Apply(h,Action::Up,true)&&ReadBounds(h,after)&&Near(after.frame,Quarter(after.work,true,false),2));
+        check("left_corner_right_selects_right_half",Apply(h,Action::Right,true)&&ReadBounds(h,after)&&Near(after.frame,Half(after.work,true),2));
+        check("right_up_is_top_right",Apply(h,Action::Up,true)&&ReadBounds(h,after)&&Near(after.frame,Quarter(after.work,true,false),2));
         first=after.frame;
         check("right_up_up_is_stable",Apply(h,Action::Up,true)&&ReadBounds(h,after)&&Near(first,after.frame,0));
-        check("right_up_right_preserves_corner",Apply(h,Action::Right,true)&&ReadBounds(h,after)&&Near(first,after.frame,0));
+        check("right_up_right_selects_right_half",Apply(h,Action::Right,true)&&ReadBounds(h,after)&&Near(after.frame,Half(after.work,true),2));
         check("right_corner_down_is_bottom_right",Apply(h,Action::Down,true)&&ReadBounds(h,after)&&Near(after.frame,Quarter(after.work,true,true),2));
         first=after.frame;
         check("right_down_down_stays_visible",Apply(h,Action::Down,true)&&!IsIconic(h)&&ReadBounds(h,after)&&Near(first,after.frame,0));
-        check("right_corner_opposite_centers",Apply(h,Action::Left,true)&&ReadBounds(h,after)&&Near(after.frame,Center(after.work,states[h].restore),2));
+        check("right_corner_left_selects_left_half",Apply(h,Action::Left,true)&&ReadBounds(h,after)&&Near(after.frame,Half(after.work,false),2));
         states.erase(h);Bounds externalCorner;
         MoveFrame(h,Quarter(after.work,false,true),externalCorner);states.erase(h);
         check("external_bottom_left_repeat_down_is_stable",Apply(h,Action::Down,true)&&!IsIconic(h)&&ReadBounds(h,after)&&Near(after.frame,Quarter(after.work,false,true),2));
-        Apply(h,Action::Right,true); // Leave the left corner for the floating state.
         SetWindowLongPtr(h,GWLP_USERDATA,1);testMinimum={Width(before.work)*6/10,Height(before.work)*8/10};
         check("oversized_corner_minimum_keeps_bottom_and_right_edges",Apply(h,Action::Right,true)&&Apply(h,Action::Down,true)&&ReadBounds(h,after)&&Width(after.outer)>=testMinimum.cx&&Height(after.outer)>=testMinimum.cy&&abs(after.frame.bottom-after.work.bottom)<=2&&abs(after.frame.right-after.work.right)<=2);
         SetWindowLongPtr(h,GWLP_USERDATA,0);
@@ -544,7 +467,6 @@ int WINAPI wWinMain(HINSTANCE instance,HINSTANCE,PWSTR,int) {
     if(!mainWindow){CloseHandle(mutex);return 2;}
     if(!RegisterKeys(mainWindow)){DestroyWindow(mainWindow);CloseHandle(mutex);return 1;}
     if(activeBindings.empty()){RemoveIdleStartup();DestroyWindow(mainWindow);CloseHandle(mutex);return 0;}
-    taskbarCreated=RegisterWindowMessage(L"TaskbarCreated");Tray(true);
     settingsEvent=CreateEventW(nullptr,FALSE,FALSE,L"Local\\Win10NativePatch.SettingsChanged.v2");
     MSG message{};bool running=true;
     while(running){DWORD wait=MsgWaitForMultipleObjects(settingsEvent?1:0,settingsEvent?&settingsEvent:nullptr,FALSE,INFINITE,QS_ALLINPUT);

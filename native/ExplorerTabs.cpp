@@ -6,6 +6,7 @@
 // Distributed WITHOUT ANY WARRANTY. See vendor/stexbar/LICENSE.
 
 #include "Patch.h"
+#include "MvpHostProtocol.h"
 #include <algorithm>
 #include <atomic>
 #include <commctrl.h>
@@ -820,7 +821,7 @@ class Controller final : public IObjectWithSite, public IAccessible, public IDro
     bool hadRegion_ = false, clipped_ = false;
     DWORD ownerThread_{};
     bool enabled_ = false, tearingDown_ = false, inDrag_ = false, dropPrivate_ = false, sameWindowDrop_ = false;
-    bool frameHooked_ = false;
+    bool frameHooked_ = false, selfHosted_ = false;
     bool dark_ = false;
     HFONT font_{};
     HICON folderIcon_{};
@@ -905,6 +906,7 @@ class Controller final : public IObjectWithSite, public IAccessible, public IDro
     HRESULT AccessTypeInfo();
 
   public:
+    void OwnMvpLifetime() { selfHosted_ = true; }
     Controller()
     {
         objectCount++;
@@ -1460,14 +1462,14 @@ void Controller::Layout()
         RebuildFont();
     }
     RECT client{},buttons{},outer{};GetClientRect(frame_,&client);GetWindowRect(frame_,&outer);
-    HWND ribbon=FindWindowExW(frame_,nullptr,L"UIRibbonDockTop",nullptr);
-    RECT ribbonRect{};if(ribbon){GetWindowRect(ribbon,&ribbonRect);MapWindowPoints(nullptr,frame_,reinterpret_cast<POINT*>(&ribbonRect),2);}
     bool measured=SUCCEEDED(DwmGetWindowAttribute(frame_,DWMWA_CAPTION_BUTTON_BOUNDS,&buttons,sizeof(buttons)))&&buttons.right>buttons.left&&buttons.bottom>buttons.top;
     POINT origin{};ClientToScreen(frame_,&origin);
-    int right=buttons.left+outer.left-origin.x,height=ribbonRect.top;
+    // Explorer's ribbon window classes vary. The actual caption buttons supply
+    // the top row's geometry; ClipRibbon verifies its native paint owner below.
+    int right=buttons.left+outer.left-origin.x,height=buttons.bottom+outer.top-origin.y;
     const int start = MulDiv(40, static_cast<int>(dpi_), 96), space = MulDiv(28, static_cast<int>(dpi_), 96);
     right -= space;
-    if(!measured||!ribbon||height<MulDiv(16,static_cast<int>(dpi_),96)||height>MulDiv(56,static_cast<int>(dpi_),96)||right<start+space*2||right>client.right)
+    if(!measured||height<MulDiv(16,static_cast<int>(dpi_),96)||height>MulDiv(56,static_cast<int>(dpi_),96)||right<start+space*2||right>client.right)
     {
         patch::Log(L"ExplorerTabs",L"Unsupported caption/ribbon geometry; ordinary Explorer chrome was restored.");
         SetPropW(frame_,L"Win10NativePatch.TabsRejected.v2",reinterpret_cast<HANDLE>(1));
@@ -2154,7 +2156,15 @@ LRESULT CALLBACK Controller::FrameProc(HWND h, UINT m, WPARAM w, LPARAM l, UINT_
     self->AddRef();
     LRESULT result = 0;
     bool handled = false;
-    if (m == patch::SettingsChangedMessage())
+    if (m == patch::mvp::DetachMessage() && self->selfHosted_)
+    {
+        self->selfHosted_ = false;
+        self->Detach();
+        self->Release();
+        handled = true;
+        result = 1;
+    }
+    else if (m == patch::SettingsChangedMessage())
     {
         self->Enable((patch::LoadConfig().flags & patch::ExplorerTabs) != 0);
         handled = true;
@@ -2225,7 +2235,11 @@ LRESULT CALLBACK Controller::FrameProc(HWND h, UINT m, WPARAM w, LPARAM l, UINT_
             self->SaveSession();
         }
         else if (m == WM_NCDESTROY)
+        {
+            bool owned = std::exchange(self->selfHosted_, false);
             self->Detach();
+            if (owned) self->Release();
+        }
     }
     if (!handled)
         result = DefSubclassProc(h, m, w, l);
@@ -3116,6 +3130,75 @@ extern "C" BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason, LPVOID)
 extern "C" HRESULT WINAPI DllCanUnloadNow()
 {
     return objectCount.load() == 0 && serverLocks.load() == 0 ? S_OK : S_FALSE;
+}
+// The MVP starter installs this hook only on a verified Explorer folder thread.
+// Creating the controller here keeps every COM and window operation in its STA.
+extern "C" LRESULT CALLBACK MvpExplorerHook(int code, WPARAM removed, LPARAM data)
+{
+    if (code >= 0 && removed == PM_REMOVE && data)
+    {
+        auto *message = reinterpret_cast<MSG *>(data);
+        if (message->message == patch::mvp::AttachMessage())
+        {
+            HWND frame = message->hwnd;
+            message->message = WM_NULL;
+            static thread_local bool attaching = false;
+            DWORD process{};
+            DWORD thread = GetWindowThreadProcessId(frame, &process);
+            if (!attaching && LocalExplorer() && ExplorerRoot(frame) &&
+                process == GetCurrentProcessId() && thread == GetCurrentThreadId() &&
+                (patch::LoadConfig().flags & patch::ExplorerTabs) && !GetPropW(frame, ControllerProperty))
+            {
+                attaching = true;
+                HRESULT result = E_NOINTERFACE;
+                ComPtr<IShellWindows> windows;
+                if (SUCCEEDED(CoCreateInstance(CLSID_ShellWindows, nullptr, CLSCTX_ALL,
+                                               IID_PPV_ARGS(&windows))))
+                {
+                    long count{};
+                    windows->get_Count(&count);
+                    for (long i = 0; i < std::min(count, 256L); ++i)
+                    {
+                        VARIANT index{};
+                        index.vt = VT_I4;
+                        index.lVal = i;
+                        ComPtr<IDispatch> dispatch;
+                        ComPtr<IWebBrowser2> browser;
+                        SHANDLE_PTR handle{};
+                        if (FAILED(windows->Item(index, &dispatch)) || !dispatch ||
+                            FAILED(dispatch.As(&browser)) || FAILED(browser->get_HWND(&handle)) ||
+                            reinterpret_cast<HWND>(handle) != frame)
+                            continue;
+                        auto *controller = new (std::nothrow) Controller();
+                        if (!controller) { result = E_OUTOFMEMORY; break; }
+                        result = controller->SetSite(browser.Get());
+                        if (SUCCEEDED(result) && GetPropW(frame, ControllerProperty) == controller)
+                        {
+                            HMODULE retained{};
+                            // Window callbacks may outlive the starter. Retain this DLL
+                            // until Explorer exits, including after an emergency detach.
+                            if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                                                      GET_MODULE_HANDLE_EX_FLAG_PIN,
+                                                  reinterpret_cast<LPCWSTR>(&MvpExplorerHook), &retained))
+                                controller->OwnMvpLifetime();
+                            else
+                            {
+                                result = HRESULT_FROM_WIN32(GetLastError());
+                                controller->SetSite(nullptr);
+                                controller->Release();
+                            }
+                        }
+                        else controller->Release();
+                        break;
+                    }
+                }
+                SetPropW(frame, patch::mvp::AttachResult,
+                         reinterpret_cast<HANDLE>(SUCCEEDED(result) ? 1ull : static_cast<DWORD>(result)));
+                attaching = false;
+            }
+        }
+    }
+    return CallNextHookEx(nullptr, code, removed, data);
 }
 extern "C" HRESULT WINAPI DllGetClassObject(REFCLSID clsid, REFIID id, void **out)
 {

@@ -1,4 +1,5 @@
 #include "Patch.h"
+#include "MvpHostProtocol.h"
 #include <shellapi.h>
 #include <shlobj.h>
 #include <algorithm>
@@ -59,8 +60,8 @@ std::wstring ModuleDirectory() {
     std::wstring path(32768,L'\0');DWORD n=GetModuleFileNameW(module,path.data(),static_cast<DWORD>(path.size()));
     if(!n||n>=path.size())return {};path.resize(n);size_t slash=path.find_last_of(L"\\/");return slash==std::wstring::npos?L"":path.substr(0,slash);
 }
-std::wstring SiblingPath(const wchar_t* name){wchar_t dir[32768];DWORD size=sizeof(dir);if(RegGetValueW(HKEY_LOCAL_MACHINE,SettingsKey,L"InstallDirectory",RRF_RT_REG_SZ,nullptr,dir,&size)==ERROR_SUCCESS){std::wstring target=dir;if(!target.empty()&&target.back()!=L'\\'&&target.back()!=L'/')target+=L'\\';target+=name;DWORD attr=GetFileAttributesW(target.c_str());if(attr!=INVALID_FILE_ATTRIBUTES&&!(attr&FILE_ATTRIBUTE_DIRECTORY))return target;}return ModuleDirectory()+L"\\"+name;}
-void OpenOptions(HWND owner){ShellExecuteW(owner,L"open",SiblingPath(L"Win10PatchOptions.exe").c_str(),nullptr,ModuleDirectory().c_str(),SW_SHOWNORMAL);}
+std::wstring SiblingPath(const wchar_t* name){wchar_t dir[32768];for(HKEY hive:{HKEY_CURRENT_USER,HKEY_LOCAL_MACHINE}){DWORD size=sizeof(dir);if(RegGetValueW(hive,SettingsKey,L"InstallDirectory",RRF_RT_REG_SZ,nullptr,dir,&size)==ERROR_SUCCESS){std::wstring target=dir;if(!target.empty()&&target.back()!=L'\\'&&target.back()!=L'/')target+=L'\\';target+=name;DWORD attr=GetFileAttributesW(target.c_str());if(attr!=INVALID_FILE_ATTRIBUTES&&!(attr&FILE_ATTRIBUTE_DIRECTORY))return target;}}return ModuleDirectory()+L"\\"+name;}
+void OpenOptions(HWND owner){std::wstring args=owner?L"--owner "+std::to_wstring(reinterpret_cast<ULONG_PTR>(GetAncestor(owner,GA_ROOT))):L"";ShellExecuteW(owner,L"open",SiblingPath(L"Win10PatchOptions.exe").c_str(),args.empty()?nullptr:args.c_str(),ModuleDirectory().c_str(),SW_SHOWNORMAL);}
 void Log(const wchar_t* component,const std::wstring& message){std::wstring text=L"[Win10NativePatch/"+std::wstring(component)+L"] "+message+L"\n";OutputDebugStringW(text.c_str());}
 bool SupportedWindows() {
     using RtlGetVersionFn=LONG(WINAPI*)(OSVERSIONINFOW*);HMODULE nt=GetModuleHandleW(L"ntdll.dll");
@@ -68,7 +69,7 @@ bool SupportedWindows() {
     SYSTEM_INFO system{};GetNativeSystemInfo(&system);
     OSVERSIONINFOW os{sizeof(os)};return system.wProcessorArchitecture==PROCESSOR_ARCHITECTURE_AMD64&&fn&&fn(&os)==0&&os.dwMajorVersion==10&&os.dwBuildNumber==19045;
 }
-bool TabsInstalled(){DWORD features{},length=sizeof(features);if(RegGetValueW(HKEY_LOCAL_MACHINE,SettingsKey,L"InstalledFeatures",RRF_RT_REG_DWORD,nullptr,&features,&length)!=ERROR_SUCCESS||!(features&ExplorerTabs))return false;std::wstring path=L"CLSID\\"+std::wstring(TabsClassId)+L"\\InprocServer32";wchar_t dll[32768];DWORD size=sizeof(dll);return RegGetValueW(HKEY_CLASSES_ROOT,path.c_str(),nullptr,RRF_RT_REG_SZ,nullptr,dll,&size)==ERROR_SUCCESS&&!_wcsicmp(dll,SiblingPath(L"ExplorerTabs.dll").c_str())&&GetFileAttributesW(dll)!=INVALID_FILE_ATTRIBUTES;}
+bool TabsInstalled(){if(GetFileAttributesW(SiblingPath(L"ExplorerMvpHost.exe").c_str())!=INVALID_FILE_ATTRIBUTES&&GetFileAttributesW(SiblingPath(L"ExplorerTabs.dll").c_str())!=INVALID_FILE_ATTRIBUTES)return true;DWORD features{},length=sizeof(features);if(RegGetValueW(HKEY_LOCAL_MACHINE,SettingsKey,L"InstalledFeatures",RRF_RT_REG_DWORD,nullptr,&features,&length)!=ERROR_SUCCESS||!(features&ExplorerTabs))return false;std::wstring path=L"CLSID\\"+std::wstring(TabsClassId)+L"\\InprocServer32";wchar_t dll[32768];DWORD size=sizeof(dll);return RegGetValueW(HKEY_CLASSES_ROOT,path.c_str(),nullptr,RRF_RT_REG_SZ,nullptr,dll,&size)==ERROR_SUCCESS&&!_wcsicmp(dll,SiblingPath(L"ExplorerTabs.dll").c_str())&&GetFileAttributesW(dll)!=INVALID_FILE_ATTRIBUTES;}
 Diagnostics ReadDiagnostics() {
     Diagnostics d;d.supportedWindows=SupportedWindows();d.tabsInstalled=TabsInstalled();d.snapRunning=FindWindowW(SnapWindowClass,nullptr)!=nullptr;d.gestures=ReadGestureStatus();
     DWORD activeInputs=static_cast<DWORD>(reinterpret_cast<ULONG_PTR>(GetPropW(FindWindowW(SnapWindowClass,nullptr),L"Win10NativePatch.ActiveInputs.v2")));
@@ -92,6 +93,26 @@ bool ReconcileSnapRuntime(const Config& c,std::wstring& error) {
     while(GetTickCount64()<deadline){if(WaitForSingleObject(pi.hProcess,30)==WAIT_OBJECT_0)break;h=FindWindowW(SnapWindowClass,nullptr);if(h){DWORD_PTR response{};if(SendMessageTimeoutW(h,SettingsChangedMessage(),1,0,SMTO_ABORTIFHUNG|SMTO_BLOCK,1500,&response)){ready=response==1;if(response!=2)break;}else break;}}
     CloseHandle(pi.hProcess);if(!ready){error=L"Native Snap could not register its shortcuts.";return false;}return true;
 }
+bool ReconcileTabsRuntime(const Config& config,std::wstring& error) {
+    const std::wstring app=SiblingPath(L"ExplorerMvpHost.exe");
+    if(GetFileAttributesW(app.c_str())==INVALID_FILE_ATTRIBUTES)return true;
+    const bool needed=(config.flags&ExplorerTabs)!=0;
+    HKEY run{};LONG code=RegCreateKeyExW(HKEY_CURRENT_USER,RunKey,0,nullptr,0,KEY_QUERY_VALUE|KEY_SET_VALUE,nullptr,&run,nullptr);
+    if(code!=ERROR_SUCCESS){error=L"Windows could not update Explorer startup settings.";return false;}
+    std::wstring command=L"\""+app+L"\"";
+    if(needed)code=RegSetValueExW(run,L"Win10NativePatch.ExplorerMvp.v1",0,REG_SZ,reinterpret_cast<const BYTE*>(command.c_str()),static_cast<DWORD>((command.size()+1)*sizeof(wchar_t)));
+    else {wchar_t existing[32768]{};DWORD type{},bytes=sizeof(existing);LONG read=RegQueryValueExW(run,L"Win10NativePatch.ExplorerMvp.v1",nullptr,&type,reinterpret_cast<BYTE*>(existing),&bytes);if(read==ERROR_SUCCESS&&type==REG_SZ&&bytes>=sizeof(wchar_t)&&existing[bytes/sizeof(wchar_t)-1]==0&&!_wcsicmp(existing,command.c_str()))code=RegDeleteValueW(run,L"Win10NativePatch.ExplorerMvp.v1");}
+    RegCloseKey(run);
+    if(code!=ERROR_SUCCESS){error=L"Windows could not save Explorer startup settings.";return false;}
+    HWND host=FindWindowW(mvp::HostClass,nullptr);
+    if(!needed){if(host)PostMessageW(host,WM_CLOSE,0,0);return true;}
+    if(host){PostMessageW(host,SettingsChangedMessage(),0,0);return true;}
+    STARTUPINFOW start{sizeof(start)};start.dwFlags=STARTF_USESHOWWINDOW;start.wShowWindow=SW_HIDE;PROCESS_INFORMATION process{};
+    if(!CreateProcessW(app.c_str(),command.data(),nullptr,nullptr,FALSE,CREATE_NO_WINDOW,nullptr,ModuleDirectory().c_str(),&start,&process)){error=L"Explorer integration could not start.";return false;}
+    CloseHandle(process.hThread);bool ready=false;ULONGLONG deadline=GetTickCount64()+4000;
+    while(GetTickCount64()<deadline){if(WaitForSingleObject(process.hProcess,30)==WAIT_OBJECT_0)break;if(FindWindowW(mvp::HostClass,nullptr)){ready=true;break;}}
+    CloseHandle(process.hProcess);if(!ready)error=L"Explorer integration did not confirm startup.";return ready;
+}
 bool ApplyConfig(const Config& c,GestureStatus& status,std::wstring& error) {
     ConfigLock lock;if(!lock.owned){error=L"Another settings update is running.";return false;}
     if(!SupportedWindows()){error=L"This patch requires Windows 10 22H2 (build 19045).";return false;}
@@ -101,11 +122,11 @@ bool ApplyConfig(const Config& c,GestureStatus& status,std::wstring& error) {
     bool changed=(((before.flags^c.flags)&TouchpadGestures)!=0)||legacyDisable;
     status=ReadGestureStatus();
     if(changed&&!ConfigureGestures((c.flags&TouchpadGestures)!=0,status,error)){std::wstring ignored;ReconcileSnapRuntime(before,ignored);return false;}
-    if(!SaveConfig(c,error)||!ReconcileSnapRuntime(c,error)) {
+    if(!SaveConfig(c,error)||!ReconcileSnapRuntime(c,error)||!ReconcileTabsRuntime(c,error)) {
         std::wstring ignored;Store(HKEY_CURRENT_USER,SettingsKey,before);
         if(changed)RollbackGestureAttempt(ignored);
         status=ReadGestureStatus();
-        ReconcileSnapRuntime(before,ignored);NotifySettingsChanged();return false;
+        ReconcileSnapRuntime(before,ignored);ReconcileTabsRuntime(before,ignored);NotifySettingsChanged();return false;
     }
     NotifySettingsChanged();return true;
 }

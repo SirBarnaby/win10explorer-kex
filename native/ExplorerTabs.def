@@ -6,3 +6,4 @@ EXPORTS
     DllUnregisterServer PRIVATE
     RunProof
     RunModelTests
+    MvpExplorerHook

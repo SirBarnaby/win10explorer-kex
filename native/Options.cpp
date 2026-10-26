@@ -4,6 +4,7 @@
 #include <dwmapi.h>
 #include <sstream>
 #include <algorithm>
+#include <limits>
 
 namespace {
 struct Context {
@@ -12,6 +13,40 @@ struct Context {
     bool dirty=false;
     bool loading=false;
 };
+bool ExplorerOwner(const std::wstring& value,HWND& owner) {
+    if(value.empty())return false;
+    ULONG_PTR number=0;
+    for(wchar_t digit:value) {
+        if(digit<L'0'||digit>L'9')return false;
+        ULONG_PTR next=static_cast<ULONG_PTR>(digit-L'0');
+        if(number>(std::numeric_limits<ULONG_PTR>::max()-next)/10)return false;
+        number=number*10+next;
+    }
+    HWND candidate=reinterpret_cast<HWND>(number);
+    if(!candidate||!IsWindow(candidate)||GetAncestor(candidate,GA_ROOT)!=candidate)return false;
+    wchar_t name[64]{};
+    if(!GetClassNameW(candidate,name,static_cast<int>(std::size(name)))||wcscmp(name,L"CabinetWClass")!=0)return false;
+    DWORD process=0,currentSession=0,ownerSession=0;
+    if(!GetWindowThreadProcessId(candidate,&process)||!process||
+       !ProcessIdToSessionId(GetCurrentProcessId(),&currentSession)||
+       !ProcessIdToSessionId(process,&ownerSession)||currentSession!=ownerSession)return false;
+    HANDLE handle=OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION,FALSE,process);
+    if(!handle)return false;
+    std::array<wchar_t,32768> executable{};
+    DWORD length=static_cast<DWORD>(executable.size());
+    bool queried=QueryFullProcessImageNameW(handle,0,executable.data(),&length)!=FALSE;
+    CloseHandle(handle);
+    if(!queried)return false;
+    wchar_t windows[MAX_PATH]{};
+    UINT windowsLength=GetWindowsDirectoryW(windows,static_cast<UINT>(std::size(windows)));
+    if(!windowsLength||windowsLength>=std::size(windows))return false;
+    std::wstring expected=std::wstring(windows,windowsLength)+L"\\explorer.exe";
+    if(CompareStringOrdinal(executable.data(),static_cast<int>(length),expected.c_str(),static_cast<int>(expected.size()),TRUE)!=CSTR_EQUAL)return false;
+    DWORD confirmedProcess=0;
+    if(!GetWindowThreadProcessId(candidate,&confirmedProcess)||confirmedProcess!=process||
+       !GetClassNameW(candidate,name,static_cast<int>(std::size(name)))||wcscmp(name,L"CabinetWClass")!=0)return false;
+    owner=candidate;return true;
+}
 const wchar_t* StateName(patch::EffectiveState state) {
     switch(state) {
     case patch::EffectiveState::Enabled:return L"Enabled";
@@ -43,8 +78,8 @@ void ReadPages(Context& c) {
         SetFlag(c.draft,patch::ExplorerTabs,Checked(c.pages[0],1001));
         SetFlag(c.draft,patch::TouchpadGestures,Checked(c.pages[0],1002));
         SetFlag(c.draft,patch::KeyboardShortcuts,Checked(c.pages[0],1003));
+        SetFlag(c.draft,patch::RestoreTabs,Checked(c.pages[0],1004));
     }
-    if(c.pages[1])SetFlag(c.draft,patch::RestoreTabs,Checked(c.pages[1],1101));
     if(c.pages[2]) {
         c.draft.keyboardModifiers=0;
         constexpr DWORD modifiers[]={MOD_CONTROL,MOD_ALT,MOD_WIN,MOD_SHIFT};
@@ -60,10 +95,10 @@ void UpdateDiagnostics(HWND page) {
     auto d=patch::ReadDiagnostics();
     std::wostringstream out;
     out<<L"Windows 10 22H2 x64: "<<(d.supportedWindows?L"Supported":L"Not supported")
-       <<L"\r\nExplorer Tabs installed: "<<(d.tabsInstalled?L"Yes":L"No")
+       <<L"\r\nExplorer integration available: "<<(d.tabsInstalled?L"Yes":L"No")
        <<L"\r\nExplorer folder windows: "<<d.explorerWindows
        <<L"\r\nWindows with active tabs: "<<d.tabWindows
-       <<L"\r\nSnap helper running: "<<(d.snapRunning?L"Yes":L"No")
+       <<L"\r\nSnapping component running: "<<(d.snapRunning?L"Yes":L"No")
        <<L"\r\nTouchpad gestures: "<<StateName(d.gestures.state)
        <<L"\r\n\r\n"<<d.gestures.detail<<L"\r\n"<<d.detail;
     SetDlgItemText(page,1301,out.str().c_str());
@@ -73,7 +108,7 @@ void UpdateStatus(Context& c) {
         auto d=patch::ReadDiagnostics();
         auto applied=patch::LoadConfig();
         std::wstring tabs;
-        if(!d.tabsInstalled)tabs=L"Not installed. Explorer acceptance must pass before deployment.";
+        if(!d.tabsInstalled)tabs=L"Explorer integration is not available in this installation.";
         else if((c.draft.flags^applied.flags)&patch::ExplorerTabs)tabs=L"Change not applied. Select Apply to change Explorer tabs.";
         else if(!(applied.flags&patch::ExplorerTabs))tabs=d.tabWindows?L"Pending: open windows have not confirmed disabling tabs.":L"Disabled. Ordinary Explorer remains available.";
         else if(d.tabWindows)tabs=L"Enabled in "+std::to_wstring(d.tabWindows)+L" Explorer window(s).";
@@ -131,8 +166,8 @@ INT_PTR CALLBACK PageProc(HWND page,UINT message,WPARAM w,LPARAM l) {
         if(index==0) {
             Check(page,1001,(c->draft.flags&patch::ExplorerTabs)!=0);Check(page,1002,(c->draft.flags&patch::TouchpadGestures)!=0);
             Check(page,1003,(c->draft.flags&patch::KeyboardShortcuts)!=0);
-        } else if(index==1)Check(page,1101,(c->draft.flags&patch::RestoreTabs)!=0);
-        else if(index==2) {
+            Check(page,1004,(c->draft.flags&patch::RestoreTabs)!=0);
+        } else if(index==2) {
             constexpr DWORD modifiers[]={MOD_CONTROL,MOD_ALT,MOD_WIN,MOD_SHIFT};
             for(int i=0;i<4;++i) {Check(page,1201+i,(c->draft.keyboardModifiers&modifiers[i])!=0);FillKeys(GetDlgItem(page,1210+i),c->draft.keyboardKeys[i]);}
         }
@@ -162,23 +197,27 @@ int WINAPI wWinMain(HINSTANCE instance,HINSTANCE,PWSTR,int) {
     int argc=0;LPWSTR* argv=CommandLineToArgvW(GetCommandLine(),&argc);
     std::vector<std::wstring> arguments;
     if(argv){for(int i=1;i<argc;++i)arguments.emplace_back(argv[i]);LocalFree(argv);}
+    HWND owner=nullptr;
+    bool ownerArgument=arguments.size()==2&&arguments[0]==L"--owner";
+    if(ownerArgument&&!ExplorerOwner(arguments[1],owner))return 2;
     HRESULT com=CoInitializeEx(nullptr,COINIT_APARTMENTTHREADED);
     int result=0;
     if(arguments.size()==2&&arguments[0]==L"--self-test")result=patch::RunConfigSelfTests(arguments[1]);
     else if(arguments.size()==2&&arguments[0]==L"--probe")result=patch::RunGestureProbe(arguments[1]);
-    else if(!arguments.empty())result=2;
+    else if(!arguments.empty()&&!ownerArgument)result=2;
     else {
         INITCOMMONCONTROLSEX controls{sizeof(controls),ICC_STANDARD_CLASSES|ICC_WIN95_CLASSES};InitCommonControlsEx(&controls);
         Context context;context.draft=patch::LoadConfig();
         std::array<PROPSHEETPAGE,4> pages{};
-        constexpr const wchar_t* titles[]={L"Features",L"Explorer",L"Snapping",L"Diagnostics"};
+        constexpr const wchar_t* titles[]={L"General",L"Tabs",L"Snapping",L"Diagnostics"};
         for(int i=0;i<4;++i) {
             pages[i].dwSize=sizeof(PROPSHEETPAGE);pages[i].dwFlags=PSP_USETITLE;pages[i].hInstance=instance;
             pages[i].pszTemplate=MAKEINTRESOURCE(201+i);pages[i].pszTitle=titles[i];
             pages[i].pfnDlgProc=PageProc;pages[i].lParam=reinterpret_cast<LPARAM>(&context);
         }
         PROPSHEETHEADER sheet{};sheet.dwSize=sizeof(sheet);sheet.dwFlags=PSH_PROPSHEETPAGE|PSH_USEHICON|PSH_NOCONTEXTHELP;
-        sheet.hInstance=instance;sheet.hIcon=LoadIcon(instance,MAKEINTRESOURCE(101));sheet.pszCaption=L"Windows 10 Native Patch — Options";
+        sheet.hwndParent=owner;
+        sheet.hInstance=instance;sheet.hIcon=LoadIcon(instance,MAKEINTRESOURCE(101));sheet.pszCaption=L"Explorer Options";
         sheet.nPages=static_cast<UINT>(pages.size());sheet.ppsp=pages.data();
         INT_PTR outcome=PropertySheet(&sheet);result=outcome<0?1:0;
     }
