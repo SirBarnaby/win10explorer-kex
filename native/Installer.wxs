@@ -1,0 +1,58 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Wix xmlns="http://schemas.microsoft.com/wix/2006/wi">
+ <Product Id="{9F62E90D-90FB-48CF-A445-B01E1DCFF200}" Name="Windows 10 Native Patch" Language="1033" Version="2.0.0" Manufacturer="Win10NativePatch contributors" UpgradeCode="{35B86C67-D8B0-4A0C-9FFB-40FE72AE137E}">
+  <Package InstallerVersion="500" Compressed="yes" InstallScope="perMachine" Platform="x64"/>
+  <MediaTemplate EmbedCab="yes"/>
+  <MajorUpgrade DowngradeErrorMessage="A newer native patch is already installed." Schedule="afterInstallExecute"/>
+  <Property Id="ARPSYSTEMCOMPONENT" Value="1"/>
+  <Property Id="EXPLORERACCEPTED" Value="$(var.Acceptance)"/>
+  <Property Id="MSIRESTARTMANAGERCONTROL" Value="Disable"/>
+  <Property Id="REBOOT" Value="ReallySuppress"/>
+  <Property Id="NATIVEWINDOWSBUILD"><RegistrySearch Id="WindowsBuild" Root="HKLM" Key="SOFTWARE\Microsoft\Windows NT\CurrentVersion" Name="CurrentBuildNumber" Type="raw" Win64="yes"/></Property>
+  <Condition Message="Windows 10 22H2 x64 (build 19045) is required.">Installed OR (VersionNT64 AND NATIVEWINDOWSBUILD = "19045")</Condition>
+  <Condition Message="This Explorer component has not passed native acceptance.">EXPLORERACCEPTED = "1" OR NOT (&amp;Explorer = 3)</Condition>
+  <Directory Id="TARGETDIR" Name="SourceDir">
+   <Directory Id="ProgramFiles64Folder"><Directory Id="PatchRoot" Name="Win10 Native Patch"><Directory Id="INSTALLDIR" Name="2.0.0">
+    <Component Id="CoreFiles" Guid="{9A21F663-7B47-4EB0-BED9-AF0F7322DB2C}" Win64="yes">
+     <File Id="OptionsExe" Source="$(var.BinaryDir)\Win10PatchOptions.exe" KeyPath="yes"/>
+     <File Id="SetupExe" Source="$(var.BinaryDir)\NativePatchSetup.exe"/>
+     <RegistryValue Root="HKLM" Key="Software\Win10NativePatch\v2" Name="InstallDirectory" Value="[INSTALLDIR]" Type="string"/>
+     <RegistryValue Root="HKLM" Key="Software\Microsoft\Windows\CurrentVersion\Uninstall\Win10NativePatch.v2" Name="DisplayName" Value="Windows 10 Native Patch" Type="string"/>
+     <RegistryValue Root="HKLM" Key="Software\Microsoft\Windows\CurrentVersion\Uninstall\Win10NativePatch.v2" Name="DisplayVersion" Value="2.0.0" Type="string"/>
+     <RegistryValue Root="HKLM" Key="Software\Microsoft\Windows\CurrentVersion\Uninstall\Win10NativePatch.v2" Name="UninstallString" Value="&quot;[INSTALLDIR]NativePatchSetup.exe&quot; --uninstall" Type="string"/>
+     <RegistryValue Root="HKLM" Key="Software\Microsoft\Windows\CurrentVersion\Uninstall\Win10NativePatch.v2" Name="ModifyPath" Value="&quot;[INSTALLDIR]NativePatchSetup.exe&quot;" Type="string"/>
+     <RegistryValue Root="HKLM" Key="Software\Microsoft\Windows\CurrentVersion\Uninstall\Win10NativePatch.v2" Name="DisplayIcon" Value="[INSTALLDIR]Win10PatchOptions.exe,0" Type="string"/>
+    </Component>
+    <Component Id="SourceAndNotices" Guid="{C31F9363-838F-49EC-8EB2-C445FFBC9DB6}" Win64="yes">
+     <File Source="$(var.BundleDir)\Source.zip" KeyPath="yes"/>
+     <File Source="$(var.BundleDir)\LICENSE.txt"/>
+     <File Source="$(var.BundleDir)\README.txt"/>
+     <File Source="$(var.BundleDir)\acceptance.json"/>
+    </Component>
+    <Component Id="SnapFiles" Guid="{FA2BD954-36C5-4E62-83FA-569434B50DC3}" Win64="yes"><File Id="SnapExe" Source="$(var.BinaryDir)\NativeSnap.exe" KeyPath="yes"/></Component>
+    <Component Id="ExplorerFiles" Guid="{A416A73F-3CD9-473D-A76C-7CED2653360F}" Win64="yes">
+     <File Id="ExplorerDll" Source="$(var.BinaryDir)\ExplorerTabs.dll" KeyPath="yes"/>
+     <RegistryValue Root="HKLM" Key="Software\Win10NativePatch\v2" Name="InstalledFeatures" Type="integer" Value="1"/>
+     <RegistryKey Root="HKLM" Key="Software\Classes\CLSID\{73F7B7DC-C022-4862-A3EA-7BD04EAE73A9}">
+      <RegistryValue Value="Windows 10 native Explorer tabs" Type="string"/>
+      <RegistryKey Key="InprocServer32"><RegistryValue Value="[#ExplorerDll]" Type="string"/><RegistryValue Name="ThreadingModel" Value="Apartment" Type="string"/></RegistryKey>
+     </RegistryKey>
+     <RegistryValue Root="HKLM" Key="Software\Microsoft\Windows\CurrentVersion\Explorer\Browser Helper Objects\{73F7B7DC-C022-4862-A3EA-7BD04EAE73A9}" Value="Windows 10 native Explorer tabs" Type="string"/>
+     <RegistryValue Root="HKLM" Key="Software\Microsoft\Windows\CurrentVersion\Shell Extensions\Approved" Name="{73F7B7DC-C022-4862-A3EA-7BD04EAE73A9}" Value="Windows 10 native Explorer tabs" Type="string"/>
+    </Component>
+   </Directory></Directory></Directory>
+   <Directory Id="ProgramMenuFolder"><Directory Id="PatchMenu" Name="Windows 10 Native Patch">
+    <Component Id="Shortcuts" Guid="{56BD3B68-6DC9-4A61-A3A9-A6038A7DC560}" Win64="yes">
+     <Shortcut Id="OptionsShortcut" Name="Options" Target="[#OptionsExe]" WorkingDirectory="INSTALLDIR"/>
+     <Shortcut Id="SetupShortcut" Name="Change or remove" Target="[#SetupExe]" WorkingDirectory="INSTALLDIR"/>
+     <Shortcut Id="DisableShortcut" Name="Emergency disable" Target="[#SetupExe]" Arguments="--emergency-disable" WorkingDirectory="INSTALLDIR"/>
+     <RemoveFolder Id="RemovePatchMenu" On="uninstall"/>
+     <RegistryValue Root="HKLM" Key="Software\Win10NativePatch\v2" Name="MenuInstalled" Type="integer" Value="1" KeyPath="yes"/>
+    </Component>
+   </Directory></Directory>
+  </Directory>
+  <Feature Id="Core" Title="Options, recovery and source" Level="1" Absent="disallow"><ComponentRef Id="CoreFiles"/><ComponentRef Id="SourceAndNotices"/><ComponentRef Id="Shortcuts"/></Feature>
+  <Feature Id="Snap" Title="Native snapping" Level="1"><ComponentRef Id="SnapFiles"/></Feature>
+  <Feature Id="Explorer" Title="Explorer title-bar tabs" Level="1"><ComponentRef Id="ExplorerFiles"/><Condition Level="0">EXPLORERACCEPTED &lt;&gt; "1"</Condition></Feature>
+ </Product>
+</Wix>

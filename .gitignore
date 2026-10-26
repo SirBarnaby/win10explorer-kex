@@ -1,0 +1,13 @@
+/bin/
+/build*/
+/dist/
+/evidence/
+/package/
+/tools/
+/vendor/
+/native/build*/
+*.zip
+*.zip.sha256
+*.user
+*.suo
+*.log

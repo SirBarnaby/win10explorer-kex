@@ -1,0 +1,18 @@
+#include <windows.h>
+101 ICON "NativeSnap.ico"
+301 DIALOGEX 0,0,334,216
+STYLE DS_SETFONT | DS_MODALFRAME | WS_POPUP | WS_CAPTION | WS_SYSMENU
+CAPTION "Windows 10 Native Patch — Setup"
+FONT 9,"Segoe UI"
+BEGIN
+ LTEXT "Choose components",-1,12,12,304,12
+ CONTROL "Explorer title-bar tabs",1401,"Button",BS_AUTOCHECKBOX | WS_TABSTOP,14,33,297,14
+ CONTROL "Touchpad snapping and optional keyboard shortcuts",1402,"Button",BS_AUTOCHECKBOX | WS_TABSTOP,14,54,305,14
+ LTEXT "Options is installed in the Start menu with every configuration.",-1,14,78,301,20
+ LTEXT "",1410,14,102,304,48
+ PUSHBUTTON "Install / change",1403,12,162,91,16
+ PUSHBUTTON "Repair",1404,110,162,60,16
+ PUSHBUTTON "Remove all",1405,177,162,75,16
+ PUSHBUTTON "Close",IDCANCEL,259,162,60,16
+ LTEXT "Setup never restarts Explorer. Reopen folder windows when convenient.",-1,14,190,304,18
+END

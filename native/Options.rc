@@ -1,0 +1,61 @@
+#include <windows.h>
+#include <commctrl.h>
+101 ICON "../src/NativeSnap.ico"
+
+201 DIALOGEX 0,0,330,218
+STYLE DS_SETFONT | DS_CONTROL | WS_CHILD
+FONT 9,"Segoe UI"
+BEGIN
+ LTEXT "Choose the features you want to use.",-1,12,10,302,12
+ CONTROL "Explorer title-bar tabs",1001,"Button",BS_AUTOCHECKBOX | WS_TABSTOP,12,33,220,14
+ LTEXT "",1011,25,50,285,23
+ CONTROL "Touchpad snap gestures",1002,"Button",BS_AUTOCHECKBOX | WS_TABSTOP,12,80,220,14
+ LTEXT "",1012,25,97,285,24
+ CONTROL "Alternate keyboard shortcuts",1003,"Button",BS_AUTOCHECKBOX | WS_TABSTOP,12,127,220,14
+ LTEXT "",1013,25,144,285,24
+ LTEXT "Features are independent. Standard Windows + arrow shortcuts keep their Windows behavior.",-1,12,182,302,28
+END
+
+202 DIALOGEX 0,0,330,218
+STYLE DS_SETFONT | DS_CONTROL | WS_CHILD
+FONT 9,"Segoe UI"
+BEGIN
+ CONTROL "Restore tabs when starting Explorer",1101,"Button",BS_AUTOCHECKBOX | WS_TABSTOP,12,12,285,14
+ LTEXT "Turning tabs off keeps the current folder open and saves the tab session for when you turn tabs back on.",-1,12,37,302,29
+ GROUPBOX "Tab shortcuts",-1,10,78,310,107
+ LTEXT "New tab\tCtrl + T\nClose tab\tCtrl + W\nReopen closed tab\tCtrl + Shift + T\nNext / previous\tCtrl + Tab / Ctrl + Shift + Tab\nSelect a tab\tCtrl + 1 through 9",-1,20,94,292,78
+ LTEXT "Windows + E and Ctrl + N continue to open separate Explorer windows.",-1,12,194,302,23
+END
+
+203 DIALOGEX 0,0,330,218
+STYLE DS_SETFONT | DS_CONTROL | WS_CHILD
+FONT 9,"Segoe UI"
+BEGIN
+ LTEXT "Optional keyboard shortcuts",-1,12,9,300,12
+ CONTROL "Ctrl",1201,"Button",BS_AUTOCHECKBOX | WS_TABSTOP,12,29,49,13
+ CONTROL "Alt",1202,"Button",BS_AUTOCHECKBOX | WS_TABSTOP,69,29,44,13
+ CONTROL "Windows",1203,"Button",BS_AUTOCHECKBOX | WS_TABSTOP,121,29,78,13
+ CONTROL "Shift",1204,"Button",BS_AUTOCHECKBOX | WS_TABSTOP,210,29,66,13
+ LTEXT "Left",-1,12,56,44,12
+ COMBOBOX 1210,60,53,90,145,CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP
+ LTEXT "Up",-1,174,56,44,12
+ COMBOBOX 1211,218,53,90,145,CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP
+ LTEXT "Right",-1,12,84,44,12
+ COMBOBOX 1212,60,81,90,145,CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP
+ LTEXT "Down",-1,174,84,44,12
+ COMBOBOX 1213,218,81,90,145,CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP
+ GROUPBOX "Snap behavior",-1,10,112,310,87
+ LTEXT "Left / right: snap to that half; repeating stays there.\nFrom a side, up / down: choose its top / bottom corner.\nOpposite left / right: restore a smaller centered window.",-1,20,128,292,34
+ LTEXT "Floating up / down: maximize / restore and center.\nRepeated down keeps the bottom corner visible. Never minimize.",-1,20,166,292,29
+ LTEXT "Touchpad swipes use separate internal bindings.",-1,12,204,300,12
+END
+
+204 DIALOGEX 0,0,330,218
+STYLE DS_SETFONT | DS_CONTROL | WS_CHILD
+FONT 9,"Segoe UI"
+BEGIN
+ EDITTEXT 1301,10,10,310,146,ES_MULTILINE | ES_AUTOVSCROLL | ES_READONLY | WS_VSCROLL | WS_TABSTOP
+ PUSHBUTTON "Refresh status",1302,10,165,90,17
+ PUSHBUTTON "Restore previous gestures",1303,155,165,165,17
+ LTEXT "Restoring gestures turns off the touchpad feature. Your other feature choices stay as they are.",-1,10,190,310,25
+END

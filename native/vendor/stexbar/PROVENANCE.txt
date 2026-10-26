@@ -1,0 +1,8 @@
+Reference: https://github.com/stefankueng/tools/tree/78a130839802780be6b5c2f53ee556e3d8065779/StExBar/src
+Snapshot retrieved 2026-10-26 from repository main at the above commit.
+SRBand.cpp/.h, ExPaths.cpp, StExBar.cpp and LICENSE are preserved unchanged.
+Stefan Kueng's source headers grant GPL version 2 or any later version.
+ExplorerTabs.cpp adapts the COM class factory, IObjectWithSite lifetime, and
+IServiceProvider -> IShellBrowser -> IShellView -> IFolderView access pattern.
+The tab model, serialization, frame integration and rendering are new code.
+ShellTabs source was not used.

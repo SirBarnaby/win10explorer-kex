@@ -1,0 +1,4 @@
+# GCC 16 MinGW adds default-manifest.o unconditionally. Supply only our manifest.
+*endfile:
+crtend.o%s
+
