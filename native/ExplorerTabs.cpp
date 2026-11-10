@@ -3049,6 +3049,7 @@ LRESULT CALLBACK Controller::StripProc(HWND h, UINT m, WPARAM w, LPARAM l)
         }
         break;
     case WM_NCDESTROY:
+        RemovePropW(h, L"Win10NativePatch.CaptionInk");
         SetWindowLongPtrW(h, GWLP_USERDATA, 0);
         break;
     }

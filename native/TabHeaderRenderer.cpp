@@ -13,6 +13,7 @@
 #include <memory>
 #include <unordered_set>
 #include "TabMotion.h"
+#include "CaptionInk.h"
 
 using Microsoft::WRL::ComPtr;
 namespace header {
@@ -57,6 +58,7 @@ Edge EdgeOf(const RECT& r) { return {r.left, r.top, r.right, r.bottom}; }
 struct Inks {
     COLORREF text{}, disabled{}, accent{}, selectedText{}, selectedFill{}, hotFill{}, highlightText{}, background{};
     bool contrast{}, caption{}, active{};
+    float textOpacity{1.f}; // inactive windows fade only the theme's caption ink
     bool operator==(const Inks&) const = default;
 };
 enum class Part : unsigned char { None, Body, Close };
@@ -308,7 +310,18 @@ struct TabHeaderRenderer::Impl {
         const int normal = inks.caption ? (state.active ? CS_ACTIVE : CS_INACTIVE) : TS_NORMAL;
         const COLORREF nativeText =
             GetSysColor(inks.caption ? (state.active ? COLOR_CAPTIONTEXT : COLOR_INACTIVECAPTIONTEXT) : COLOR_BTNTEXT);
-        inks.text = inks.contrast ? nativeText : native.Get(part, normal, TMT_TEXTCOLOR, nativeText);
+        const COLORREF styled = inks.contrast ? nativeText : native.Get(part, normal, TMT_TEXTCOLOR, nativeText);
+        // In the title bar the tabs use the same ink as the window's own title
+        // (DWMBlurGlass, dark or accent title bars); the row keeps its toolbar ink.
+        if (inks.caption) {
+            const auto in = caption::Gather(GetAncestor(window, GA_ROOT), state.active, styled);
+            inks.text = caption::Ink(in);
+            inks.textOpacity = state.active || caption::Exact(in) ? 1.f : .82f;
+        } else {
+            inks.text = styled;
+            inks.textOpacity = state.active ? 1.f : .82f;
+        }
+        if (inks.caption) SetPropW(window, L"Win10NativePatch.CaptionInk", reinterpret_cast<HANDLE>(static_cast<ULONG_PTR>(inks.text | 0x01000000)));
         inks.disabled = GetSysColor(COLOR_GRAYTEXT);
         inks.accent = GetSysColor(COLOR_HIGHLIGHT);
         inks.highlightText = GetSysColor(COLOR_HIGHLIGHTTEXT);
@@ -419,7 +432,7 @@ struct TabHeaderRenderer::Impl {
         auto label = Box(geometry.body);
         label.left += pad + icon + pad;
         label.right -= px(4);
-        brush->SetColor(Color(ink, opacity));
+        brush->SetColor(Color(ink, inks.textOpacity));
         if (label.right > label.left)
             dc->DrawTextW(tab.title.data(), static_cast<UINT>(tab.title.size()), font.Get(), label, brush.Get(), D2D1_DRAW_TEXT_OPTIONS_CLIP);
         // Narrow tabs keep the close button on the selected tab only.

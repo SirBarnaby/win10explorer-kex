@@ -11,6 +11,9 @@
 #include <mutex>
 #include <utility>
 #include <dcomp.h>
+#include <dwmapi.h>
+#include <uxtheme.h>
+#include <vssym32.h>
 #include <d2d1.h>
 #include <exdisp.h>
 #include <shlobj.h>
@@ -402,6 +405,69 @@ int wmain(int argc,wchar_t** argv){
             <<",\"activeCaptionColor\":"<<caption<<",\"captionTextColor\":"<<captionText<<",\"buttonTextColor\":"<<buttonText
             <<",\"systemRestored\":"<<(restored?"true":"false")<<",\"providerExplicitlyDisabled\":false,\"transparencySettingExercised\":"<<(theme?"true":"false")<<"}";
         UnhookWindowsHookEx(hook);FreeLibrary(module);Gdiplus::GdiplusShutdown(gdip);CoUninitialize();return whiteSet&&restored?0:1;
+    }
+    if(argc==4&&!wcscmp(argv[3],L"--caption-ink")) {
+        // AE7: tabs in the title bar use the window's own title ink in light,
+        // dark, accent (light and dark colours) and DWMBlurGlass modes.
+        PostMessageW(h,ApplyMessage(),64,0);Wait(800);
+        SetWindowPos(h,HWND_TOPMOST,100,70,1050,650,SWP_SHOWWINDOW);Wait(300);
+        HWND strip{};EnumChildWindows(h,[](HWND child,LPARAM value)->BOOL{wchar_t name[128]{};GetClassNameW(child,name,128);if(!wcsncmp(name,L"Win10NativePatch.ExplorerTabs.v2",32)){*reinterpret_cast<HWND*>(value)=child;return FALSE;}return TRUE;},reinterpret_cast<LPARAM>(&strip));
+        const wchar_t* personalize=L"Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize";const wchar_t* dwm=L"Software\\Microsoft\\Windows\\DWM";
+        struct Saved{const wchar_t* key;const wchar_t* name;DWORD value;bool present;};
+        std::vector<Saved> saved{{personalize,L"AppsUseLightTheme",0,false},{dwm,L"ColorPrevalence",0,false},{dwm,L"AccentColor",0,false}};
+        for(auto& s:saved){DWORD size=4;s.present=RegGetValueW(HKEY_CURRENT_USER,s.key,s.name,RRF_RT_REG_DWORD,nullptr,&s.value,&size)==ERROR_SUCCESS;}
+        auto set=[&](const wchar_t* key,const wchar_t* name,DWORD value){RegSetKeyValueW(HKEY_CURRENT_USER,key,name,REG_DWORD,&value,4);};
+        auto broadcast=[&]{DWORD_PTR result{};SendMessageTimeoutW(HWND_BROADCAST,WM_SETTINGCHANGE,0,reinterpret_cast<LPARAM>(L"ImmersiveColorSet"),SMTO_ABORTIFHUNG,500,&result);Wait(1200);};
+        auto darkFrame=[&]{for(DWORD attribute:{20u,19u}){BOOL dark=FALSE;if(SUCCEEDED(DwmGetWindowAttribute(h,attribute,&dark,sizeof(dark))))return dark!=FALSE;}DWORD light=1,size=4;RegGetValueW(HKEY_CURRENT_USER,personalize,L"AppsUseLightTheme",RRF_RT_REG_DWORD,nullptr,&light,&size);return light==0;};
+        COLORREF themeActive=RGB(0,0,0),themeInactive=RGB(0,0,0);
+        if(HTHEME theme=OpenThemeData(h,L"WINDOW")){GetThemeColor(theme,WP_CAPTION,CS_ACTIVE,TMT_TEXTCOLOR,&themeActive);GetThemeColor(theme,WP_CAPTION,CS_INACTIVE,TMT_TEXTCOLOR,&themeInactive);CloseThemeData(theme);}
+        std::ofstream report(dir+L"\\caption-ink.json");report<<"{\"strip\":"<<reinterpret_cast<ULONG_PTR>(strip)<<",\"modes\":[";bool good=strip!=nullptr,first=true;
+        auto inkPixels=[&](COLORREF expected){RECT r{};GetWindowRect(strip,&r);const int w=r.right-r.left,hh=r.bottom-r.top;if(w<=0||hh<=0)return 0;
+            HDC screen=GetDC(nullptr),dc=CreateCompatibleDC(screen);BITMAPINFO info{};info.bmiHeader.biSize=sizeof(info.bmiHeader);info.bmiHeader.biWidth=w;info.bmiHeader.biHeight=-hh;info.bmiHeader.biPlanes=1;info.bmiHeader.biBitCount=32;void* bits{};
+            HBITMAP bitmap=CreateDIBSection(screen,&info,DIB_RGB_COLORS,&bits,nullptr,0);int count=0;
+            if(bitmap){HGDIOBJ old=SelectObject(dc,bitmap);BitBlt(dc,0,0,w,hh,screen,r.left,r.top,SRCCOPY|CAPTUREBLT);GdiFlush();const auto* p=static_cast<const BYTE*>(bits);
+                for(int i=0;i<w*hh;++i){const int d=abs(p[i*4+2]-GetRValue(expected))+abs(p[i*4+1]-GetGValue(expected))+abs(p[i*4]-GetBValue(expected));if(d<=60)++count;}SelectObject(dc,old);DeleteObject(bitmap);}
+            DeleteDC(dc);ReleaseDC(nullptr,screen);return count;};
+        // exact=false: the theme fallback on an inactive window is faded like
+        // DWM's own caption text, so only the reported ink is compared.
+        auto measure=[&](const wchar_t* mode,bool active,COLORREF expected,bool exact){
+            if(active)ActivateFrame(h);else{SetCursorPos(40,420);INPUT click[2]{};for(auto& i:click)i.type=INPUT_MOUSE;click[0].mi.dwFlags=MOUSEEVENTF_LEFTDOWN;click[1].mi.dwFlags=MOUSEEVENTF_LEFTUP;SendInput(2,click,sizeof(INPUT));Wait(500);}
+            InvalidateRect(strip,nullptr,FALSE);Wait(400);
+            const COLORREF ink=static_cast<COLORREF>(reinterpret_cast<ULONG_PTR>(GetPropW(strip,L"Win10NativePatch.CaptionInk")))&0xFFFFFF;
+            const int pixels=inkPixels(expected);const bool foreground=GetForegroundWindow()==h;
+            const bool pass=ink==expected&&(!exact||pixels>=15)&&foreground==active;good=good&&pass;
+            Capture(h,dir+L"\\ink-"+mode+(active?L"-active.png":L"-inactive.png"));
+            char name[64]{};WideCharToMultiByte(CP_UTF8,0,mode,-1,name,64,nullptr,nullptr);
+            report<<(first?"":",")<<"{\"mode\":\""<<name<<"\",\"active\":"<<(active?"true":"false")<<",\"expected\":"<<expected<<",\"ink\":"<<ink<<",\"pixels\":"<<pixels<<",\"foreground\":"<<(foreground?"true":"false")<<",\"darkFrame\":"<<(darkFrame()?"true":"false")<<",\"passed\":"<<(pass?"true":"false")<<'}';first=false;report.flush();};
+        auto both=[&](const wchar_t* mode,COLORREF active,COLORREF inactive,bool inactiveExact){measure(mode,true,active,true);measure(mode,false,inactive,inactiveExact);};
+        set(personalize,L"AppsUseLightTheme",1);set(dwm,L"ColorPrevalence",0);broadcast();
+        both(L"light",themeActive,themeInactive,false);
+        set(personalize,L"AppsUseLightTheme",0);broadcast();
+        if(darkFrame())both(L"dark",RGB(255,255,255),RGB(170,170,170),true);else both(L"dark-not-applied",themeActive,themeInactive,false);
+        // Accent title bars use DWM's live colorization colour; text is black on
+        // light colours and white on dark ones (both rules are unit tested).
+        set(personalize,L"AppsUseLightTheme",1);set(dwm,L"ColorPrevalence",1);broadcast();
+        DWORD argb{};BOOL opaque{};DwmGetColorizationColor(&argb,&opaque);
+        const COLORREF accent=RGB((argb>>16)&0xFF,(argb>>8)&0xFF,argb&0xFF);
+        const bool lightAccent=5*GetGValue(accent)+2*GetRValue(accent)+GetBValue(accent)>8*128;
+        report<<(first?"":",")<<"{\"accentColour\":"<<accent<<'}';first=false;
+        both(L"accent",lightAccent?RGB(0,0,0):RGB(255,255,255),themeInactive,false);
+        set(dwm,L"ColorPrevalence",0);broadcast();
+        // DWMBlurGlass stand-in: a process with its name beside the user's config.
+        wchar_t temp[MAX_PATH]{};GetTempPathW(MAX_PATH,temp);const std::wstring stub=std::wstring(temp)+L"BlurGlassStub";
+        CreateDirectoryW(stub.c_str(),nullptr);CreateDirectoryW((stub+L"\\data").c_str(),nullptr);
+        const bool copied=CopyFileW(L"C:\\Windows\\System32\\PING.EXE",(stub+L"\\DWMBlurGlass.exe").c_str(),FALSE)!=FALSE;
+        {std::ofstream ini(stub+L"\\data\\config.ini");ini<<"[config]\r\napplyglobal=false\r\nactiveTextColor=4278190080\r\ninactiveTextColor=4294967295\r\nactiveTextColorDark=4280492835\r\ninactiveTextColorDark=4294967295\r\n";}
+        STARTUPINFOW startup{sizeof(startup)};startup.dwFlags=STARTF_USESHOWWINDOW;startup.wShowWindow=SW_HIDE;PROCESS_INFORMATION process{};
+        std::wstring command=L"\""+stub+L"\\DWMBlurGlass.exe\" -n 60 127.0.0.1";
+        const bool started=copied&&CreateProcessW(nullptr,command.data(),nullptr,nullptr,FALSE,CREATE_NO_WINDOW,nullptr,stub.c_str(),&startup,&process);
+        Wait(6000); // the process list is re-read every five seconds
+        both(L"blurglass",RGB(0,0,0),RGB(255,255,255),true);
+        if(started){TerminateProcess(process.hProcess,0);WaitForSingleObject(process.hProcess,2000);CloseHandle(process.hThread);CloseHandle(process.hProcess);}
+        for(auto& s:saved){if(s.present)set(s.key,s.name,s.value);else RegDeleteKeyValueW(HKEY_CURRENT_USER,s.key,s.name);}
+        broadcast();PostMessageW(h,ApplyMessage(),0,0);Wait(400);
+        report<<"],\"blurGlassStubStarted\":"<<(started?"true":"false")<<",\"themeActive\":"<<themeActive<<",\"themeInactive\":"<<themeInactive<<",\"success\":"<<(good&&started?"true":"false")<<'}';
+        UnhookWindowsHookEx(hook);FreeLibrary(module);Gdiplus::GdiplusShutdown(gdip);CoUninitialize();return good&&started?0:1;
     }
     if(argc==4&&!wcscmp(argv[3],L"--renderer-faults")) {
         const auto sessionBefore=SavedSession();PostMessageW(h,ApplyMessage(),72,0);Wait(2700);PostMessageW(h,ApplyMessage(),70,0);Wait(150);
