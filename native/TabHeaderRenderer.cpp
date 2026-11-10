@@ -53,10 +53,12 @@ bool SamePixels(const VisualState& a,const VisualState& b) {
     if(!same(l.allocation.bounds,r.allocation.bounds)||l.allocation.dpi!=r.allocation.dpi||!same(l.viewport,r.viewport)||
        !same(l.newTab,r.newTab)||!same(l.overflow,r.overflow)||l.active!=r.active||l.tabs.size()!=r.tabs.size()||
        a.tabs.size()!=b.tabs.size()||!(a.hot==b.hot)||!(a.pressed==b.pressed)||!(a.focus==b.focus)||a.active!=b.active||
-       a.focused!=b.focused||a.canCreate!=b.canCreate||a.busyTab!=b.busyTab)return false;
+       a.focused!=b.focused||a.canCreate!=b.canCreate||a.busyTab!=b.busyTab||!same(l.tabViewport,r.tabViewport)||
+       !same(l.scrollLeft,r.scrollLeft)||!same(l.scrollRight,r.scrollRight)||l.fadeLeft!=r.fadeLeft||l.fadeRight!=r.fadeRight)return false;
     for(size_t i=0;i<l.tabs.size();++i) {
         const auto& x=l.tabs[i];const auto& y=r.tabs[i];
-        if(x.id!=y.id||!same(x.bounds,y.bounds)||!same(x.body,y.body)||!same(x.close,y.close)||!same(x.closeGlyph,y.closeGlyph))return false;
+        if(x.id!=y.id||x.showClose!=y.showClose||!same(x.bounds,y.bounds)||!same(x.body,y.body)||!same(x.close,y.close)||
+           !same(x.closeGlyph,y.closeGlyph))return false;
     }
     for(size_t i=0;i<a.tabs.size();++i) {
         const auto& x=a.tabs[i];const auto& y=b.tabs[i];
@@ -181,11 +183,93 @@ struct TabHeaderRenderer::Impl {
             fill(state.layout.viewport,contrast?GetSysColor(COLOR_BTNFACE):
                  rebar.Get(RP_BACKGROUND,0,TMT_FILLCOLOR,GetSysColor(COLOR_BTNFACE)),1.f);
         }
+        // Tabs draw inside their own viewport. While scrolled, the clipped
+        // edges fade out through an opacity mask, as in Firefox's tab strip.
+        const RECT tabArea=state.layout.tabViewport;
+        ComPtr<ID2D1Layer> fadeLayer;
+        bool faded=false;
+        if(state.layout.fadeLeft||state.layout.fadeRight) {
+            const float left=static_cast<float>(tabArea.left),right=static_cast<float>(tabArea.right);
+            const float span=std::max(1.f,right-left),edge=std::min(span/2.f,static_cast<float>(px(24)))/span;
+            const D2D1_GRADIENT_STOP stops[]{
+                {0.f,D2D1::ColorF(0,0,0,state.layout.fadeLeft?0.f:1.f)},{edge,D2D1::ColorF(0,0,0,1.f)},
+                {1.f-edge,D2D1::ColorF(0,0,0,1.f)},{1.f,D2D1::ColorF(0,0,0,state.layout.fadeRight?0.f:1.f)}};
+            ComPtr<ID2D1GradientStopCollection> collection;
+            ComPtr<ID2D1LinearGradientBrush> mask;
+            if(SUCCEEDED(draw->CreateGradientStopCollection(stops,4,&collection))&&
+               SUCCEEDED(draw->CreateLinearGradientBrush(D2D1::LinearGradientBrushProperties(D2D1::Point2F(left,0),D2D1::Point2F(right,0)),
+                                                          collection.Get(),&mask))&&
+               SUCCEEDED(draw->CreateLayer(nullptr,&fadeLayer))) {
+                draw->PushLayer(D2D1::LayerParameters(Box(tabArea),nullptr,D2D1_ANTIALIAS_MODE_ALIASED,
+                                                      D2D1::IdentityMatrix(),1.f,mask.Get()),fadeLayer.Get());
+                faded=true;
+            }
+        }
+        if(!faded)draw->PushAxisAlignedClip(Box(tabArea),D2D1_ANTIALIAS_MODE_ALIASED);
+        hr=DrawTabs(draw,state,brush.Get(),{text,disabled,accent,selectedText,selectedFill,hotFill,contrast});
+        if(faded)draw->PopLayer();else draw->PopAxisAlignedClip();
+        if(FAILED(hr))return hr;
         auto affordance=[&](TargetId target,RECT bounds,bool enabled) {
             if(!enabled)return;
             if(state.pressed==target&&state.hot==target)fill(bounds,hotFill,contrast?1.f:.30f);
             else if(state.hot==target)fill(bounds,hotFill,contrast?1.f:.16f);
         };
+        const bool newEnabled=state.canCreate;
+        affordance({TargetKind::NewTab,0},state.layout.newTab,newEnabled);
+        affordance({TargetKind::Overflow,0},state.layout.overflow,true);
+        auto controlInk=[&](TargetId id,bool enabled) {
+            return !enabled?disabled:contrast&&state.hot==id?GetSysColor(COLOR_HIGHLIGHTTEXT):text;
+        };
+        const auto plus=state.layout.newTab,overflow=state.layout.overflow;
+        const float cx=(plus.left+plus.right)/2.f,cy=(plus.top+plus.bottom)/2.f,r=static_cast<float>(px(4));
+        const COLORREF plusInk=controlInk({TargetKind::NewTab,0},newEnabled);
+        line(cx-r,cy,cx+r,cy,plusInk,1.f,stroke);line(cx,cy-r,cx,cy+r,plusInk,1.f,stroke);
+        const float ox=(overflow.left+overflow.right)/2.f,oy=(overflow.top+overflow.bottom)/2.f;
+        const COLORREF overflowInk=controlInk({TargetKind::Overflow,0},true);
+        line(ox-r,oy-r/2,ox,oy+r/2,overflowInk,1.f,stroke);
+        line(ox,oy+r/2,ox+r,oy-r/2,overflowInk,1.f,stroke);
+        // Scroll arrows: chevrons that grey out at either end.
+        auto arrow=[&](TargetKind kind,RECT bounds,bool enabled,float direction) {
+            if(IsRectEmpty(&bounds))return;
+            affordance({kind,0},bounds,enabled);
+            const COLORREF ink=controlInk({kind,0},enabled);
+            const float ax=(bounds.left+bounds.right)/2.f,ay=(bounds.top+bounds.bottom)/2.f,half=r/2.f;
+            line(ax+half*direction,ay-r,ax-half*direction,ay,ink,1.f,stroke);
+            line(ax-half*direction,ay,ax+half*direction,ay+r,ink,1.f,stroke);
+        };
+        arrow(TargetKind::ScrollLeft,state.layout.scrollLeft,state.layout.fadeLeft,1.f);
+        arrow(TargetKind::ScrollRight,state.layout.scrollRight,state.layout.fadeRight,-1.f);
+        if(state.focused&&(state.focus.kind==TargetKind::NewTab||state.focus.kind==TargetKind::Overflow)) {
+            RECT focus=state.focus.kind==TargetKind::NewTab?plus:overflow;InflateRect(&focus,-px(3),-px(3));
+            brush->SetColor(Color(text,.8f));draw->DrawRectangle(Box(focus),brush.Get(),stroke);
+        }
+        std::erase_if(icons,[&](const IconSource& cached) {
+            return std::none_of(state.tabs.begin(),state.tabs.end(),[&](const TabVisual& tab) {
+                return tab.id==cached.id&&tab.iconRevision==cached.revision&&tab.icon==cached.handle;
+            });
+        });
+        return S_OK;
+    }
+    struct Inks {COLORREF text,disabled,accent,selectedText,selectedFill,hotFill;bool contrast;};
+    HRESULT DrawTabs(ID2D1RenderTarget* draw,const VisualState& state,ID2D1SolidColorBrush* brush,const Inks& inks) {
+        const auto [text,disabled,accent,selectedText,selectedFill,hotFill,contrast]=inks;
+        auto fill=[&](RECT r,COLORREF color,float opacity) {
+            if(IsRectEmpty(&r))return;
+            brush->SetColor(Color(color,opacity));draw->FillRectangle(Box(r),brush);
+        };
+        auto line=[&](float x1,float y1,float x2,float y2,COLORREF color,float opacity,float thickness) {
+            brush->SetColor(Color(color,opacity));
+            draw->DrawLine(D2D1::Point2F(x1,y1),D2D1::Point2F(x2,y2),brush,thickness);
+        };
+        auto affordance=[&](TargetId target,RECT bounds,bool enabled) {
+            if(!enabled)return;
+            if(state.pressed==target&&state.hot==target)fill(bounds,hotFill,contrast?1.f:.30f);
+            else if(state.hot==target)fill(bounds,hotFill,contrast?1.f:.16f);
+        };
+        const UINT scale=state.layout.allocation.dpi;
+        auto px=[&](int n){return MulDiv(n,static_cast<int>(scale),96);};
+        const float stroke=static_cast<float>(std::max(1,px(1)));
+        HRESULT hr=S_OK;
         for(const auto& tab:state.tabs) {
             const auto* geometry=state.layout.Find(tab.id);
             if(!geometry||!geometry->Visible())continue;
@@ -223,44 +307,24 @@ struct TabHeaderRenderer::Impl {
             auto label=Box(geometry->body);label.left+=pad+icon+pad;label.right-=px(4);
             brush->SetColor(Color(ink,opacity));
             if(label.right>label.left)draw->DrawTextW(tab.title.data(),static_cast<UINT>(tab.title.size()),font.Get(),label,
-                                                    brush.Get(),D2D1_DRAW_TEXT_OPTIONS_CLIP);
-            const auto glyph=geometry->closeGlyph;
-            line(glyph.left+.5f,glyph.top+.5f,glyph.right-.5f,glyph.bottom-.5f,ink,opacity,stroke);
-            line(glyph.right-.5f,glyph.top+.5f,glyph.left+.5f,glyph.bottom-.5f,ink,opacity,stroke);
+                                                    brush,D2D1_DRAW_TEXT_OPTIONS_CLIP);
+            // Narrow tabs keep the close button on the selected tab only.
+            if(geometry->showClose&&!IsRectEmpty(&geometry->closeGlyph)) {
+                const auto glyph=geometry->closeGlyph;
+                line(glyph.left+.5f,glyph.top+.5f,glyph.right-.5f,glyph.bottom-.5f,ink,opacity,stroke);
+                line(glyph.right-.5f,glyph.top+.5f,glyph.left+.5f,glyph.bottom-.5f,ink,opacity,stroke);
+            }
             if(state.focused&&(state.focus==body||state.focus==close)) {
                 RECT focus=state.focus==body?geometry->body:geometry->close;InflateRect(&focus,-px(3),-px(3));
-                brush->SetColor(Color(ink,.8f));draw->DrawRectangle(Box(focus),brush.Get(),stroke);
+                brush->SetColor(Color(ink,.8f));draw->DrawRectangle(Box(focus),brush,stroke);
             }
             if(state.busyTab&&tab.id==state.busyTab) {
                 const float x=bounds.left+pad+icon/2.f,y=(bounds.top+bounds.bottom)/2.f,r=px(6)*1.f;
-                brush->SetColor(Color(text,.8f));draw->DrawEllipse(D2D1::Ellipse(D2D1::Point2F(x,y),r,r),brush.Get(),stroke);
+                brush->SetColor(Color(text,.8f));draw->DrawEllipse(D2D1::Ellipse(D2D1::Point2F(x,y),r,r),brush,stroke);
                 line(x,y,x,y-r*.6f,text,1.f,stroke);line(x,y,x+r*.5f,y,text,1.f,stroke);
             }
         }
-        const bool newEnabled=state.canCreate;
-        affordance({TargetKind::NewTab,0},state.layout.newTab,newEnabled);
-        affordance({TargetKind::Overflow,0},state.layout.overflow,true);
-        auto controlInk=[&](TargetId id,bool enabled) {
-            return !enabled?disabled:contrast&&state.hot==id?GetSysColor(COLOR_HIGHLIGHTTEXT):text;
-        };
-        const auto plus=state.layout.newTab,overflow=state.layout.overflow;
-        const float cx=(plus.left+plus.right)/2.f,cy=(plus.top+plus.bottom)/2.f,r=static_cast<float>(px(4));
-        const COLORREF plusInk=controlInk({TargetKind::NewTab,0},newEnabled);
-        line(cx-r,cy,cx+r,cy,plusInk,1.f,stroke);line(cx,cy-r,cx,cy+r,plusInk,1.f,stroke);
-        const float ox=(overflow.left+overflow.right)/2.f,oy=(overflow.top+overflow.bottom)/2.f;
-        const COLORREF overflowInk=controlInk({TargetKind::Overflow,0},true);
-        line(ox-r,oy-r/2,ox,oy+r/2,overflowInk,1.f,stroke);
-        line(ox,oy+r/2,ox+r,oy-r/2,overflowInk,1.f,stroke);
-        if(state.focused&&(state.focus.kind==TargetKind::NewTab||state.focus.kind==TargetKind::Overflow)) {
-            RECT focus=state.focus.kind==TargetKind::NewTab?plus:overflow;InflateRect(&focus,-px(3),-px(3));
-            brush->SetColor(Color(text,.8f));draw->DrawRectangle(Box(focus),brush.Get(),stroke);
-        }
-        std::erase_if(icons,[&](const IconSource& cached) {
-            return std::none_of(state.tabs.begin(),state.tabs.end(),[&](const TabVisual& tab) {
-                return tab.id==cached.id&&tab.iconRevision==cached.revision&&tab.icon==cached.handle;
-            });
-        });
-        return S_OK;
+        return hr;
     }
     HRESULT Paint(HWND owned,const VisualState& state) {
         if(hasPainted&&dpi&&window==owned&&SamePixels(painted,state))return S_FALSE;

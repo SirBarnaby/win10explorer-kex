@@ -50,11 +50,11 @@ constexpr wchar_t ControllerProperty[] = L"Win10NativePatch.ExplorerController.v
 constexpr wchar_t ProofProperty[] = L"Win10NativePatch.IsolatedProof.v2";
 constexpr wchar_t SessionKey[] = L"Software\\Win10NativePatch\\v2\\ExplorerTabs";
 constexpr wchar_t WindowSessionProperty[]=L"Win10NativePatch.WindowSession.v1";
-constexpr UINT_PTR MaintenanceTimer = 0x57545032, SessionTimer = 0x57545033;
+constexpr UINT_PTR MaintenanceTimer = 0x57545032, SessionTimer = 0x57545033, ScrollTimer = 0x57545034;
 constexpr UINT SyncMessage = WM_APP + 0x482;
 constexpr UINT RestoreMessage = WM_APP + 0x483;
 constexpr UINT IconMessage = WM_APP + 0x484;
-constexpr size_t MaxTabs = 64, MaxHistory = 64, MaxSelection = 512, MaxPacket = 8 * 1024 * 1024;
+constexpr size_t MaxTabs = 500, MaxHistory = 64, MaxSelection = 512, MaxPacket = 8 * 1024 * 1024;
 // LastSession stays small enough to read and write without a visible pause.
 constexpr size_t SessionBudget = 1024 * 1024, BackgroundHistory = 16;
 constexpr UINT SessionDelayMs = 1500;
@@ -1068,6 +1068,11 @@ class Controller final : public IObjectWithSite, public IAccessible, public IDro
     HHOOK keyboard_{};
     bool headerAttached_=false,layingOut_=false,hasUsableSession_=false,sessionDirty_=false;
     RECT placed_{};
+    // Overflow scrolling and Firefox's close-with-mouse width lock.
+    int scroll_{}, lockedWidth_{};
+    ULONGLONG revealedId_{};
+    HWND tooltip_{};
+    header::TargetId tipTarget_{};
     DWORD ownerThread_{};
     bool enabled_ = false, tearingDown_ = false, inDrag_ = false, dropPrivate_ = false, sameWindowDrop_ = false;
     bool frameHooked_ = false, selfHosted_ = false, legacyHidden_ = false, closingFrame_ = false;
@@ -1144,6 +1149,11 @@ class Controller final : public IObjectWithSite, public IAccessible, public IDro
     void DrainCommands();
     bool Defer(tabs::Command);
     void MoveTab(int);
+    void ScrollBy(int pixels);
+    void ScrollRepeat(bool first);
+    void RefreshHot();
+    void Tooltip(header::TargetId target);
+    std::wstring TooltipText(header::TargetId target) const;
     void BeginRestore(const ViewState &);
     void ApplyRestore();
     void CancelRestore();
@@ -1708,6 +1718,13 @@ void Controller::Enable(bool value)
         enabled_=false;
         layout_={};
         if(headerAttached_){header::Detach(frame_,!closingFrame_);headerAttached_=false;}
+        if (tooltip_)
+        {
+            DestroyWindow(tooltip_);
+            tooltip_ = nullptr;
+        }
+        tipTarget_ = {};
+        lockedWidth_ = 0;
         if (strip_)
         {
             RevokeDragDrop(strip_);
@@ -1791,7 +1808,10 @@ void Controller::Layout(bool transient)
     std::vector<std::uint64_t> identities;
     identities.reserve(tabs_.size());
     for(const auto& tab:tabs_)identities.push_back(tab.id);
-    auto next=header::BuildLayout(allocation,identities,DisplayedId(),layout_.firstVisible);
+    const auto shown=DisplayedId();
+    // A newly shown tab scrolls into view; otherwise the user's scroll stays.
+    auto next=header::BuildLayout(allocation,identities,shown,{scroll_,lockedWidth_,shown!=revealedId_});
+    revealedId_=shown;scroll_=next.scroll;
     const RECT area=allocation.bounds;
     // Moving the frame reflows with identical bounds; the child moves with it.
     if(!EqualRect(&area,&placed_)||!IsWindowVisible(strip_))
@@ -2236,8 +2256,13 @@ void Controller::TabChanged()
 void Controller::RefreshMetadata()
 {
     if(!enabled_||!frame_)return;
-    for(auto& tab:tabs_)
+    // Names and icons load for tabs on screen first; the queue is bounded.
+    std::vector<Tab*> order;order.reserve(tabs_.size());
+    for(auto& tab:tabs_){const auto* shown=layout_.Find(tab.id);if(shown&&shown->Visible())order.push_back(&tab);}
+    for(auto& tab:tabs_){const auto* shown=layout_.Find(tab.id);if(!shown||!shown->Visible())order.push_back(&tab);}
+    for(Tab* entry:order)
     {
+        auto& tab=*entry;
         if(tab.position>=tab.history.size())continue;
         auto& state=tab.history[tab.position];
         if(Equal(tab.metadataLoaded,state.folder))continue;
@@ -2472,6 +2497,7 @@ int Controller::Hit(POINT point) const
         for(size_t i=0;i<tabs_.size();++i)if(tabs_[i].id==target.tab)return static_cast<int>(i);
     if(target.kind==header::TargetKind::NewTab)return -2;
     if(target.kind==header::TargetKind::Overflow)return -3;
+    if(target.kind==header::TargetKind::ScrollLeft||target.kind==header::TargetKind::ScrollRight)return -4;
     return -1;
 }
 void Controller::Menu(int hit, POINT point)
@@ -2536,6 +2562,7 @@ void Controller::Menu(int hit, POINT point)
 void Controller::CancelPointer()
 {
     pressedTarget_={};pressedButton_=0;
+    if(strip_)KillTimer(strip_,ScrollTimer);
     if(strip_&&GetCapture()==strip_)ReleaseCapture();
     if(strip_)InvalidateRect(strip_,nullptr,FALSE);
 }
@@ -2576,6 +2603,92 @@ void Controller::InvokeTarget(header::TargetId target)
     else if(target.kind==header::TargetKind::Close&&index>=0)Close(index);
     else if(target.kind==header::TargetKind::NewTab)NewTab();
     else if(target.kind==header::TargetKind::Overflow)Menu(-3,MenuAnchor(target));
+    else if(target.kind==header::TargetKind::ScrollLeft)ScrollBy(-layout_.tabWidth);
+    else if(target.kind==header::TargetKind::ScrollRight)ScrollBy(layout_.tabWidth);
+}
+void Controller::ScrollBy(int pixels)
+{
+    if(!Ready()||!layout_.overflowing||!pixels)return;
+    const int next=std::clamp(scroll_+pixels,0,layout_.maxScroll);
+    if(next==scroll_)return;
+    scroll_=next;revealedId_=DisplayedId();
+    Layout();
+    RefreshHot();
+    RefreshMetadata();
+}
+void Controller::ScrollRepeat(bool first)
+{
+    // Press-and-hold repeats at the keyboard's delay and rate.
+    if(!strip_||(pressedTarget_.kind!=header::TargetKind::ScrollLeft&&pressedTarget_.kind!=header::TargetKind::ScrollRight)){
+        if(strip_)KillTimer(strip_,ScrollTimer);
+        return;
+    }
+    if(first||hotTarget_==pressedTarget_)
+        ScrollBy(pressedTarget_.kind==header::TargetKind::ScrollLeft?-layout_.tabWidth:layout_.tabWidth);
+    int delay{},speed{};
+    SystemParametersInfoW(SPI_GETKEYBOARDDELAY,0,&delay,0);SystemParametersInfoW(SPI_GETKEYBOARDSPEED,0,&speed,0);
+    const UINT interval=first?static_cast<UINT>(250*(std::clamp(delay,0,3)+1)):static_cast<UINT>(1000.0/(2.5+std::clamp(speed,0,31)*27.5/31.0));
+    SetTimer(strip_,ScrollTimer,interval,nullptr);
+}
+void Controller::RefreshHot()
+{
+    POINT point{};
+    if(!strip_||!GetCursorPos(&point))return;
+    ScreenToClient(strip_,&point);
+    RECT client{};GetClientRect(strip_,&client);
+    const auto target=PtInRect(&client,point)?layout_.Hit(point):header::TargetId{};
+    if(target!=hotTarget_){hotTarget_=target;InvalidateRect(strip_,nullptr,FALSE);}
+    Tooltip(target);
+}
+void Controller::Tooltip(header::TargetId target)
+{
+    if(!strip_)return;
+    if(!tooltip_) {
+        tooltip_=CreateWindowExW(WS_EX_TOPMOST,TOOLTIPS_CLASSW,nullptr,WS_POPUP|TTS_NOPREFIX|TTS_ALWAYSTIP,
+                                 CW_USEDEFAULT,CW_USEDEFAULT,CW_USEDEFAULT,CW_USEDEFAULT,strip_,nullptr,module,nullptr);
+        if(!tooltip_)return;
+        TTTOOLINFOW tool{sizeof(tool)};tool.uFlags=TTF_SUBCLASS|TTF_TRANSPARENT;tool.hwnd=strip_;tool.uId=1;
+        tool.lpszText=LPSTR_TEXTCALLBACKW;
+        SendMessageW(tooltip_,TTM_ADDTOOLW,0,reinterpret_cast<LPARAM>(&tool));
+        SendMessageW(tooltip_,TTM_SETMAXTIPWIDTH,0,MulDiv(480,static_cast<int>(dpi_),96));
+    }
+    if(target==tipTarget_)return;
+    tipTarget_=target;
+    SendMessageW(tooltip_,TTM_POP,0,0);
+    TTTOOLINFOW tool{sizeof(tool)};tool.hwnd=strip_;tool.uId=1;
+    RECT bounds{};
+    if(target.kind==header::TargetKind::Tab||target.kind==header::TargetKind::Close) {
+        if(const auto* tab=layout_.Find(target.tab))IntersectRect(&bounds,&tab->bounds,&layout_.tabViewport);
+    } else if(target.kind==header::TargetKind::NewTab)bounds=layout_.newTab;
+    else if(target.kind==header::TargetKind::Overflow)bounds=layout_.overflow;
+    else if(target.kind==header::TargetKind::ScrollLeft)bounds=layout_.scrollLeft;
+    else if(target.kind==header::TargetKind::ScrollRight)bounds=layout_.scrollRight;
+    tool.rect=bounds;
+    SendMessageW(tooltip_,TTM_NEWTOOLRECTW,0,reinterpret_cast<LPARAM>(&tool));
+}
+std::wstring Controller::TooltipText(header::TargetId target) const
+{
+    switch(target.kind) {
+    case header::TargetKind::NewTab: return L"New tab (Ctrl+T)";
+    case header::TargetKind::Overflow: return L"List all tabs";
+    case header::TargetKind::ScrollLeft: return L"Scroll tabs left";
+    case header::TargetKind::ScrollRight: return L"Scroll tabs right";
+    case header::TargetKind::Close: return L"Close tab (Ctrl+W)";
+    case header::TargetKind::Tab: break;
+    default: return {};
+    }
+    const int index=Index(target.tab);
+    if(index<0)return {};
+    const auto& tab=tabs_[index];
+    std::wstring text=tab.title;
+    if(tab.position<tab.history.size()&&tab.history[tab.position].folder) {
+        PWSTR path{};
+        if(SUCCEEDED(SHGetNameFromIDList(tab.history[tab.position].folder.p,SIGDN_DESKTOPABSOLUTEEDITING,&path))&&path) {
+            if(text!=path)text+=L"\n"+std::wstring(path);
+            CoTaskMemFree(path);
+        }
+    }
+    return text;
 }
 void Controller::Mouse(UINT message, WPARAM, LPARAM data)
 {
@@ -2590,6 +2703,7 @@ void Controller::Mouse(UINT message, WPARAM, LPARAM data)
             hotTarget_=target;
             InvalidateRect(strip_, nullptr, FALSE);
         }
+        Tooltip(target);
         TRACKMOUSEEVENT t{sizeof(t), TME_LEAVE, strip_, 0};
         TrackMouseEvent(&t);
         if (pressedButton_==WM_LBUTTONDOWN&&pressedTarget_.kind==header::TargetKind::Tab&& (GetKeyState(VK_LBUTTON) & 0x8000) && !inDrag_)
@@ -2613,6 +2727,7 @@ void Controller::Mouse(UINT message, WPARAM, LPARAM data)
         InvalidateRect(strip_,nullptr,FALSE);
         dragStart_ = point;
         SetCapture(strip_);
+        if(message==WM_LBUTTONDOWN&&hit==-4){ScrollRepeat(true);return;}
         if (hit == -1)
         {
             ReleaseCapture();
@@ -2629,6 +2744,9 @@ void Controller::Mouse(UINT message, WPARAM, LPARAM data)
         // Capture-change cleanup can run synchronously during ReleaseCapture.
         // Preserve the intended ordinary up action before releasing it.
         CancelPointer();
+        // Closing with the mouse keeps tab widths until the pointer leaves the
+        // strip, so the next close button lands under it (Firefox).
+        if(valid&&was.kind==header::TargetKind::Close&&!layout_.overflowing)lockedWidth_=layout_.tabWidth;
         if(valid)InvokeTarget(was);
         return;
     }
@@ -2638,6 +2756,7 @@ void Controller::Mouse(UINT message, WPARAM, LPARAM data)
         const auto now=layout_.Hit(point);
         const bool valid=pressedButton_==WM_MBUTTONDOWN&&GetCapture()==strip_&&was.tab&&was.tab==now.tab&&was==now;
         CancelPointer();
+        if(valid&&!layout_.overflowing)lockedWidth_=layout_.tabWidth;
         if(valid)InvokeTarget({header::TargetKind::Close,was.tab});
         return;
     }
@@ -2687,8 +2806,34 @@ LRESULT CALLBACK Controller::StripProc(HWND h, UINT m, WPARAM w, LPARAM l)
         return 0;
     case WM_MOUSELEAVE:
         self->hotTarget_={};
+        self->Tooltip({});
+        if(self->lockedWidth_){self->lockedWidth_=0;self->Layout();}
         InvalidateRect(h, nullptr, FALSE);
         return 0;
+    case WM_MOUSEWHEEL:
+    case WM_MOUSEHWHEEL:
+        // While overflowing, a wheel notch moves one tab and a horizontal
+        // touchpad swipe moves in proportion. Otherwise the wheel is Explorer's.
+        if(self->layout_.overflowing){
+            const int delta=GET_WHEEL_DELTA_WPARAM(w);
+            self->ScrollBy(header::ScrollStep(self->layout_,m==WM_MOUSEWHEEL?-delta:delta));
+            return 0;
+        }
+        break;
+    case WM_TIMER:
+        if(w==ScrollTimer){self->ScrollRepeat(false);return 0;}
+        break;
+    case WM_NOTIFY:
+    {
+        auto* info=reinterpret_cast<NMTTDISPINFOW*>(l);
+        if(info&&info->hdr.hwndFrom==self->tooltip_&&info->hdr.code==TTN_GETDISPINFOW) {
+            static thread_local std::wstring text;
+            text=self->TooltipText(self->tipTarget_);
+            info->lpszText=text.data();
+            return 0;
+        }
+        break;
+    }
     case WM_CAPTURECHANGED:
     case WM_CANCELMODE:
         self->CancelPointer();
@@ -2847,6 +2992,7 @@ LRESULT CALLBACK Controller::FrameProc(HWND h, UINT m, WPARAM w, LPARAM l, UINT_
     {
         if (m == WM_SIZE || m == WM_WINDOWPOSCHANGED || m == WM_DPICHANGED)
         {
+            if(m!=WM_WINDOWPOSCHANGED)self->lockedWidth_=0;
             header::Invalidate(h);
             result = DefSubclassProc(h, m, w, l);
             self->Layout(true);
@@ -3371,6 +3517,11 @@ HRESULT Controller::DragOver(DWORD keys, POINTL point, DWORD *effect)
     }
     POINT local{point.x, point.y};
     ScreenToClient(strip_, &local);
+    if(layout_.overflowing) {
+        const int edge=MulDiv(header::ControlDip,static_cast<int>(dpi_),96),step=MulDiv(8,static_cast<int>(dpi_),96);
+        if(local.x<layout_.tabViewport.left+edge)ScrollBy(-step);
+        else if(local.x>=layout_.tabViewport.right-edge)ScrollBy(step);
+    }
     int hit = Hit(local);
     if (hit != hoverDrop_)
     {
@@ -3564,7 +3715,8 @@ bool Controller::ChildRect(LONG child, RECT &out) const
     else if(child>0&&static_cast<size_t>(child)<=tabs_.size()*2){
         const auto* tab=layout_.Find(tabs_[(child-1)/2].id);
         if(!tab)return false;
-        out=child%2?tab->body:tab->close;
+        const RECT part=child%2?tab->body:tab->close;
+        if(!IntersectRect(&out,&part,&layout_.tabViewport))out={};
     }
     else if (child == static_cast<LONG>(tabs_.size()*2 + 1))
         out=layout_.newTab;
@@ -4030,8 +4182,8 @@ extern "C" HRESULT WINAPI RunModelTests(const wchar_t *report)
                 tabs.push_back(reader.tab());
             return reader.ok && !reader.left && tabs.size() == count && active < count;
         };
-        auto build = [&](size_t entries, size_t selected) {
-            std::vector<Tab> tabs(MaxTabs);
+        auto build = [&](size_t count, size_t entries, size_t selected) {
+            std::vector<Tab> tabs(count);
             for (size_t i = 0; i < tabs.size(); ++i)
                 for (size_t e = 0; e < entries; ++e)
                 {
@@ -4047,7 +4199,7 @@ extern "C" HRESULT WINAPI RunModelTests(const wchar_t *report)
             return tabs;
         };
         const size_t active = 3;
-        auto trimmed = build(60, 2);
+        auto trimmed = build(64, 60, 2);
         auto bytes = EncodeSession(trimmed, active, SessionBudget);
         std::vector<Tab> decoded;
         DWORD decodedActive{};
@@ -4057,7 +4209,7 @@ extern "C" HRESULT WINAPI RunModelTests(const wchar_t *report)
                                 decoded[active].history.size() == 60 && decoded[0].history.size() == BackgroundHistory + 1 &&
                                 decoded[0].position == BackgroundHistory && decoded[0].history.back().selected.size() == 2 &&
                                 decoded[0].history.front().selected.empty());
-        auto heavy = build(20, 100);
+        auto heavy = build(MaxTabs, 20, 100);
         bytes = EncodeSession(heavy, active, SessionBudget);
         decoded.clear();
         const bool heavyOk = decode(bytes, decoded, decodedActive);
@@ -4065,7 +4217,7 @@ extern "C" HRESULT WINAPI RunModelTests(const wchar_t *report)
                             !bytes.empty() && bytes.size() <= SessionBudget && heavyOk && decoded.size() == MaxTabs &&
                                 decoded[0].history.size() == 1 && decoded[0].history[0].selected.empty() &&
                                 decoded[active].history[0].selected.size() == 100);
-        auto light = build(3, 1);
+        auto light = build(64, 3, 1);
         bytes = EncodeSession(light, active, SessionBudget);
         decoded.clear();
         checks.emplace_back("session_small_keeps_full_detail",

@@ -129,6 +129,41 @@ int wmain(int argc,wchar_t** argv){
   out<<",\"rapidSwitchDelivered\":"<<(rapid?"true":"false")<<",\"success\":"<<(good?"true":"false")<<'}';
   PostMessageW(frame,apply,0,0);Pump(400);UnhookWindowsHookEx(hook);FreeLibrary(lab);PostMessageW(frame,WM_CLOSE,0,0);CoUninitialize();return good?0:1;
  }
+ if(mode==L"overflow"){
+  // AE3/AE4: many tabs shrink to the 76 DIP minimum, scroll by whole tabs and
+  // stay reachable; the wrapper records the LastSession size afterwards.
+  const int dpi=static_cast<int>(GetDpiForWindow(frame)),minimum=MulDiv(76,dpi,96),unit=MulDiv(30,dpi,96);
+  size_t stuck=0;while(TabCount(frame)<120&&stuck<3){const size_t n=TabCount(frame);CtrlKey('T');Pump(350);stuck=TabCount(frame)==n?stuck+1:0;}
+  Pump(1500);
+  auto tabs=Tabs(frame);
+  auto firstShown=[&]{tabs=Tabs(frame);for(size_t i=0;i<tabs.size();++i)if(!(tabs[i].state&STATE_SYSTEM_OFFSCREEN))return static_cast<int>(i);return -1;};
+  auto width=[](const Target& t){return static_cast<int>(t.rect.right-t.rect.left);};
+  int offscreen=0;for(auto& t:tabs)if(t.state&STATE_SYSTEM_OFFSCREEN)++offscreen;
+  const int selected=SelectedIndex(frame),shown=firstShown();
+  // The neighbour of the revealed last tab is whole and, being narrow, has no close button.
+  const int neighbour=tabs.size()>=2?width(tabs[tabs.size()-2]):0;
+  check("overflow-120-tabs",tabs.size()==120);
+  check("overflow-minimum-width",neighbour>=minimum-1&&neighbour<=minimum+1);
+  check("overflow-hides-offscreen-tabs",offscreen>0&&shown>0);
+  check("overflow-selected-revealed",selected==119&&!(tabs[119].state&STATE_SYSTEM_OFFSCREEN));
+  bool closeHidden=false;for(auto& t:Targets(frame))if(tabs.size()>=2&&t.child==tabs[tabs.size()-2].child+1)closeHidden=(t.state&STATE_SYSTEM_OFFSCREEN)!=0;
+  check("overflow-narrow-tab-close-hidden",closeHidden);
+  const RECT neighbourRect=tabs.size()>=2?tabs[tabs.size()-2].rect:RECT{};
+  SetCursorPos((neighbourRect.left+neighbourRect.right)/2,(neighbourRect.top+neighbourRect.bottom)/2);Pump(200);
+  for(int i=0;i<3;++i){INPUT wheel{};wheel.type=INPUT_MOUSE;wheel.mi.dwFlags=MOUSEEVENTF_WHEEL;wheel.mi.mouseData=WHEEL_DELTA;SendInput(1,&wheel,sizeof(wheel));Pump(150);}
+  Pump(400);const int afterWheel=firstShown();
+  check("overflow-wheel-scrolls-by-tabs",shown>=3&&afterWheel==shown-3);
+  check("overflow-wheel-keeps-selection",SelectedIndex(frame)==119);
+  if(auto a=Access(frame);a&&!tabs.empty())a->accDoDefaultAction(Child(tabs[0].child));
+  Pump(1500);const int afterReveal=firstShown();
+  check("overflow-offscreen-tab-reachable",SelectedIndex(frame)==0&&afterReveal==0);
+  RECT strip{};GetWindowRect(Strip(frame),&strip);
+  PhysicalClick({strip.right-unit*2-unit/2,(strip.top+strip.bottom)/2});Pump(300);
+  check("overflow-right-arrow-scrolls-one-tab",firstShown()==1);
+  out<<"],\"dpi\":"<<dpi<<",\"tabs\":"<<tabs.size()<<",\"tabWidth\":"<<neighbour<<",\"minimum\":"<<minimum<<",\"offscreen\":"<<offscreen
+     <<",\"firstShown\":"<<shown<<",\"afterWheel\":"<<afterWheel<<",\"afterReveal\":"<<afterReveal<<",\"success\":"<<(good?"true":"false")<<'}';
+  PostMessageW(frame,apply,0,0);Pump(400);UnhookWindowsHookEx(hook);FreeLibrary(lab);PostMessageW(frame,WM_CLOSE,0,0);CoUninitialize();return good?0:1;
+ }
  if(mode==L"switching"){
   // AE1/AE2 and the Firefox chords. Tabs: Alpha, Beta, Gamma (Gamma shown).
   CreateDirectoryW(L"C:\\NativeLabFolders\\Gamma",nullptr);{HANDLE z=CreateFileW(L"C:\\NativeLabFolders\\Gamma\\Zeta.txt",GENERIC_WRITE,0,nullptr,CREATE_ALWAYS,0,nullptr);if(z!=INVALID_HANDLE_VALUE)CloseHandle(z);}
