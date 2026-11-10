@@ -1,6 +1,7 @@
 #include <windows.h>
 #include <commctrl.h>
 #include <gdiplus.h>
+#include <algorithm>
 #include <cstring>
 #include <fstream>
 #include <string>
@@ -110,7 +111,12 @@ void WINAPI ObserveDebug(LPCWSTR text){
     log<<GetTickCount64()<<L" "<<(text?text:L"")<<L"\n";
     reinterpret_cast<void(WINAPI*)(LPCWSTR)>(debugOriginal)(text);
 }
-PVOID* drawSlot{};PVOID drawOriginal{},drawReplacement{};ID2D1Factory* observedFactory{};
+// The production renderer draws through DirectComposition surfaces created by
+// its own desktop device. The draw fault rejects BeginDraw on those surfaces
+// only, as a lost device would, so Explorer's own composition is untouched.
+PVOID* surfaceSlot{};PVOID surfaceOriginal{},surfaceReplacement{};
+PVOID* drawSlot{};PVOID drawOriginal{},drawReplacement{};IUnknown* observedDevice{};
+std::vector<IUnknown*> observedSurfaces;
 bool rejectDraw{};ULONG graphicsCalls{};
 void RestoreGraphics(){
     if(debugSlot)Exchange(debugSlot,debugOriginal,reinterpret_cast<PVOID>(ObserveDebug));
@@ -118,30 +124,44 @@ void RestoreGraphics(){
     if(graphicsSlot)Exchange(graphicsSlot,graphicsOriginal,graphicsReplacement);
     graphicsSlot=nullptr;
     if(drawSlot)Exchange(drawSlot,drawOriginal,drawReplacement);
-    drawSlot=nullptr;observedFactory=nullptr;rejectDraw=false;
+    drawSlot=nullptr;
+    if(surfaceSlot)Exchange(surfaceSlot,surfaceOriginal,surfaceReplacement);
+    surfaceSlot=nullptr;observedDevice=nullptr;observedSurfaces.clear();rejectDraw=false;
 }
-HRESULT WINAPI NoComposition(IDXGIDevice*,REFIID,void** value){
+HRESULT WINAPI NoComposition(IUnknown*,REFIID,void** value){
     if(value)*value=nullptr;
     SetPropW(frame,L"HeaderLab.GraphicsCalls",reinterpret_cast<HANDLE>(static_cast<ULONG_PTR>(++graphicsCalls)));
     return E_FAIL;
 }
-using DrawTargetFn=HRESULT(STDMETHODCALLTYPE*)(ID2D1Factory*,IDXGISurface*,const D2D1_RENDER_TARGET_PROPERTIES*,ID2D1RenderTarget**);
-HRESULT STDMETHODCALLTYPE ObserveDraw(ID2D1Factory* factory,IDXGISurface* surface,
-        const D2D1_RENDER_TARGET_PROPERTIES* properties,ID2D1RenderTarget** target){
-    if(rejectDraw&&factory==observedFactory){
-        if(target)*target=nullptr;
+using BeginDrawFn=HRESULT(STDMETHODCALLTYPE*)(IUnknown*,const RECT*,REFIID,void**,POINT*);
+HRESULT STDMETHODCALLTYPE ObserveBeginDraw(IUnknown* surface,const RECT* update,REFIID iid,void** value,POINT* offset){
+    if(rejectDraw&&std::find(observedSurfaces.begin(),observedSurfaces.end(),surface)!=observedSurfaces.end()){
+        if(value)*value=nullptr;
         SetPropW(frame,L"HeaderLab.GraphicsCalls",reinterpret_cast<HANDLE>(static_cast<ULONG_PTR>(++graphicsCalls)));
         return D2DERR_RECREATE_TARGET;
     }
-    return reinterpret_cast<DrawTargetFn>(drawOriginal)(factory,surface,properties,target);
+    return reinterpret_cast<BeginDrawFn>(drawOriginal)(surface,update,iid,value,offset);
 }
-HRESULT WINAPI ObserveFactory(D2D1_FACTORY_TYPE type,REFIID id,const D2D1_FACTORY_OPTIONS* options,void** value){
-    using Fn=HRESULT(WINAPI*)(D2D1_FACTORY_TYPE,REFIID,const D2D1_FACTORY_OPTIONS*,void**);
-    HRESULT hr=reinterpret_cast<Fn>(graphicsOriginal)(type,id,options,value);
+using CreateSurfaceFn=HRESULT(STDMETHODCALLTYPE*)(IUnknown*,UINT,UINT,DXGI_FORMAT,DXGI_ALPHA_MODE,IUnknown**);
+HRESULT STDMETHODCALLTYPE ObserveSurface(IUnknown* device,UINT width,UINT height,DXGI_FORMAT format,DXGI_ALPHA_MODE alpha,IUnknown** surface){
+    HRESULT hr=reinterpret_cast<CreateSurfaceFn>(surfaceOriginal)(device,width,height,format,alpha,surface);
+    if(SUCCEEDED(hr)&&device==observedDevice&&surface&&*surface){
+        observedSurfaces.push_back(*surface);
+        // IDCompositionSurface: IUnknown (3 slots), then BeginDraw.
+        auto slot=*reinterpret_cast<PVOID**>(*surface)+3;
+        if(!drawSlot){drawOriginal=*slot;drawReplacement=reinterpret_cast<PVOID>(ObserveBeginDraw);if(Exchange(slot,drawReplacement,drawOriginal))drawSlot=slot;}
+    }
+    return hr;
+}
+HRESULT WINAPI ObserveComposition(IUnknown* rendering,REFIID id,void** value){
+    using Fn=HRESULT(WINAPI*)(IUnknown*,REFIID,void**);
+    HRESULT hr=reinterpret_cast<Fn>(graphicsOriginal)(rendering,id,value);
     if(SUCCEEDED(hr)&&value&&*value){
-        observedFactory=static_cast<ID2D1Factory*>(*value);
-        auto slot=*reinterpret_cast<PVOID**>(observedFactory)+15;
-        if(!drawSlot){drawOriginal=*slot;drawReplacement=reinterpret_cast<PVOID>(ObserveDraw);if(Exchange(slot,drawReplacement,drawOriginal))drawSlot=slot;}
+        observedDevice=static_cast<IUnknown*>(*value);
+        // IDCompositionDevice2: IUnknown (3), Commit, WaitForCommitCompletion,
+        // GetFrameStatistics, CreateVisual, CreateSurfaceFactory, CreateSurface.
+        auto slot=*reinterpret_cast<PVOID**>(observedDevice)+8;
+        if(!surfaceSlot){surfaceOriginal=*slot;surfaceReplacement=reinterpret_cast<PVOID>(ObserveSurface);if(Exchange(slot,surfaceReplacement,surfaceOriginal))surfaceSlot=slot;}
     }
     return hr;
 }
@@ -149,10 +169,10 @@ bool InstrumentGraphics(HMODULE library,bool creation){
     graphicsCalls=0;rejectDraw=false;
     debugSlot=ImportSlot(library,"OutputDebugStringW");
     if(debugSlot){debugOriginal=*debugSlot;if(!Exchange(debugSlot,reinterpret_cast<PVOID>(ObserveDebug),debugOriginal))debugSlot=nullptr;}
-    graphicsSlot=ImportSlot(library,creation?"DCompositionCreateDevice":"D2D1CreateFactory");
+    graphicsSlot=ImportSlot(library,"DCompositionCreateDevice2");
     if(!graphicsSlot)return false;
     graphicsOriginal=*graphicsSlot;
-    graphicsReplacement=creation?reinterpret_cast<PVOID>(NoComposition):reinterpret_cast<PVOID>(ObserveFactory);
+    graphicsReplacement=creation?reinterpret_cast<PVOID>(NoComposition):reinterpret_cast<PVOID>(ObserveComposition);
     return Exchange(graphicsSlot,graphicsReplacement,graphicsOriginal);
 }
 bool InstrumentEvents(HWND anchor,bool enable){

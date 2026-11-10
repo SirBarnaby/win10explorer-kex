@@ -41,7 +41,7 @@ int wmain(int argc,wchar_t** argv){
             const int width=MulDiv(540,static_cast<int>(dpi),96),height=MulDiv(30,static_cast<int>(dpi),96);
             SetWindowPos(child,nullptr,0,80,width,height,SWP_NOACTIVATE|SWP_NOZORDER);
             header::Allocation allocation;allocation.region=header::Region::AllocatedRow;allocation.bounds={0,0,width,height};allocation.dpi=dpi;
-            state.layout=header::BuildLayout(allocation,ids,2,0);
+            state.layout=header::BuildLayout(allocation,ids,2);
             const HRESULT hr=renderer.Paint(child,state);success=SUCCEEDED(hr)&&success;
             Pump(150);Capture(host,std::wstring(argv[1])+L"\\renderer-dpi-"+std::to_wstring(dpi)+L".png");
             if(index++)report<<',';report<<static_cast<LONG>(hr);

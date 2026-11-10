@@ -70,5 +70,7 @@ LayoutState BuildLayout(const Allocation&, std::span<const std::uint64_t> tabs,
 // One scroll step: a wheel notch moves one tab; touchpad deltas move in
 // proportion (pixel exact).
 int ScrollStep(const LayoutState&, int wheelDelta);
+// A tab's geometry relative to its own left edge, at full width.
+TabGeometry LocalTab(int width, int height, UINT dpi, bool showClose);
 RECT Translate(RECT, POINT origin);
 }

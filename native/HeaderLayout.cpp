@@ -39,6 +39,16 @@ int LayoutState::Reveal(std::uint64_t id) const {
     }
     return scroll;
 }
+TabGeometry LocalTab(int width,int height,UINT dpi,bool showClose) {
+    TabGeometry tab;tab.showClose=showClose;tab.bounds={0,0,width,height};tab.body=tab.bounds;
+    if(showClose){
+        const int unit=MulDiv(ControlDip,static_cast<int>(dpi),96),radius=MulDiv(3,static_cast<int>(dpi),96);
+        tab.close={width-unit,0,width,height};tab.body.right=tab.close.left;
+        const int cx=(tab.close.left+tab.close.right)/2,cy=height/2;
+        tab.closeGlyph={cx-radius,cy-radius,cx+radius+1,cy+radius+1};
+    }
+    return tab;
+}
 int ScrollStep(const LayoutState& layout,int wheelDelta) {
     return MulDiv(layout.tabWidth,wheelDelta,WHEEL_DELTA);
 }
@@ -91,7 +101,6 @@ LayoutState BuildLayout(const Allocation& allocation,std::span<const std::uint64
     }
     result.scroll=scroll;result.fadeLeft=scroll>0;result.fadeRight=scroll<result.maxScroll;
     const bool narrow=tabWidth<MulDiv(TabClipDip,dpi,96);
-    const int radius=MulDiv(3,dpi,96);
     bool anyVisible=false;
     result.tabs.reserve(ids.size());
     for(size_t i=0;i<ids.size();++i){
@@ -100,14 +109,10 @@ LayoutState BuildLayout(const Allocation& allocation,std::span<const std::uint64
         const int left=area.left+tab.x-scroll,right=left+tabWidth;
         if(right>area.left&&left<area.right){
             if(!anyVisible){result.firstVisible=i;anyVisible=true;}
-            tab.bounds={left,0,right,height};
-            tab.body=tab.bounds;
-            if(tab.showClose){
-                tab.close={right-unit,0,right,height};
-                tab.body.right=tab.close.left;
-                const int cx=(tab.close.left+tab.close.right)/2,cy=height/2;
-                tab.closeGlyph={cx-radius,cy-radius,cx+radius+1,cy+radius+1};
-            }
+            const auto local=LocalTab(tabWidth,height,allocation.dpi,tab.showClose);
+            const POINT origin{left,0};
+            tab.bounds=Translate(local.bounds,origin);tab.body=Translate(local.body,origin);
+            if(tab.showClose){tab.close=Translate(local.close,origin);tab.closeGlyph=Translate(local.closeGlyph,origin);}
         }
         result.tabs.push_back(tab);
     }
