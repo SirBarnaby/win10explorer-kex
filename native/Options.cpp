@@ -80,6 +80,8 @@ void ReadPages(Context& c) {
         SetFlag(c.draft,patch::KeyboardShortcuts,Checked(c.pages[0],1003));
         SetFlag(c.draft,patch::RestoreTabs,Checked(c.pages[0],1004));
     }
+    // Stored inverted so configurations written before this option animate.
+    if(c.pages[1])SetFlag(c.draft,patch::NoTabAnimations,!Checked(c.pages[1],1005));
     if(c.pages[2]) {
         c.draft.keyboardModifiers=0;
         constexpr DWORD modifiers[]={MOD_CONTROL,MOD_ALT,MOD_WIN,MOD_SHIFT};
@@ -167,6 +169,8 @@ INT_PTR CALLBACK PageProc(HWND page,UINT message,WPARAM w,LPARAM l) {
             Check(page,1001,(c->draft.flags&patch::ExplorerTabs)!=0);Check(page,1002,(c->draft.flags&patch::TouchpadGestures)!=0);
             Check(page,1003,(c->draft.flags&patch::KeyboardShortcuts)!=0);
             Check(page,1004,(c->draft.flags&patch::RestoreTabs)!=0);
+        } else if(index==1) {
+            Check(page,1005,(c->draft.flags&patch::NoTabAnimations)==0);
         } else if(index==2) {
             constexpr DWORD modifiers[]={MOD_CONTROL,MOD_ALT,MOD_WIN,MOD_SHIFT};
             for(int i=0;i<4;++i) {Check(page,1201+i,(c->draft.keyboardModifiers&modifiers[i])!=0);FillKeys(GetDlgItem(page,1210+i),c->draft.keyboardKeys[i]);}

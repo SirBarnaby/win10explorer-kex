@@ -21,11 +21,13 @@ END
 STYLE DS_SETFONT | DS_CONTROL | WS_CHILD
 FONT 9,"Segoe UI"
 BEGIN
- LTEXT "Tabs share the native caption. Narrow windows get an extra row above the address bar.",-1,12,12,302,23
- LTEXT "Turning tabs off keeps the current folder open and saves the tab session for when you turn tabs back on.",-1,12,37,302,29
- GROUPBOX "Tab shortcuts",-1,10,78,310,107
- LTEXT "New tab\tCtrl + T\nClose tab\tCtrl + W\nReopen closed tab\tCtrl + Shift + T\nNext / previous\tCtrl + Tab / Ctrl + Shift + Tab\nSelect a tab\tCtrl + 1 through 9",-1,20,94,292,78
- LTEXT "Windows + E and Ctrl + N continue to open separate Explorer windows.",-1,12,194,302,23
+ LTEXT "Tabs share the native caption. Narrow windows get an extra row above the address bar.",-1,12,8,302,20
+ CONTROL "Animate tabs",1005,"Button",BS_AUTOCHECKBOX | WS_TABSTOP,12,30,302,14
+ LTEXT "Tabs slide when they open, close or move. Turning off ""Show animations in Windows"" in Ease of Access also stops them.",-1,25,45,289,20
+ GROUPBOX "Tab shortcuts",-1,10,68,310,92
+ LTEXT "New tab\nClose tab\nReopen closed tab\nNext / previous tab\nMove tab right / left\nSelect a tab\nReorder tabs",-1,20,82,92,74
+ LTEXT "Ctrl + T\nCtrl + W\nCtrl + Shift + T\nCtrl + Tab, Ctrl + PgDn / PgUp\nCtrl + Shift + PgDn / PgUp\nCtrl + 1 to 8; Ctrl + 9 selects the last\nDrag a tab along the strip",-1,114,82,200,74
+ LTEXT "Turning tabs off keeps the current folder open and saves the tab session. Windows + E and Ctrl + N open separate windows.",-1,12,168,302,23
 END
 
 203 DIALOGEX 0,0,330,218
