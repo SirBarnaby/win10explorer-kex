@@ -37,6 +37,10 @@ add_executable(HeaderRendererStateTests EXCLUDE_FROM_ALL HeaderRendererStateTest
 target_link_libraries(HeaderRendererStateTests PRIVATE HeaderLayout user32 ole32 shell32 gdiplus gdi32 uxtheme dcomp d3d11 dxgi d2d1 dwrite windowscodecs)
 add_executable(ExplorerMvpHost WIN32 ExplorerMvpHost.cpp)
 target_link_libraries(ExplorerMvpHost PRIVATE PatchRuntime dwmapi)
+# Sandbox-only copy of the starter: the Windows Sandbox guest is build 19041.
+add_executable(ExplorerMvpHostLab WIN32 EXCLUDE_FROM_ALL ExplorerMvpHost.cpp)
+target_compile_definitions(ExplorerMvpHostLab PRIVATE NATIVE_LAB_ANY_BUILD=1)
+target_link_libraries(ExplorerMvpHostLab PRIVATE PatchRuntime dwmapi)
 add_executable(ExplorerHeaderProbe WIN32 ExplorerHeaderProbe.cpp)
 target_link_libraries(ExplorerHeaderProbe PRIVATE user32 ole32 oleacc oleaut32 shell32)
 add_executable(NativePatchSetup WIN32 Setup.cpp Setup.rc LegacyMigration.cpp)

@@ -63,11 +63,19 @@ void Refresh() {
     }
     EnumWindows([](HWND window,LPARAM)->BOOL{Queue(window);return TRUE;},0);
 }
+void Created(HWND window) {
+    if(ExplorerFrame(window))PostMessageW(host,RefreshWindow,reinterpret_cast<WPARAM>(window),0);
+}
+void Destroyed(HWND window) {
+    if(observed.erase(window)) {pending.erase(window);PostMessageW(host,RefreshWindow,0,0);}
+}
+// The host normally wakes only for top-level windows that get a taskbar
+// button (shell hook). The WinEvent range below is the fallback when the
+// shell hook cannot be registered: it wakes for every object in the session.
+UINT shellHook{};
 void CALLBACK WindowEvent(HWINEVENTHOOK,DWORD event,HWND window,LONG object,LONG child,DWORD,DWORD) {
     if(object!=OBJID_WINDOW||child!=CHILDID_SELF)return;
-    if(event==EVENT_OBJECT_DESTROY) {
-        if(observed.erase(window)) {pending.erase(window);PostMessageW(host,RefreshWindow,0,0);}
-    } else if(ExplorerFrame(window))PostMessageW(host,RefreshWindow,reinterpret_cast<WPARAM>(window),0);
+    if(event==EVENT_OBJECT_DESTROY)Destroyed(window);else Created(window);
 }
 bool DetachAll(bool preserveSession,ULONG_PTR request) {
     // Owner callbacks can close a frame while the external call is running.
@@ -92,6 +100,15 @@ bool DetachAll(bool preserveSession,ULONG_PTR request) {
 }
 LRESULT CALLBACK HostProc(HWND window,UINT message,WPARAM w,LPARAM l) {
     if(message==patch::SettingsChangedMessage()) {Refresh();return 1;}
+    if(shellHook&&message==shellHook) {
+        const auto target=reinterpret_cast<HWND>(l);
+        switch(w&0x7FFF) {
+        case HSHELL_WINDOWCREATED:Created(target);break;
+        case HSHELL_WINDOWDESTROYED:Destroyed(target);break;
+        default:break;
+        }
+        return 0;
+    }
     switch(message) {
     case RefreshWindow:
         if(w)Queue(reinterpret_cast<HWND>(w));
@@ -181,7 +198,9 @@ int WINAPI wWinMain(HINSTANCE instance,HINSTANCE,PWSTR,int) {
         selected=reinterpret_cast<HWND>(static_cast<ULONG_PTR>(value));
         if(!value||!end||*end||!ExplorerFrame(selected))return 2;
     } else if(!args.empty())return 2;
+#ifndef NATIVE_LAB_ANY_BUILD
     if(!patch::SupportedWindows())return 3;
+#endif
     HANDLE mutex=CreateMutexW(nullptr,FALSE,L"Local\\Win10NativePatch.ExplorerMvpHost.v1");
     if(!mutex)return 1;if(GetLastError()==ERROR_ALREADY_EXISTS){CloseHandle(mutex);return 0;}
     extension=LoadLibraryExW((patch::ModuleDirectory()+L"\\ExplorerTabs.dll").c_str(),nullptr,LOAD_WITH_ALTERED_SEARCH_PATH);
@@ -192,8 +211,12 @@ int WINAPI wWinMain(HINSTANCE instance,HINSTANCE,PWSTR,int) {
     host=CreateWindowExW(WS_EX_TOOLWINDOW,cls.lpszClassName,L"Explorer integration",WS_POPUP,0,0,0,0,nullptr,nullptr,instance,nullptr);
     if(!host){FreeLibrary(extension);CloseHandle(mutex);return 1;}
     SetPropW(host,patch::mvp::SessionHandoffCapability,reinterpret_cast<HANDLE>(1));
-    HWINEVENTHOOK events=SetWinEventHook(EVENT_OBJECT_CREATE,EVENT_OBJECT_HIDE,nullptr,WindowEvent,0,0,WINEVENT_OUTOFCONTEXT|WINEVENT_SKIPOWNPROCESS);
+    HWINEVENTHOOK events{};
+    shellHook=RegisterWindowMessageW(L"SHELLHOOK");
+    const bool shellHooked=shellHook&&RegisterShellHookWindow(host);
+    if(!shellHooked){shellHook=0;events=SetWinEventHook(EVENT_OBJECT_CREATE,EVENT_OBJECT_HIDE,nullptr,WindowEvent,0,0,WINEVENT_OUTOFCONTEXT|WINEVENT_SKIPOWNPROCESS);}
     Refresh();MSG message{};
     while(GetMessageW(&message,nullptr,0,0)>0){TranslateMessage(&message);DispatchMessageW(&message);}
-    if(events)UnhookWinEvent(events);FreeLibrary(extension);CloseHandle(mutex);return 0;
+    if(events)UnhookWinEvent(events);
+    FreeLibrary(extension);CloseHandle(mutex);return 0;
 }
