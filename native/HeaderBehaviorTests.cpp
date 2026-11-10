@@ -33,6 +33,52 @@ bool PopupClick(const std::wstring& label){
 void ReopenPhysical(){Key(VK_CONTROL);Key(VK_SHIFT);Key('T');Key('T',true);Key(VK_SHIFT,true);Key(VK_CONTROL,true);Pump(700);}
 std::vector<HWND> ExplorerWindows(){std::vector<HWND> result;ComPtr<IShellWindows> windows;if(FAILED(CoCreateInstance(CLSID_ShellWindows,nullptr,CLSCTX_ALL,IID_PPV_ARGS(&windows))))return result;long count{};windows->get_Count(&count);for(long i=0;i<count;++i){ComPtr<IDispatch> dispatch;ComPtr<IWebBrowser2> browser;if(SUCCEEDED(windows->Item(Child(i),&dispatch))&&SUCCEEDED(dispatch.As(&browser))){SHANDLE_PTR handle{};browser->get_HWND(&handle);result.push_back(reinterpret_cast<HWND>(handle));}}return result;}
 void Type(const std::wstring& text){for(wchar_t c:text){INPUT input[2]{};for(auto& item:input){item.type=INPUT_KEYBOARD;item.ki.wScan=c;item.ki.dwFlags=KEYEVENTF_UNICODE;}input[1].ki.dwFlags|=KEYEVENTF_KEYUP;SendInput(2,input,sizeof(INPUT));}Pump(80);}
+// ---- Lab timing (U1 baseline and later comparisons) ----
+HANDLE TimingFile(){
+ static HANDLE file=[]{wchar_t path[MAX_PATH]{};DWORD bytes=sizeof(path);
+  if(RegGetValueW(HKEY_CURRENT_USER,L"Software\\Win10NativePatch\\v2",L"TimingLog",RRF_RT_REG_SZ,nullptr,path,&bytes)!=ERROR_SUCCESS||!*path)return INVALID_HANDLE_VALUE;
+  return CreateFileW(path,FILE_APPEND_DATA,FILE_SHARE_READ|FILE_SHARE_WRITE,nullptr,OPEN_ALWAYS,FILE_ATTRIBUTE_NORMAL,nullptr);}();
+ return file;
+}
+void Mark(const char* event,ULONGLONG a=0){
+ HANDLE file=TimingFile();if(file==INVALID_HANDLE_VALUE)return;LARGE_INTEGER now{},rate{};QueryPerformanceCounter(&now);QueryPerformanceFrequency(&rate);
+ const auto t=static_cast<ULONGLONG>(now.QuadPart),f=static_cast<ULONGLONG>(rate.QuadPart);char line[160]{};
+ const int n=wsprintfA(line,"%I64u %s %I64u 0\r\n",t/f*1000000+t%f*1000000/f,event,a);DWORD written{};if(n>0)WriteFile(file,line,static_cast<DWORD>(n),&written,nullptr);
+}
+void CtrlKey(WORD key,bool shift=false){if(shift)Key(VK_SHIFT);Key(VK_CONTROL);Key(key);Key(key,true);Key(VK_CONTROL,true);if(shift)Key(VK_SHIFT,true);}
+int SelectedIndex(HWND frame){auto tabs=Tabs(frame);for(size_t i=0;i<tabs.size();++i)if(tabs[i].state&STATE_SYSTEM_SELECTED)return static_cast<int>(i);return -1;}
+void NavigateMarked(HWND frame,const std::wstring& folder,const char* label){
+ ComPtr<IShellWindows> windows;if(FAILED(CoCreateInstance(CLSID_ShellWindows,nullptr,CLSCTX_ALL,IID_PPV_ARGS(&windows))))return;long count{};windows->get_Count(&count);
+ for(long i=0;i<count;++i){VARIANT index{};index.vt=VT_I4;index.lVal=i;ComPtr<IDispatch> item;ComPtr<IWebBrowser2> browser;
+  if(FAILED(windows->Item(index,&item))||FAILED(item.As(&browser)))continue;SHANDLE_PTR handle{};browser->get_HWND(&handle);if(reinterpret_cast<HWND>(handle)!=frame)continue;
+  VARIANT destination{};destination.vt=VT_BSTR;destination.bstrVal=SysAllocString(folder.c_str());VARIANT empty{};
+  Mark(label);browser->Navigate2(&destination,&empty,&empty,&empty,&empty);VariantClear(&destination);Pump(2000);return;}
+}
+void SwitchRounds(HWND frame,WORD first,WORD second,unsigned rounds,const char* label){
+ for(unsigned i=0;i<rounds;++i){Mark(label,first);CtrlKey(first);Pump(1800);Mark(label,second);CtrlKey(second);Pump(2200);}
+}
+template<class Check> bool RapidSwitchAndMeasure(HWND frame,Check& check,std::ostream& out){
+ Navigate(frame,L"C:\\NativeLabFolders\\Big");Pump(1500);
+ Mark("phase",3);SwitchRounds(frame,'1','3',8,"input-switch");
+ Mark("phase",4);CtrlKey('1');Pump(1500);
+ for(unsigned i=0;i<8;++i){NavigateMarked(frame,L"C:\\NativeLabFolders\\Big","input-plain");NavigateMarked(frame,L"C:\\NativeLabFolders\\Alpha","input-plain");}
+ Mark("phase",5);CtrlKey('T');Pump(1500);CtrlKey('T');Pump(1500);CtrlKey('1');Pump(1500);
+ const int before=SelectedIndex(frame);
+ for(int i=0;i<3;++i){Mark("input-rapid",i);CtrlKey(VK_TAB);Pump(80);}
+ Pump(3000);const int after=SelectedIndex(frame);
+ check("timing-bootstrap",TabCount(frame)==5);
+ out<<"],\"rapid\":{\"tabs\":"<<TabCount(frame)<<",\"before\":"<<before<<",\"after\":"<<after<<'}';
+ Mark("phase",6);RECT r{};GetWindowRect(frame,&r);Mark("drag-begin");
+ for(ULONGLONG end=GetTickCount64()+5000;GetTickCount64()<end;){static int step=0;++step;SetWindowPos(frame,nullptr,r.left+(step%40)*4,r.top+(step%40)*2,0,0,SWP_NOSIZE|SWP_NOZORDER|SWP_NOACTIVATE);Pump(16);}
+ Mark("drag-end");SetWindowPos(frame,nullptr,r.left,r.top,0,0,SWP_NOSIZE|SWP_NOZORDER|SWP_NOACTIVATE);Pump(500);
+ Mark("phase",7);CtrlKey('1');Pump(1500);
+ for(size_t target:{size_t{10},size_t{120}}){
+  size_t stuck=0;while(TabCount(frame)<target&&stuck<3){const size_t n=TabCount(frame);Mark("input-new",n);CtrlKey('T');Pump(500);stuck=TabCount(frame)==n?stuck+1:0;}
+  out<<",\"tabs"<<target<<"\":"<<TabCount(frame);
+  Mark("phase",static_cast<ULONGLONG>(TabCount(frame)));SwitchRounds(frame,'1','9',5,"input-switch-many");
+ }
+ return after==(before+3)%5;
+}
 std::wstring FocusText(HWND frame){GUITHREADINFO info{sizeof(info)};GetGUIThreadInfo(GetWindowThreadProcessId(frame,nullptr),&info);wchar_t text[4096]{};SendMessageTimeoutW(info.hwndFocus,WM_GETTEXT,4096,reinterpret_cast<LPARAM>(text),SMTO_ABORTIFHUNG,1000,nullptr);if(*text)return text;ComPtr<IUIAutomation> automation;ComPtr<IUIAutomationElement> element;ComPtr<IUIAutomationValuePattern> pattern;if(SUCCEEDED(CoCreateInstance(CLSID_CUIAutomation,nullptr,CLSCTX_INPROC_SERVER,IID_PPV_ARGS(&automation)))&&SUCCEEDED(automation->GetFocusedElement(&element))&&SUCCEEDED(element->GetCurrentPatternAs(UIA_ValuePatternId,IID_PPV_ARGS(&pattern)))){BSTR value{};pattern->get_CurrentValue(&value);std::wstring result=value?value:L"";SysFreeString(value);return result;}return L"";}
 }
 int wmain(int argc,wchar_t** argv){
@@ -64,6 +110,12 @@ int wmain(int argc,wchar_t** argv){
  bool good=TabCount(frame)==3;out<<"{\"bootstrap\":"<<(good?"true":"false")<<",\"foreground\":"<<reinterpret_cast<ULONG_PTR>(GetForegroundWindow())<<",\"frame\":"<<reinterpret_cast<ULONG_PTR>(frame)<<",\"focusClass\":"<<Json(Class(initialFocus.hwndFocus))<<",\"attachState\":"<<reinterpret_cast<ULONG_PTR>(GetPropW(frame,L"Win10NativePatch.HeaderLab.State"))<<",\"rejected\":"<<reinterpret_cast<ULONG_PTR>(GetPropW(frame,L"Win10NativePatch.TabsRejected.v2"))<<",\"state\":";State(out,frame);out<<",\"checks\":[";bool first=true;
  auto check=[&](const char* name,bool pass){if(!first)out<<',';first=false;out<<"{\"name\":\""<<name<<"\",\"passed\":"<<(pass?"true":"false")<<'}';out.flush();good=good&&pass;};
  if(mode==L"prepare") {out<<"],\"success\":"<<(good?"true":"false")<<'}';UnhookWindowsHookEx(hook);FreeLibrary(lab);CoUninitialize();return good?0:1;}
+ if(mode==L"timing"){
+  // Timing marks share the product's QPC clock and log file (TimingLog).
+  const bool rapid=RapidSwitchAndMeasure(frame,check,out);
+  out<<",\"rapidSwitchDelivered\":"<<(rapid?"true":"false")<<",\"success\":"<<(good?"true":"false")<<'}';
+  PostMessageW(frame,apply,0,0);Pump(400);UnhookWindowsHookEx(hook);FreeLibrary(lab);PostMessageW(frame,WM_CLOSE,0,0);CoUninitialize();return good?0:1;
+ }
  if(mode==L"drag"){
   DragPointer(Named(frame,L"Alpha").rect,Named(frame,L"Gamma").rect);
   auto reordered=Tabs(frame);check("physical-reorder-keeps-tab-identities",reordered.size()==3&&reordered[0].name==L"Beta"&&reordered[1].name==L"Gamma"&&reordered[2].name==L"Alpha");

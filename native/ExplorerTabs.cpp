@@ -60,6 +60,46 @@ class Controller;
 std::mutex controllersMutex;
 std::unordered_map<HWND, Controller *> controllers;
 
+// Diagnostic timing marks for lab measurements. Off unless the per-user
+// HKCU\Software\Win10NativePatch\v2 TimingLog value names a file; release
+// installs never set it. Lines are "<QPC microseconds> <event> <a> <b>", so a
+// test process can append its own input marks to the same file on one clock.
+namespace timing
+{
+HANDLE OpenLog()
+{
+    wchar_t path[MAX_PATH]{};
+    DWORD bytes = sizeof(path);
+    if (RegGetValueW(HKEY_CURRENT_USER, patch::SettingsKey, L"TimingLog", RRF_RT_REG_SZ, nullptr, path, &bytes) !=
+            ERROR_SUCCESS ||
+        !*path)
+        return INVALID_HANDLE_VALUE;
+    return CreateFileW(path, FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_ALWAYS,
+                       FILE_ATTRIBUTE_NORMAL, nullptr);
+}
+HANDLE Log()
+{
+    static const HANDLE file = OpenLog();
+    return file;
+}
+void Mark(const char *event, ULONGLONG a = 0, ULONGLONG b = 0)
+{
+    const HANDLE file = Log();
+    if (file == INVALID_HANDLE_VALUE)
+        return;
+    LARGE_INTEGER now{}, frequency{};
+    QueryPerformanceCounter(&now);
+    QueryPerformanceFrequency(&frequency);
+    const auto ticks = static_cast<ULONGLONG>(now.QuadPart), rate = static_cast<ULONGLONG>(frequency.QuadPart);
+    const ULONGLONG micro = ticks / rate * 1000000 + ticks % rate * 1000000 / rate;
+    char line[160]{};
+    const int length = wsprintfA(line, "%I64u %s %I64u %I64u\r\n", micro, event, a, b);
+    DWORD written{};
+    if (length > 0)
+        WriteFile(file, line, static_cast<DWORD>(length), &written, nullptr);
+}
+} // namespace timing
+
 template <class T> HRESULT Query(IUnknown *p, ComPtr<T> &out)
 {
     out.Reset();
@@ -1506,6 +1546,7 @@ void Controller::Layout(bool transient)
         if(headerRetryDeadline_)SetTimer(frame_,MaintenanceTimer,100,nullptr);
         return;
     }
+    timing::Mark("layout", transient ? 1 : 0);
     std::vector<std::uint64_t> identities;
     identities.reserve(tabs_.size());
     for(const auto& tab:tabs_)identities.push_back(tab.id);
@@ -1558,6 +1599,7 @@ bool Controller::Render()
         visual.tabs.push_back({tab.id,tab.metadataGeneration,tab.title,tab.icon?tab.icon->handle:folderIcon_});
     }
     const HRESULT result=renderer_.Paint(window,visual);
+    timing::Mark("render", epoch, visual.layout.active);
     if(!enabled_||strip_!=window||frame_!=frame)return true;
     if(FAILED(result)) {
         rendererReady_=false;
@@ -1617,6 +1659,7 @@ bool Controller::Navigate(ULONGLONG id, size_t position, bool changeTab)
     if(strip_)InvalidateRect(strip_,nullptr,FALSE);
     const Pidl destination=pending_->expected;
     ComPtr<IShellBrowser> browser=browser_;
+    timing::Mark("browse", id, position);
     HRESULT hr = browser->BrowseObject(destination.p,
                                         SBSP_SAMEBROWSER | SBSP_ABSOLUTE | SBSP_CREATENOHISTORY | SBSP_PLAYNOSOUND);
     if (FAILED(hr))
@@ -1635,6 +1678,7 @@ bool Controller::Activate(size_t index)
 {
     if (index >= tabs_.size() || pending_)
         return false;
+    timing::Mark("activate", index, tabs_[index].id);
     if (index == active_)
         return true;
     return Navigate(tabs_[index].id, tabs_[index].position, true);
@@ -1670,6 +1714,7 @@ void Controller::Synchronize()
             return;
         }
         active_ = static_cast<size_t>(i - tabs_.begin());
+        timing::Mark("commit", i->id);
         i->position = pending_->position;
         restoreState_ = i->history[i->position];
         restoreTries_ = 0;
@@ -1824,6 +1869,8 @@ void Controller::SaveSession()
 {
     if (!hasUsableSession_ || tabs_.empty())
         return;
+    timing::Mark("save-begin", tabs_.size());
+    struct SaveMark {~SaveMark(){timing::Mark("save-end");}} saveMark;
     auto encode = [&](const std::vector<Tab> &tabs) {
         Writer writer;
         writer.number(PacketMagic);
@@ -2378,6 +2425,7 @@ LRESULT CALLBACK Controller::FrameProc(HWND h, UINT m, WPARAM w, LPARAM l, UINT_
         if (self->restoreState_)
         {
             const ViewState state=*self->restoreState_;ComPtr<IShellBrowser> browser=self->browser_;
+            timing::Mark("restore", self->restoreTries_);
             Restore(browser.Get(),state);
             if(self->restoreState_&&self->browser_.Get()==browser.Get())self->restoreTries_++;
         }
@@ -2606,11 +2654,18 @@ HRESULT Controller::Invoke(DISPID id, REFIID, LCID, WORD flags, DISPPARAMS *para
     if (tearingDown_)
         return S_OK;
     if (id == DISPID_BEFORENAVIGATE2)
+    {
+        timing::Mark("beforenav");
         Remember();
+    }
     else if (id == DISPID_NAVIGATECOMPLETE2 || id == DISPID_DOCUMENTCOMPLETE)
+    {
+        timing::Mark(id == DISPID_NAVIGATECOMPLETE2 ? "navcomplete" : "doccomplete");
         PostMessageW(frame_, SyncMessage, 0, 0);
+    }
     else if (id == DISPID_NAVIGATEERROR)
     {
+        timing::Mark("naverror");
         pending_.reset();
         restoreState_.reset();
         PostMessageW(frame_, SyncMessage, 0, 0);
@@ -2819,6 +2874,7 @@ void Controller::Timer()
         if(!enabled_||!frame_||browser_.Get()!=browser.Get()||!restoreState_)return;
         if (matches&&Equal(restoreState_->folder,state.folder))
         {
+            timing::Mark("restore", restoreTries_);
             Restore(browser.Get(),state);
             if(!enabled_||!frame_||browser_.Get()!=browser.Get()||!restoreState_)return;
             if (++restoreTries_ >= 10)
