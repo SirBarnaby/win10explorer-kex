@@ -45,7 +45,10 @@ void Mark(const char* event,ULONGLONG a=0){
  const auto t=static_cast<ULONGLONG>(now.QuadPart),f=static_cast<ULONGLONG>(rate.QuadPart);char line[160]{};
  const int n=wsprintfA(line,"%I64u %s %I64u 0\r\n",t/f*1000000+t%f*1000000/f,event,a);DWORD written{};if(n>0)WriteFile(file,line,static_cast<DWORD>(n),&written,nullptr);
 }
-void CtrlKey(WORD key,bool shift=false){if(shift)Key(VK_SHIFT);Key(VK_CONTROL);Key(key);Key(key,true);Key(VK_CONTROL,true);if(shift)Key(VK_SHIFT,true);}
+// Navigation keys go out as the dedicated (extended) keys; a numpad PgUp with
+// NumLock on would be "un-shifted" by Windows and lose Shift.
+void NavKey(WORD key,bool up=false){INPUT i{};i.type=INPUT_KEYBOARD;i.ki.wVk=key;i.ki.dwFlags=KEYEVENTF_EXTENDEDKEY|(up?KEYEVENTF_KEYUP:0);SendInput(1,&i,sizeof(i));}
+void CtrlKey(WORD key,bool shift=false){const bool nav=key==VK_PRIOR||key==VK_NEXT||key==VK_END||key==VK_HOME;if(shift)Key(VK_SHIFT);Key(VK_CONTROL);if(nav){NavKey(key);NavKey(key,true);}else{Key(key);Key(key,true);}Key(VK_CONTROL,true);if(shift)Key(VK_SHIFT,true);}
 int SelectedIndex(HWND frame){auto tabs=Tabs(frame);for(size_t i=0;i<tabs.size();++i)if(tabs[i].state&STATE_SYSTEM_SELECTED)return static_cast<int>(i);return -1;}
 void NavigateMarked(HWND frame,const std::wstring& folder,const char* label){
  ComPtr<IShellWindows> windows;if(FAILED(CoCreateInstance(CLSID_ShellWindows,nullptr,CLSCTX_ALL,IID_PPV_ARGS(&windows))))return;long count{};windows->get_Count(&count);
@@ -79,7 +82,17 @@ template<class Check> bool RapidSwitchAndMeasure(HWND frame,Check& check,std::os
  }
  return after==(before+3)%5;
 }
-std::wstring FocusText(HWND frame){GUITHREADINFO info{sizeof(info)};GetGUIThreadInfo(GetWindowThreadProcessId(frame,nullptr),&info);wchar_t text[4096]{};SendMessageTimeoutW(info.hwndFocus,WM_GETTEXT,4096,reinterpret_cast<LPARAM>(text),SMTO_ABORTIFHUNG,1000,nullptr);if(*text)return text;ComPtr<IUIAutomation> automation;ComPtr<IUIAutomationElement> element;ComPtr<IUIAutomationValuePattern> pattern;if(SUCCEEDED(CoCreateInstance(CLSID_CUIAutomation,nullptr,CLSCTX_INPROC_SERVER,IID_PPV_ARGS(&automation)))&&SUCCEEDED(automation->GetFocusedElement(&element))&&SUCCEEDED(element->GetCurrentPatternAs(UIA_ValuePatternId,IID_PPV_ARGS(&pattern)))){BSTR value{};pattern->get_CurrentValue(&value);std::wstring result=value?value:L"";SysFreeString(value);return result;}return L"";}
+// ---- U2 switching fixture helpers ----
+ComPtr<IWebBrowser2> Browser(HWND frame){ComPtr<IShellWindows> windows;if(FAILED(CoCreateInstance(CLSID_ShellWindows,nullptr,CLSCTX_ALL,IID_PPV_ARGS(&windows))))return {};long count{};windows->get_Count(&count);
+ for(long i=0;i<count;++i){ComPtr<IDispatch> item;ComPtr<IWebBrowser2> browser;if(FAILED(windows->Item(Child(i),&item))||FAILED(item.As(&browser)))continue;SHANDLE_PTR handle{};browser->get_HWND(&handle);if(reinterpret_cast<HWND>(handle)==frame)return browser;}return {};}
+ComPtr<IShellFolderViewDual> ViewOf(HWND frame){auto browser=Browser(frame);ComPtr<IDispatch> document;ComPtr<IShellFolderViewDual> view;if(browser&&SUCCEEDED(browser->get_Document(&document))&&document)document.As(&view);return view;}
+std::wstring ViewSelection(HWND frame){auto view=ViewOf(frame);ComPtr<FolderItems> items;ComPtr<FolderItem> item;long count{};BSTR name{};
+ if(!view||FAILED(view->SelectedItems(&items))||!items||FAILED(items->get_Count(&count))||count!=1||FAILED(items->Item(Child(0),&item))||!item||FAILED(item->get_Name(&name)))return L"";std::wstring result=name?name:L"";SysFreeString(name);return result;}
+bool SelectInView(HWND frame,const std::wstring& name){// shldisp's Folder is renamed by the include macro above.
+ auto view=ViewOf(frame);ComPtr<struct HeaderFolderPath> folder;ComPtr<FolderItem> item;BSTR text=SysAllocString(name.c_str());
+ const bool found=view&&SUCCEEDED(view->get_Folder(&folder))&&folder&&SUCCEEDED(folder->ParseName(text,&item))&&item;SysFreeString(text);if(!found)return false;
+ VARIANT target{};target.vt=VT_DISPATCH;target.pdispVal=item.Get();return SUCCEEDED(view->SelectItem(&target,SVSI_SELECT|SVSI_DESELECTOTHERS|SVSI_FOCUSED|SVSI_ENSUREVISIBLE));}
+std::vector<std::wstring> TabNames(HWND frame){std::vector<std::wstring> names;for(auto& tab:Tabs(frame))names.push_back(tab.name);return names;}std::wstring FocusText(HWND frame){GUITHREADINFO info{sizeof(info)};GetGUIThreadInfo(GetWindowThreadProcessId(frame,nullptr),&info);wchar_t text[4096]{};SendMessageTimeoutW(info.hwndFocus,WM_GETTEXT,4096,reinterpret_cast<LPARAM>(text),SMTO_ABORTIFHUNG,1000,nullptr);if(*text)return text;ComPtr<IUIAutomation> automation;ComPtr<IUIAutomationElement> element;ComPtr<IUIAutomationValuePattern> pattern;if(SUCCEEDED(CoCreateInstance(CLSID_CUIAutomation,nullptr,CLSCTX_INPROC_SERVER,IID_PPV_ARGS(&automation)))&&SUCCEEDED(automation->GetFocusedElement(&element))&&SUCCEEDED(element->GetCurrentPatternAs(UIA_ValuePatternId,IID_PPV_ARGS(&pattern)))){BSTR value{};pattern->get_CurrentValue(&value);std::wstring result=value?value:L"";SysFreeString(value);return result;}return L"";}
 }
 int wmain(int argc,wchar_t** argv){
  if(argc!=4||!Guest())return 2;
@@ -116,7 +129,30 @@ int wmain(int argc,wchar_t** argv){
   out<<",\"rapidSwitchDelivered\":"<<(rapid?"true":"false")<<",\"success\":"<<(good?"true":"false")<<'}';
   PostMessageW(frame,apply,0,0);Pump(400);UnhookWindowsHookEx(hook);FreeLibrary(lab);PostMessageW(frame,WM_CLOSE,0,0);CoUninitialize();return good?0:1;
  }
- if(mode==L"drag"){
+ if(mode==L"switching"){
+  // AE1/AE2 and the Firefox chords. Tabs: Alpha, Beta, Gamma (Gamma shown).
+  CreateDirectoryW(L"C:\\NativeLabFolders\\Gamma",nullptr);{HANDLE z=CreateFileW(L"C:\\NativeLabFolders\\Gamma\\Zeta.txt",GENERIC_WRITE,0,nullptr,CREATE_ALWAYS,0,nullptr);if(z!=INVALID_HANDLE_VALUE)CloseHandle(z);}
+  Pump(800);const bool picked=SelectInView(frame,L"RenameProbe.txt");Pump(300);const auto beforeLeave=ViewSelection(frame);
+  CtrlKey(VK_NEXT);Pump(900);check("ctrl-pagedown-wraps-to-first",SelectedIndex(frame)==0&&CurrentUrl(frame)==L"file:///C:/NativeLabFolders/Alpha");
+  CtrlKey(VK_PRIOR);Pump(900);check("ctrl-pageup-wraps-to-last",SelectedIndex(frame)==2&&CurrentUrl(frame)==L"file:///C:/NativeLabFolders/Gamma");
+  CtrlKey('1');Pump(1200);CtrlKey('3');Pump(900);const auto returned=ViewSelection(frame);Pump(1600);const auto returnedLate=ViewSelection(frame);
+  // Informational: a selection set through shell automation does not come back
+  // after a tab round-trip in the baseline either (reported, not gated).
+  CtrlKey(VK_PRIOR,true);Pump(500);auto moved=TabNames(frame);
+  check("ctrl-shift-pageup-moves-tab-left",moved.size()==3&&moved[0]==L"Alpha"&&moved[1]==L"Gamma"&&moved[2]==L"Beta"&&SelectedIndex(frame)==1);
+  CtrlKey(VK_NEXT,true);Pump(500);CtrlKey(VK_NEXT,true);Pump(500);moved=TabNames(frame);
+  check("ctrl-shift-pagedown-stops-at-end",moved.size()==3&&moved[2]==L"Gamma"&&SelectedIndex(frame)==2&&CurrentUrl(frame)==L"file:///C:/NativeLabFolders/Gamma");
+  // AE2: a selection the user makes after arrival is not overwritten.
+  CtrlKey('1');Pump(1200);CtrlKey('3');Pump(400);NavKey(VK_END);NavKey(VK_END,true);Pump(1800);
+  const auto chosen=ViewSelection(frame);check("user-selection-survives-restore",chosen==L"Zeta");
+  // AE1: three quick requests while a slow folder loads end on the last one.
+  CtrlKey('2');Pump(900);Navigate(frame,L"C:\\NativeLabFolders\\Big");Pump(600);CtrlKey('3');Pump(1200);
+  const ULONGLONG start=GetTickCount64();CtrlKey('2');Pump(30);CtrlKey('1');Pump(30);CtrlKey('3');Pump(30);CtrlKey('2');
+  const int immediate=SelectedIndex(frame);Pump(3000);
+  check("rapid-requests-settle-on-last",SelectedIndex(frame)==1&&CurrentUrl(frame)==L"file:///C:/NativeLabFolders/Big");
+  out<<"],\"picked\":"<<(picked?"true":"false")<<",\"beforeLeave\":"<<Json(beforeLeave)<<",\"returned\":"<<Json(returned)<<",\"returnedLate\":"<<Json(returnedLate)<<",\"immediate\":"<<immediate<<",\"selection\":"<<Json(chosen)<<",\"rapidMs\":"<<(GetTickCount64()-start)<<",\"tabs\":";State(out,frame);
+  out<<",\"success\":"<<(good?"true":"false")<<'}';PostMessageW(frame,apply,0,0);Pump(300);UnhookWindowsHookEx(hook);FreeLibrary(lab);PostMessageW(frame,WM_CLOSE,0,0);CoUninitialize();return good?0:1;
+ } if(mode==L"drag"){
   DragPointer(Named(frame,L"Alpha").rect,Named(frame,L"Gamma").rect);
   auto reordered=Tabs(frame);check("physical-reorder-keeps-tab-identities",reordered.size()==3&&reordered[0].name==L"Beta"&&reordered[1].name==L"Gamma"&&reordered[2].name==L"Alpha");
   DragPointer(Named(frame,L"Beta").rect,Named(frame,L"Gamma").rect,true);

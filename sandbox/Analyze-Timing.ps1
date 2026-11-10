@@ -1,4 +1,4 @@
-﻿# Summarises a lab timing log written by ExplorerTabs.dll (TimingLog) and the
+# Summarises a lab timing log written by ExplorerTabs.dll (TimingLog) and the
 # HeaderBehaviorTests "timing" fixture. Both write "<us> <event> <a> <b>" lines
 # on the same QPC clock. Host-only, read-only; prints JSON.
 param([Parameter(Mandatory)][string]$Log,[string]$Out)
@@ -29,9 +29,9 @@ function Switches([string]$kind,[scriptblock]$filter={$true}){
         $activate=Next $x.t $until 'activate'
         $highlight=$null
         if($activate){$id=$activate.b;$highlight=Next $x.t $until 'render' {param($r)$r.b -eq $id}}
-        $restores=All $x.t $until 'restore'
-        $saves=All $x.t $until 'save-begin'
-        $saveEnds=All $x.t $until 'save-end'
+        $restores=@(All $x.t $until 'restore')
+        $saves=@(All $x.t $until 'save-begin')
+        $saveEnds=@(All $x.t $until 'save-end')
         $saveMs=0.0
         for($k=0;$k -lt [math]::Min($saves.Count,$saveEnds.Count);$k++){$saveMs+=$saveEnds[$k].t-$saves[$k].t}
         $firstRestore=$null;$lastRestore=$null
@@ -45,8 +45,8 @@ function Switches([string]$kind,[scriptblock]$filter={$true}){
             firstRestore=Since $firstRestore $x.t
             lastRestore=Since $lastRestore $x.t
             restoreCount=$restores.Count
-            renders=(All $x.t $until 'render').Count
-            layouts=(All $x.t $until 'layout').Count
+            renders=@(All $x.t $until 'render').Count
+            layouts=@(All $x.t $until 'layout').Count
             saves=$saves.Count
             saveMs=[math]::Round($saveMs,2)
         }
@@ -71,7 +71,7 @@ $dragBegin=@($events|Where-Object{$_.e -eq 'drag-begin'})[0];$dragEnd=@($events|
 $drag=$null
 if($dragBegin -and $dragEnd){
     $seconds=($dragEnd.t-$dragBegin.t)/1000
-    $drag=[ordered]@{seconds=[math]::Round($seconds,2);renders=(All $dragBegin.t $dragEnd.t 'render').Count;layouts=(All $dragBegin.t $dragEnd.t 'layout').Count;saves=(All $dragBegin.t $dragEnd.t 'save-begin').Count}
+    $drag=[ordered]@{seconds=[math]::Round($seconds,2);renders=@(All $dragBegin.t $dragEnd.t 'render').Count;layouts=@(All $dragBegin.t $dragEnd.t 'layout').Count;saves=@(All $dragBegin.t $dragEnd.t 'save-begin').Count}
     $drag.rendersPerSecond=[math]::Round($drag.renders/$seconds,1)
 }
 $result=[ordered]@{

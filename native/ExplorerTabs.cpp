@@ -9,6 +9,7 @@
 #include "MvpHostProtocol.h"
 #include "HeaderIntegration.h"
 #include "TabHeaderRenderer.h"
+#include "TabModel.h"
 #include <algorithm>
 #include <atomic>
 #include <commctrl.h>
@@ -17,6 +18,7 @@
 #include <dwmapi.h>
 #include <exdisp.h>
 #include <exdispid.h>
+#include <shdispid.h>
 #include <iomanip>
 #include <limits>
 #include <memory>
@@ -48,11 +50,14 @@ constexpr wchar_t ControllerProperty[] = L"Win10NativePatch.ExplorerController.v
 constexpr wchar_t ProofProperty[] = L"Win10NativePatch.IsolatedProof.v2";
 constexpr wchar_t SessionKey[] = L"Software\\Win10NativePatch\\v2\\ExplorerTabs";
 constexpr wchar_t WindowSessionProperty[]=L"Win10NativePatch.WindowSession.v1";
-constexpr UINT_PTR MaintenanceTimer = 0x57545032;
+constexpr UINT_PTR MaintenanceTimer = 0x57545032, SessionTimer = 0x57545033;
 constexpr UINT SyncMessage = WM_APP + 0x482;
 constexpr UINT RestoreMessage = WM_APP + 0x483;
 constexpr UINT IconMessage = WM_APP + 0x484;
 constexpr size_t MaxTabs = 64, MaxHistory = 64, MaxSelection = 512, MaxPacket = 8 * 1024 * 1024;
+// LastSession stays small enough to read and write without a visible pause.
+constexpr size_t SessionBudget = 1024 * 1024, BackgroundHistory = 16;
+constexpr UINT SessionDelayMs = 1500;
 const CLSID TabsClsid = {0x73f7b7dc, 0xc022, 0x4862, {0xa3, 0xea, 0x7b, 0xd0, 0x4e, 0xae, 0x73, 0xa9}};
 std::atomic<ULONGLONG> nextId{1};
 std::atomic<bool> sessionRestored{false};
@@ -252,7 +257,8 @@ DWORD WINAPI MetadataThread(void *context)
         }
         {
             std::lock_guard lock(metadataMutex);
-            auto target = metadataTargets.find(result.job.cookie);
+            const ULONGLONG finished = result.job.cookie;
+            auto target = metadataTargets.find(finished);
             if (target == metadataTargets.end())
                 --metadataOutstanding;
             else
@@ -262,7 +268,7 @@ DWORD WINAPI MetadataThread(void *context)
                 {
                     auto inserted = metadataResults.emplace(ticket, std::move(result));
                     if (!PostMessageW(target->second, IconMessage, static_cast<WPARAM>(ticket),
-                                      static_cast<LPARAM>(inserted.first->second.job.cookie)))
+                                      static_cast<LPARAM>(finished)))
                     {
                         metadataResults.erase(inserted.first);
                         --metadataOutstanding;
@@ -273,7 +279,7 @@ DWORD WINAPI MetadataThread(void *context)
             // Capacity became available. Wake other frames that could not
             // enqueue earlier; this is driven by completed work, never a timer.
             for(const auto& [cookie,window]:metadataTargets)
-                if(cookie!=result.job.cookie)PostMessageW(window,IconMessage,0,static_cast<LPARAM>(cookie));
+                if(cookie!=finished)PostMessageW(window,IconMessage,0,static_cast<LPARAM>(cookie));
         }
         // An STA must dispatch messages between provider calls. No application
         // window is created and no Explorer COM interface crosses apartments.
@@ -434,6 +440,165 @@ ViewState Capture(IShellBrowser *browser)
     s.hasGroup = SUCCEEDED(fv->GetGroupBy(&s.group, &s.groupAscending));
     return s;
 }
+bool SameSort(IFolderView2 *fv, const std::vector<SORTCOLUMN> &wanted)
+{
+    int columns{};
+    if (FAILED(fv->GetSortColumnCount(&columns)) || columns != static_cast<int>(wanted.size()))
+        return false;
+    std::vector<SORTCOLUMN> current(wanted.size());
+    if (FAILED(fv->GetSortColumns(current.data(), columns)))
+        return false;
+    for (size_t i = 0; i < wanted.size(); ++i)
+        if (current[i].direction != wanted[i].direction || !IsEqualPropertyKey(current[i].propkey, wanted[i].propkey))
+            return false;
+    return true;
+}
+// Each setter re-sorts, re-groups or re-lays out the native view, so values
+// that already match are left alone.
+void RestoreLayout(IFolderView2 *fv, const ViewState &s)
+{
+    FOLDERVIEWMODE mode{};
+    int iconSize{};
+    if (s.mode != FVM_AUTO && s.iconSize > 0 &&
+        (FAILED(fv->GetViewModeAndIconSize(&mode, &iconSize)) || mode != s.mode || iconSize != s.iconSize))
+        fv->SetViewModeAndIconSize(s.mode, s.iconSize);
+    if (!s.sort.empty() && !SameSort(fv, s.sort))
+        fv->SetSortColumns(s.sort.data(), static_cast<int>(s.sort.size()));
+    PROPERTYKEY group{};
+    BOOL ascending = TRUE;
+    if (s.hasGroup && (FAILED(fv->GetGroupBy(&group, &ascending)) || !IsEqualPropertyKey(group, s.group) ||
+                       ascending != s.groupAscending))
+        fv->SetGroupBy(s.group, s.groupAscending);
+}
+// True when `item` (an index in the view) names the same child as `wanted`.
+bool SameItem(IFolderView2 *fv, IShellFolder *folder, int item, const Pidl &wanted)
+{
+    PITEMID_CHILD child{};
+    if (!wanted || FAILED(fv->Item(item, &child)))
+        return false;
+    const HRESULT order = folder->CompareIDs(SHCIDS_CANONICALONLY, child, reinterpret_cast<PCUITEMID_CHILD>(wanted.p));
+    CoTaskMemFree(child);
+    return SUCCEEDED(order) && HRESULT_CODE(order) == 0;
+}
+// Compare-before-set: the view already shows exactly the saved selection and
+// focus, so a confirming restore pass changes nothing.
+bool SelectionMatches(IFolderView2 *fv, IShellFolder *folder, const ViewState &s)
+{
+    int count{};
+    if (!fv || !folder || FAILED(fv->ItemCount(SVGIO_SELECTION, &count)) ||
+        static_cast<size_t>(count) != s.selected.size())
+        return false;
+    for (int start = 0, found = 0; found < count; ++found)
+    {
+        int item{};
+        if (fv->GetSelectedItem(start, &item) != S_OK)
+            return false;
+        if (std::none_of(s.selected.begin(), s.selected.end(),
+                         [&](const Pidl &wanted) { return SameItem(fv, folder, item, wanted); }))
+            return false;
+        start = item + 1;
+    }
+    int focused{};
+    return !s.focused || (SUCCEEDED(fv->GetFocusedItem(&focused)) && SameItem(fv, folder, focused, s.focused));
+}
+// True when the items a restore needs are already listed by the view, so it
+// can be applied without waiting for the view's enumeration event.
+bool RestoreItemsListed(IShellView *view, const ViewState &s)
+{
+    const Pidl *probe = s.anchor ? &s.anchor : s.focused ? &s.focused : s.selected.empty() ? nullptr : &s.selected.front();
+    if (!probe)
+        return true;
+    ComPtr<IFolderView> fv;
+    ComPtr<IShellFolder> folder;
+    int count{};
+    if (!view || FAILED(view->QueryInterface(IID_PPV_ARGS(&fv))) || FAILED(fv->GetFolder(IID_PPV_ARGS(&folder))) ||
+        FAILED(fv->ItemCount(SVGIO_ALLVIEW, &count)) || count <= 0 || count > 5000)
+        return false;
+    const auto wanted = reinterpret_cast<PCUITEMID_CHILD>(probe->p);
+    for (int i = 0; i < count; ++i)
+    {
+        PITEMID_CHILD child{};
+        if (FAILED(fv->Item(i, &child)))
+            continue;
+        const HRESULT order = folder->CompareIDs(SHCIDS_CANONICALONLY, child, wanted);
+        CoTaskMemFree(child);
+        if (SUCCEEDED(order) && HRESULT_CODE(order) == 0)
+            return true;
+    }
+    return false;
+}
+// Receives DShellFolderViewEvents from one folder view. Kept apart from the
+// controller's own IDispatch so its DISPIDs never meet DWebBrowserEvents2.
+class ViewEvents final : public IDispatch
+{
+    std::atomic<ULONG> refs_{1};
+    HWND target_{};
+    UINT message_{};
+    ComPtr<IConnectionPoint> point_;
+    DWORD cookie_{};
+    ViewEvents(HWND target, UINT message) : target_(target), message_(message) { objectCount++; }
+    ~ViewEvents() { objectCount--; }
+
+  public:
+    static ComPtr<ViewEvents> Connect(IShellView *view, HWND target, UINT message)
+    {
+        ComPtr<IDispatch> automation;
+        ComPtr<IConnectionPointContainer> container;
+        ComPtr<ViewEvents> sink;
+        if (!view || FAILED(view->GetItemObject(SVGIO_BACKGROUND, IID_PPV_ARGS(&automation))) ||
+            FAILED(automation.As(&container)))
+            return nullptr;
+        sink.Attach(new (std::nothrow) ViewEvents(target, message));
+        if (!sink || FAILED(container->FindConnectionPoint(DIID_DShellFolderViewEvents, &sink->point_)) ||
+            FAILED(sink->point_->Advise(static_cast<IDispatch *>(sink.Get()), &sink->cookie_)))
+            return nullptr;
+        return sink;
+    }
+    void Disconnect()
+    {
+        target_ = nullptr;
+        if (point_ && cookie_)
+            point_->Unadvise(cookie_);
+        cookie_ = 0;
+        point_.Reset();
+    }
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID id, void **out) override
+    {
+        if (!out)
+            return E_POINTER;
+        *out = nullptr;
+        if (id == IID_IUnknown || id == IID_IDispatch || id == DIID_DShellFolderViewEvents)
+            *out = static_cast<IDispatch *>(this);
+        if (!*out)
+            return E_NOINTERFACE;
+        AddRef();
+        return S_OK;
+    }
+    ULONG STDMETHODCALLTYPE AddRef() override { return ++refs_; }
+    ULONG STDMETHODCALLTYPE Release() override
+    {
+        const ULONG n = --refs_;
+        if (!n)
+            delete this;
+        return n;
+    }
+    HRESULT STDMETHODCALLTYPE GetTypeInfoCount(UINT *n) override
+    {
+        if (n)
+            *n = 0;
+        return n ? S_OK : E_POINTER;
+    }
+    HRESULT STDMETHODCALLTYPE GetTypeInfo(UINT, LCID, ITypeInfo **) override { return E_NOTIMPL; }
+    HRESULT STDMETHODCALLTYPE GetIDsOfNames(REFIID, LPOLESTR *, UINT, LCID, DISPID *) override { return E_NOTIMPL; }
+    HRESULT STDMETHODCALLTYPE Invoke(DISPID id, REFIID, LCID, WORD, DISPPARAMS *, VARIANT *, EXCEPINFO *,
+                                     UINT *) override
+    {
+        // Applied from the frame's queue, never inside the view's own event.
+        if (target_ && (id == DISPID_FILELISTENUMDONE || id == DISPID_INITIALENUMERATIONDONE))
+            PostMessageW(target_, message_, 0, 0);
+        return S_OK;
+    }
+};
 void Restore(IShellBrowser *browser, const ViewState &s)
 {
     ComPtr<IShellView> view;
@@ -441,12 +606,10 @@ void Restore(IShellBrowser *browser, const ViewState &s)
     if (!browser || !Equal(CurrentFolder(browser), s.folder) || FAILED(browser->QueryActiveShellView(&view)) ||
         FAILED(view.As(&fv)))
         return;
-    if (s.mode != FVM_AUTO && s.iconSize > 0)
-        fv->SetViewModeAndIconSize(s.mode, s.iconSize);
-    if (!s.sort.empty())
-        fv->SetSortColumns(s.sort.data(), static_cast<int>(s.sort.size()));
-    if (s.hasGroup)
-        fv->SetGroupBy(s.group, s.groupAscending);
+    RestoreLayout(fv.Get(), s);
+    ComPtr<IShellFolder> folder;
+    if (SUCCEEDED(fv->GetFolder(IID_PPV_ARGS(&folder))) && SelectionMatches(fv.Get(), folder.Get(), s))
+        return;
     // IFolderView2 does not expose a pixel scroll setter. Restore a visible item
     // anchor without forcing the native DirectUI view into a legacy ListView.
     if (s.anchor)
@@ -491,16 +654,18 @@ struct Writer
             bytes.insert(bytes.end(), b, b + n);
         }
     }
-    void state(const ViewState &s)
+    void state(const ViewState &s, bool selection = true)
     {
+        static const Pidl none;
         pidl(s.folder);
-        pidl(s.focused);
-        pidl(s.anchor);
+        pidl(selection ? s.focused : none);
+        pidl(selection ? s.anchor : none);
         number(static_cast<int>(s.mode));
         number(s.iconSize);
-        number(static_cast<DWORD>(s.selected.size()));
-        for (auto &p : s.selected)
-            pidl(p);
+        number(static_cast<DWORD>(selection ? s.selected.size() : 0));
+        if (selection)
+            for (auto &p : s.selected)
+                pidl(p);
         number(static_cast<DWORD>(s.sort.size()));
         for (auto &v : s.sort)
             number(v);
@@ -514,6 +679,15 @@ struct Writer
         number(static_cast<DWORD>(t.position));
         for (auto &s : t.history)
             state(s);
+    }
+    // Writes history entries [first, last) of the tab. With
+    // `currentSelectionOnly`, only the current entry keeps its selection.
+    void tab(const Tab &t, size_t first, size_t last, bool selection, bool currentSelectionOnly)
+    {
+        number(static_cast<DWORD>(last - first));
+        number(static_cast<DWORD>(t.position - first));
+        for (size_t i = first; i < last; ++i)
+            state(t.history[i], selection && (!currentSelectionOnly || i == t.position));
     }
 };
 struct Reader
@@ -636,6 +810,46 @@ UINT TransferMessage()
 {
     static UINT v = RegisterWindowMessageW(L"Win10NativePatch.ExplorerTabTransfer.v2");
     return v;
+}
+// Encodes LastSession within `budget`, giving up detail in steps so every open
+// tab survives: full history; background tabs trimmed to their current entry
+// plus BackgroundHistory neighbours, selections only on current entries;
+// current entries only, selection kept for the active tab; bare current
+// folders. Returns empty when even the bare form does not fit.
+std::vector<BYTE> EncodeSession(const std::vector<Tab> &tabs, size_t active, size_t budget)
+{
+    enum class Detail { Full, Background, Current, Bare };
+    for (const auto detail : {Detail::Full, Detail::Background, Detail::Current, Detail::Bare})
+    {
+        Writer writer;
+        writer.number(PacketMagic);
+        writer.number(DWORD{3});
+        writer.number(static_cast<DWORD>(tabs.size()));
+        writer.number(static_cast<DWORD>(active));
+        for (size_t i = 0; i < tabs.size() && writer.ok && writer.bytes.size() <= budget; ++i)
+        {
+            const Tab &tab = tabs[i];
+            size_t first = 0, last = tab.history.size();
+            if (detail == Detail::Background && i != active)
+            {
+                // Keep a window of BackgroundHistory+1 entries around the
+                // current one, preferring older entries (Back is used more).
+                first = tab.position > BackgroundHistory ? tab.position - BackgroundHistory : 0;
+                last = std::min(last, first + BackgroundHistory + 1);
+            }
+            else if (detail == Detail::Current || detail == Detail::Bare)
+            {
+                first = tab.position;
+                last = tab.position + 1;
+            }
+            const bool selection = detail == Detail::Full || detail == Detail::Background ||
+                                   (detail == Detail::Current && i == active);
+            writer.tab(tab, first, last, selection, detail != Detail::Full);
+        }
+        if (writer.ok && writer.bytes.size() <= budget)
+            return std::move(writer.bytes);
+    }
+    return {};
 }
 std::vector<BYTE> Serialize(const Tab &t, HWND source = nullptr)
 {
@@ -852,7 +1066,8 @@ class Controller final : public IObjectWithSite, public IAccessible, public IDro
     DWORD eventCookie_{};
     HWND frame_{}, strip_{}, travel_{};
     HHOOK keyboard_{};
-    bool headerAttached_=false,layingOut_=false,hasUsableSession_=false;
+    bool headerAttached_=false,layingOut_=false,hasUsableSession_=false,sessionDirty_=false;
+    RECT placed_{};
     DWORD ownerThread_{};
     bool enabled_ = false, tearingDown_ = false, inDrag_ = false, dropPrivate_ = false, sameWindowDrop_ = false;
     bool frameHooked_ = false, selfHosted_ = false, legacyHidden_ = false, closingFrame_ = false;
@@ -871,9 +1086,15 @@ class Controller final : public IObjectWithSite, public IAccessible, public IDro
     POINT dragStart_{};
     int backCommand_ = -1, forwardCommand_ = -1;
     std::vector<Tab> tabs_, closed_;
-    size_t active_{};
+    size_t active_{}; // The tab the Shell view shows (committed).
+    tabs::SwitchModel switching_;
+    bool busyShown_ = false;
+    // One restore per arrival: applied when the view lists its items, at the
+    // fallback deadline, or never if the user acts in the view first.
     std::optional<ViewState> restoreState_;
-    unsigned restoreTries_{};
+    ULONGLONG restoreDeadline_{};
+    HWND restoreView_{};
+    ComPtr<ViewEvents> viewEvents_;
     struct Pending
     {
         ULONGLONG id{};
@@ -917,8 +1138,24 @@ class Controller final : public IObjectWithSite, public IAccessible, public IDro
     void UpdateNavigationButtons();
     void Remember();
     void Synchronize();
-    bool Navigate(ULONGLONG, size_t, bool);
+    bool Navigate(ULONGLONG, size_t, bool, bool remember = true);
     bool Activate(size_t);
+    bool FollowRequest(ULONGLONG);
+    void DrainCommands();
+    bool Defer(tabs::Command);
+    void MoveTab(int);
+    void BeginRestore(const ViewState &);
+    void ApplyRestore();
+    void CancelRestore();
+    bool IsViewInput(const MSG &) const;
+    bool Shortcut(UINT key, bool ctrl, bool shift, bool alt, bool repeated);
+    bool BackspaceTravels(bool repeated);
+    void RetryHeader();
+    void NavigationDuty();
+    void DetachDuty();
+    ULONGLONG CommittedId() const { return active_ < tabs_.size() ? tabs_[active_].id : 0; }
+    ULONGLONG DisplayedId() const { return switching_.Displayed(CommittedId()); }
+    size_t DisplayedIndex() const { const int i = Index(DisplayedId()); return i >= 0 ? static_cast<size_t>(i) : active_; }
     void NewTab(const Pidl *folder = nullptr);
     void Close(size_t,const std::vector<BYTE>* expected=nullptr);
     void Reopen();
@@ -927,6 +1164,7 @@ class Controller final : public IObjectWithSite, public IAccessible, public IDro
     void Menu(int, POINT);
     void LimitMemory();
     void SaveSession();
+    void FlushSession();
     void LoadSession();
     bool SaveWindowSession();
     bool LoadWindowSession();
@@ -1101,7 +1339,7 @@ class Controller final : public IObjectWithSite, public IAccessible, public IDro
         const auto target=ChildTarget(v.lVal);std::wstring text;
         if(target.kind==header::TargetKind::NewTab)text=L"Ctrl+T";
         if(target.kind==header::TargetKind::Tab){const int index=Index(target.tab);if(index<8)text=L"Ctrl+"+std::to_wstring(index+1);else if(index==static_cast<int>(tabs_.size()-1))text=L"Ctrl+9";}
-        if(target.kind==header::TargetKind::Close&&Index(target.tab)==static_cast<int>(active_))text=L"Ctrl+W";
+        if(target.kind==header::TargetKind::Close&&target.tab==DisplayedId())text=L"Ctrl+W";
         if(text.empty())return S_FALSE;*p=SysAllocString(text.c_str());return *p?S_OK:E_OUTOFMEMORY;
     }
     HRESULT STDMETHODCALLTYPE get_accFocus(VARIANT *p) override
@@ -1121,7 +1359,7 @@ class Controller final : public IObjectWithSite, public IAccessible, public IDro
         if (!p)
             return E_POINTER;
         VariantInit(p);
-        if(active_<tabs_.size()){p->vt = VT_I4;p->lVal=TargetChild({header::TargetKind::Tab,tabs_[active_].id});}
+        if(const auto shown=DisplayedId()){p->vt = VT_I4;p->lVal=TargetChild({header::TargetKind::Tab,shown});}
         return S_OK;
     }
     HRESULT STDMETHODCALLTYPE get_accDefaultAction(VARIANT v, BSTR *p) override
@@ -1292,7 +1530,7 @@ void Controller::Detach()
     CancelMetadata(metadataCookie_);
     headerRetryDeadline_=0;
     if (!tabs_.empty())
-        SaveSession();
+        FlushSession();
     Enable(false);
     if (events_ && eventCookie_)
         events_->Unadvise(eventCookie_);
@@ -1301,6 +1539,7 @@ void Controller::Detach()
     if (frame_ && frameHooked_)
     {
         KillTimer(frame_, MaintenanceTimer);
+        KillTimer(frame_, SessionTimer);
         RemoveWindowSubclass(frame_, FrameProc, reinterpret_cast<UINT_PTR>(this));
         if (GetPropW(frame_, ControllerProperty) == this)
             RemovePropW(frame_, ControllerProperty);
@@ -1450,10 +1689,12 @@ void Controller::Enable(bool value)
         CancelMetadata(metadataCookie_);
         for(auto& t:tabs_)t.metadataPending=false;
         Remember();
-        SaveSession();
+        FlushSession();
         pending_.reset();
+        switching_.Abandon();
+        busyShown_ = false;
         detached_.reset();
-        restoreState_.reset();
+        CancelRestore();
         if (keyboard_)
         {
             UnhookWindowsHookEx(keyboard_);
@@ -1550,9 +1791,12 @@ void Controller::Layout(bool transient)
     std::vector<std::uint64_t> identities;
     identities.reserve(tabs_.size());
     for(const auto& tab:tabs_)identities.push_back(tab.id);
-    auto next=header::BuildLayout(allocation,identities,active_<tabs_.size()?tabs_[active_].id:0,layout_.firstVisible);
+    auto next=header::BuildLayout(allocation,identities,DisplayedId(),layout_.firstVisible);
     const RECT area=allocation.bounds;
-    SetWindowPos(strip_, HWND_TOP,area.left,area.top,area.right-area.left,area.bottom-area.top,SWP_NOACTIVATE);
+    // Moving the frame reflows with identical bounds; the child moves with it.
+    if(!EqualRect(&area,&placed_)||!IsWindowVisible(strip_))
+        SetWindowPos(strip_, HWND_TOP,area.left,area.top,area.right-area.left,area.bottom-area.top,SWP_NOACTIVATE);
+    placed_=area;
     // A synchronous native reflow can invalidate a candidate while positioning
     // its child. Consumers reject that candidate until the queued update runs.
     layout_=std::move(next);
@@ -1588,7 +1832,7 @@ bool Controller::Render()
     visual.layout=layout_;
     visual.active=GetForegroundWindow()==frame||GetActiveWindow()==frame;
     visual.focused=GetFocus()==window;
-    visual.busy=pending_.has_value();
+    visual.busyTab=busyShown_?DisplayedId():0;
     visual.canCreate=tabs_.size()<MaxTabs;
     visual.hot=hotTarget_;visual.pressed=pressedTarget_;visual.focus=focusedTarget_;
     // Keep metadata-owned HICONs alive across graphics/COM calls and use one
@@ -1599,7 +1843,7 @@ bool Controller::Render()
         visual.tabs.push_back({tab.id,tab.metadataGeneration,tab.title,tab.icon?tab.icon->handle:folderIcon_});
     }
     const HRESULT result=renderer_.Paint(window,visual);
-    timing::Mark("render", epoch, visual.layout.active);
+    if(result==S_OK)timing::Mark("render", epoch, visual.layout.active);
     if(!enabled_||strip_!=window||frame_!=frame)return true;
     if(FAILED(result)) {
         rendererReady_=false;
@@ -1625,7 +1869,9 @@ void Controller::Paint()
 }
 void Controller::Remember()
 {
-    if (tabs_.empty() || active_ >= tabs_.size() || pending_)
+    // Until a pending restore runs, the view does not show this tab's state
+    // yet; the saved entry stays authoritative.
+    if (tabs_.empty() || active_ >= tabs_.size() || pending_ || restoreState_)
         return;
     const auto id=tabs_[active_].id;
     ComPtr<IShellBrowser> browser=browser_;
@@ -1633,20 +1879,22 @@ void Controller::Remember()
     const int index=Index(id);
     if(index<0||pending_)return;
     auto &t = tabs_[index];
+
     if (!t.history.empty() && Equal(s.folder, t.history[t.position].folder))
     {
         s.label=t.history[t.position].label;
         t.history[t.position] = std::move(s);
     }
 }
-bool Controller::Navigate(ULONGLONG id, size_t position, bool changeTab)
+bool Controller::Navigate(ULONGLONG id, size_t position, bool changeTab, bool remember)
 {
     if (pending_ || !browser_)
         return false;
     int index=Index(id);
     if (index<0 || position >= tabs_[index].history.size())
         return false;
-    Remember();
+    if(remember)Remember();
+    CancelRestore();
     index=Index(id);
     if(!enabled_||!browser_||pending_||index<0||position>=tabs_[index].history.size())return false;
     Pending pending;
@@ -1656,7 +1904,11 @@ bool Controller::Navigate(ULONGLONG id, size_t position, bool changeTab)
     pending.expected = tabs_[index].history[position].folder;
     pending.start = GetTickCount64();
     pending_ = std::move(pending);
-    if(strip_)InvalidateRect(strip_,nullptr,FALSE);
+    busyShown_ = false;
+    // The strip shows the destination before the Shell starts building the
+    // new view on this thread; the composition commit does not wait for it.
+    if(changeTab){switching_.Request(id,CommittedId(),0);Layout();}
+    if(!pending_||pending_->id!=id)return false;
     const Pidl destination=pending_->expected;
     ComPtr<IShellBrowser> browser=browser_;
     timing::Mark("browse", id, position);
@@ -1665,7 +1917,8 @@ bool Controller::Navigate(ULONGLONG id, size_t position, bool changeTab)
     if (FAILED(hr))
     {
         if(pending_&&pending_->id==id)pending_.reset();
-        if(strip_)InvalidateRect(strip_,nullptr,FALSE);
+        switching_.Forget(id);
+        Layout();
         patch::Log(L"ExplorerTabs", L"Shell navigation rejected: " + std::to_wstring(hr));
         return false;
     }
@@ -1676,18 +1929,156 @@ bool Controller::Navigate(ULONGLONG id, size_t position, bool changeTab)
 }
 bool Controller::Activate(size_t index)
 {
-    if (index >= tabs_.size() || pending_)
+    if (index >= tabs_.size())
         return false;
-    timing::Mark("activate", index, tabs_[index].id);
-    if (index == active_)
+    const auto id=tabs_[index].id;
+    const auto position=tabs_[index].position;
+    timing::Mark("activate", index, id);
+    switch(switching_.Request(id,CommittedId(),pending_?pending_->id:0))
+    {
+    case tabs::RequestAction::None:
+        Layout();
         return true;
-    return Navigate(tabs_[index].id, tabs_[index].position, true);
+    case tabs::RequestAction::Wait:
+        // The navigation in flight is followed by this one when it arrives.
+        Layout();
+        return true;
+    case tabs::RequestAction::Navigate:
+        break;
+    }
+    if(Navigate(id,position,true))return true;
+    switching_.Forget(id);
+    Layout();
+    return false;
+}
+bool Controller::FollowRequest(ULONGLONG id)
+{
+    // The tab that just arrived was only passed through: its saved state is
+    // neither captured from the fresh view nor restored into it.
+    const int index=Index(id);
+    return index>=0&&Navigate(id,tabs_[index].position,true,false);
+}
+bool Controller::Defer(tabs::Command command)
+{
+    if(switching_.Enqueue(command))return true;
+    patch::Log(L"ExplorerTabs",L"Too many tab commands were waiting for a folder; the newest one was ignored.");
+    return false;
+}
+void Controller::DrainCommands()
+{
+    while(enabled_&&!pending_)
+    {
+        const auto command=switching_.Next();
+        if(!command)return;
+        const int index=Index(command->tab);
+        switch(command->kind)
+        {
+        case tabs::CommandKind::NewTab: NewTab(); break;
+        case tabs::CommandKind::Duplicate:
+            if(index>=0){Pidl folder=tabs_[index].history[tabs_[index].position].folder;NewTab(&folder);}
+            break;
+        case tabs::CommandKind::Close: if(index>=0)Close(static_cast<size_t>(index)); break;
+        case tabs::CommandKind::Reopen: Reopen(); break;
+        case tabs::CommandKind::Back: History(-1); break;
+        case tabs::CommandKind::Forward: History(1); break;
+        }
+    }
+}
+void Controller::BeginRestore(const ViewState& state)
+{
+    CancelRestore();
+    if(!browser_||!frame_)return;
+    restoreState_=state;
+    restoreDeadline_=GetTickCount64()+1500;
+    ComPtr<IShellView> view;
+    if(SUCCEEDED(browser_->QueryActiveShellView(&view)))
+    {
+        view->GetWindow(&restoreView_);
+        viewEvents_=ViewEvents::Connect(view.Get(),frame_,RestoreMessage);
+    }
+    if(!restoreState_)return;
+    // Items already listed: restore at once; otherwise the view's enumeration
+    // event or the fallback deadline applies it.
+    if(RestoreItemsListed(view.Get(),*restoreState_))PostMessageW(frame_,RestoreMessage,0,0);
+    SetTimer(frame_,MaintenanceTimer,100,nullptr);
+}
+void Controller::CancelRestore()
+{
+    if(viewEvents_)viewEvents_->Disconnect();
+    viewEvents_.Reset();
+    restoreState_.reset();
+    restoreView_=nullptr;
+    restoreDeadline_=0;
+}
+void Controller::ApplyRestore()
+{
+    // One pass, when the view is ready (or at the fallback deadline). It
+    // compares before it sets, so a view that already shows the state is left
+    // alone.
+    if(!restoreState_)return;
+    const ViewState state=std::move(*restoreState_);
+    ComPtr<IShellBrowser> browser=browser_;
+    CancelRestore();
+    timing::Mark("restore");
+    Restore(browser.Get(),state);
+}bool Controller::IsViewInput(const MSG& message) const
+{
+    if(!restoreView_||!(message.hwnd==restoreView_||IsChild(restoreView_,message.hwnd)))return false;
+    switch(message.message)
+    {
+    case WM_LBUTTONDOWN: case WM_RBUTTONDOWN: case WM_MBUTTONDOWN: case WM_LBUTTONDBLCLK:
+    case WM_MOUSEWHEEL: case WM_MOUSEHWHEEL:
+        return true;
+    case WM_KEYDOWN: case WM_SYSKEYDOWN:
+        switch(message.wParam)
+        {
+        case VK_SHIFT: case VK_CONTROL: case VK_MENU: case VK_LWIN: case VK_RWIN:
+        case VK_LSHIFT: case VK_RSHIFT: case VK_LCONTROL: case VK_RCONTROL: case VK_LMENU: case VK_RMENU:
+            return false;
+        default:
+            return true;
+        }
+    default:
+        return false;
+    }
 }
 void Controller::Synchronize()
 {
     if (tearingDown_ || !browser_)
         return;
     const HWND frame=frame_;ComPtr<IShellBrowser> browser=browser_;
+    if (pending_ && !tabs_.empty())
+    {
+        // Only the folder decides arrival; the full view state is not needed.
+        const auto arrivedFolder=CurrentFolder(browser.Get());
+        if(tearingDown_||!frame_||frame_!=frame||!pending_||!Equal(arrivedFolder,pending_->expected))
+            return;
+        const int index=Index(pending_->id);
+        if (index<0)
+        {
+            pending_.reset();
+            switching_.Abandon();
+            Layout();
+            return;
+        }
+        active_ = static_cast<size_t>(index);
+        auto& tab=tabs_[active_];
+        timing::Mark("commit", tab.id);
+        tab.position = pending_->position;
+        pending_.reset();
+        busyShown_=false;
+        if(const auto next=switching_.Arrived(tab.id);next&&FollowRequest(next))
+        {
+            RefreshTravel();
+            TabChanged();
+            return;
+        }
+        BeginRestore(tabs_[active_].history[tabs_[active_].position]);
+        RefreshTravel();
+        TabChanged();
+        DrainCommands();
+        return;
+    }
     auto s = Capture(browser.Get());
     if (!s.folder||tearingDown_||!frame_||frame_!=frame||browser_.Get()!=browser.Get())
         return;
@@ -1704,29 +2095,14 @@ void Controller::Synchronize()
         return;
     }
     if (pending_)
-    {
-        if (!Equal(s.folder, pending_->expected))
-            return;
-        auto i = std::find_if(tabs_.begin(), tabs_.end(), [&](auto &t) { return t.id == pending_->id; });
-        if (i == tabs_.end())
-        {
-            pending_.reset();
-            return;
-        }
-        active_ = static_cast<size_t>(i - tabs_.begin());
-        timing::Mark("commit", i->id);
-        i->position = pending_->position;
-        restoreState_ = i->history[i->position];
-        restoreTries_ = 0;
-        pending_.reset();
-        PostMessageW(frame_, RestoreMessage, 0, 0);
-        SetTimer(frame_, MaintenanceTimer, 100, nullptr);
-    }
-    else
+        return;
     {
         auto &t = tabs_[active_];
         if (!Equal(t.history[t.position].folder, s.folder))
         {
+            // Navigated inside the tab (address bar, double-click, history):
+            // a restore aimed at the previous folder no longer applies.
+            if(restoreState_&&!Equal(restoreState_->folder,s.folder))CancelRestore();
             t.history.erase(t.history.begin() + static_cast<ptrdiff_t>(t.position + 1), t.history.end());
             t.history.push_back(std::move(s));
             if (t.history.size() > MaxHistory)
@@ -1740,8 +2116,14 @@ void Controller::Synchronize()
 }
 void Controller::NewTab(const Pidl *folder)
 {
-    if (tabs_.size() >= MaxTabs || pending_ || tabs_.empty())
+    if (tabs_.size() >= MaxTabs || tabs_.empty())
         return;
+    if (pending_)
+    {
+        if (!folder)
+            Defer({tabs::CommandKind::NewTab, 0});
+        return;
+    }
     const Pidl requested=folder?*folder:Pidl{};
     Remember();
     if(!enabled_||tabs_.empty()||pending_)return;
@@ -1757,8 +2139,15 @@ void Controller::NewTab(const Pidl *folder)
 }
 void Controller::Close(size_t index,const std::vector<BYTE>* expected)
 {
-    if (index >= tabs_.size() || pending_)
+    if (index >= tabs_.size())
         return;
+    if (pending_)
+    {
+        // A detach hand-off re-checks its own snapshot later instead.
+        if (!expected)
+            Defer({tabs::CommandKind::Close, tabs_[index].id});
+        return;
+    }
     if(expected&&Serialize(tabs_[index],frame_)!=*expected)return;
     if (tabs_.size() == 1)
     {
@@ -1785,6 +2174,7 @@ void Controller::Close(size_t index,const std::vector<BYTE>* expected)
     closed_.push_back(tabs_[index]);
     if (closed_.size() > 32)
         closed_.erase(closed_.begin());
+    switching_.Forget(id);
     tabs_.erase(tabs_.begin() + static_cast<ptrdiff_t>(index));
     if (active_ > index)
         active_--;
@@ -1794,8 +2184,13 @@ void Controller::Close(size_t index,const std::vector<BYTE>* expected)
 }
 void Controller::Reopen()
 {
-    if (closed_.empty() || pending_ || tabs_.size() >= MaxTabs)
+    if (closed_.empty() || tabs_.size() >= MaxTabs)
         return;
+    if (pending_)
+    {
+        Defer({tabs::CommandKind::Reopen, 0});
+        return;
+    }
     Tab t = std::move(closed_.back());
     closed_.pop_back();
     t.id = nextId++;
@@ -1810,8 +2205,13 @@ void Controller::Reopen()
 }
 void Controller::History(int direction)
 {
-    if (tabs_.empty() || pending_)
+    if (tabs_.empty())
         return;
+    if (pending_)
+    {
+        Defer({direction < 0 ? tabs::CommandKind::Back : tabs::CommandKind::Forward, 0});
+        return;
+    }
     auto &t = tabs_[active_];
     if (direction < 0 && t.position > 0)
         Navigate(t.id, t.position - 1, false);
@@ -1825,8 +2225,9 @@ void Controller::TabChanged()
     if (enabled_ && strip_)
     {
         Layout();
-        if(!TargetChild(focusedTarget_)&&active_<tabs_.size())focusedTarget_={header::TargetKind::Tab,tabs_[active_].id};
-        NotifyWinEvent(EVENT_OBJECT_SELECTION, strip_, OBJID_CLIENT,active_<tabs_.size()?TargetChild({header::TargetKind::Tab,tabs_[active_].id}):CHILDID_SELF);
+        const auto shown=DisplayedId();
+        if(!TargetChild(focusedTarget_)&&shown)focusedTarget_={header::TargetKind::Tab,shown};
+        NotifyWinEvent(EVENT_OBJECT_SELECTION, strip_, OBJID_CLIENT,shown?TargetChild({header::TargetKind::Tab,shown}):CHILDID_SELF);
         NotifyWinEvent(EVENT_OBJECT_REORDER, strip_, OBJID_CLIENT, CHILDID_SELF);
     }
     UpdateNavigationButtons();
@@ -1867,45 +2268,31 @@ void Controller::AcceptMetadata(ULONGLONG ticket)
 }
 void Controller::SaveSession()
 {
+    // Tab changes come in bursts; the registry write waits for 1.5 s of quiet.
+    if (!hasUsableSession_ || tabs_.empty() || !frame_)
+        return;
+    sessionDirty_ = true;
+    SetTimer(frame_, SessionTimer, SessionDelayMs, nullptr);
+}
+void Controller::FlushSession()
+{
+    if (frame_)
+        KillTimer(frame_, SessionTimer);
+    sessionDirty_ = false;
     if (!hasUsableSession_ || tabs_.empty())
         return;
     timing::Mark("save-begin", tabs_.size());
     struct SaveMark {~SaveMark(){timing::Mark("save-end");}} saveMark;
-    auto encode = [&](const std::vector<Tab> &tabs) {
-        Writer writer;
-        writer.number(PacketMagic);
-        writer.number(DWORD{3});
-        writer.number(static_cast<DWORD>(tabs.size()));
-        writer.number(static_cast<DWORD>(active_));
-        for (const auto &tab : tabs)
-            writer.tab(tab);
-        return writer;
-    };
-    Writer w = encode(tabs_);
-    if (!w.ok)
-    {
-        // Keep every open tab even when a very large selection/history would
-        // exceed the persistence budget. Live in-memory history is unchanged.
-        auto compact = tabs_;
-        for (auto &tab : compact)
-        {
-            ViewState current = tab.history[tab.position];
-            current.selected.clear();
-            current.focused = {};
-            current.anchor = {};
-            tab.history.clear();
-            tab.history.push_back(std::move(current));
-            tab.position = 0;
-        }
-        w = encode(compact);
-        if (!w.ok)
-            return;
-    }
+    // Every open tab is kept even when long histories or large selections
+    // exceed the budget. Live in-memory history is unchanged.
+    const auto bytes = EncodeSession(tabs_, active_, SessionBudget);
+    if (bytes.empty())
+        return;
     HKEY key{};
     if (RegCreateKeyExW(HKEY_CURRENT_USER, SessionKey, 0, nullptr, 0, KEY_SET_VALUE, nullptr, &key, nullptr) ==
         ERROR_SUCCESS)
     {
-        RegSetValueExW(key, L"LastSession", 0, REG_BINARY, w.bytes.data(), static_cast<DWORD>(w.bytes.size()));
+        RegSetValueExW(key, L"LastSession", 0, REG_BINARY, bytes.data(), static_cast<DWORD>(bytes.size()));
         RegCloseKey(key);
     }
 }
@@ -2089,7 +2476,7 @@ int Controller::Hit(POINT point) const
 }
 void Controller::Menu(int hit, POINT point)
 {
-    if(!Ready()||pending_)return;
+    if(!Ready())return;
     const auto owner=layout_.allocation.owner;
     const auto id=hit>=0&&static_cast<size_t>(hit)<tabs_.size()?tabs_[hit].id:0;
     std::vector<ULONGLONG> identities;
@@ -2101,7 +2488,7 @@ void Controller::Menu(int hit, POINT point)
         {
             identities.push_back(tabs_[i].id);
             auto label=tabs_[i].title;for(size_t at=0;(at=label.find(L'&',at))!=std::wstring::npos;at+=2)label.insert(at,1,L'&');
-            AppendMenuW(menu, MF_STRING | (i == active_ ? MF_CHECKED : 0), 100 + static_cast<UINT_PTR>(i),
+            AppendMenuW(menu, MF_STRING | (i == DisplayedIndex() ? MF_CHECKED : 0), 100 + static_cast<UINT_PTR>(i),
                         label.c_str());
         }
         AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
@@ -2121,7 +2508,7 @@ void Controller::Menu(int hit, POINT point)
     UINT selected = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON, point.x, point.y, 0, frame_, nullptr);
     --menuDepth_;
     DestroyMenu(menu);
-    if(!Ready()||pending_||layout_.allocation.owner!=owner)return;
+    if(!Ready()||layout_.allocation.owner!=owner)return;
     hit=Index(id);
     if (selected >= 100 && selected - 100 < identities.size())
     {
@@ -2134,6 +2521,8 @@ void Controller::Menu(int hit, POINT point)
         Close(hit);
     else if (selected == ReopenTab)
         Reopen();
+    else if (selected == Duplicate && hit >= 0 && pending_)
+        Defer({tabs::CommandKind::Duplicate, tabs_[hit].id});
     else if (selected == Duplicate && hit >= 0)
     {
         Pidl folder = tabs_[hit].history[tabs_[hit].position].folder;
@@ -2181,7 +2570,7 @@ POINT Controller::MenuAnchor(header::TargetId target) const
 }
 void Controller::InvokeTarget(header::TargetId target)
 {
-    if(!Ready()||pending_)return;
+    if(!Ready())return;
     int index=Index(target.tab);
     if(target.kind==header::TargetKind::Tab&&index>=0)Activate(index);
     else if(target.kind==header::TargetKind::Close&&index>=0)Close(index);
@@ -2218,7 +2607,6 @@ void Controller::Mouse(UINT message, WPARAM, LPARAM data)
     if (message == WM_LBUTTONDOWN||message==WM_MBUTTONDOWN)
     {
         CancelPointer();
-        if(pending_)return;
         FocusTarget(layout_.Hit(point));
         pressedButton_=message;
         pressedTarget_=layout_.Hit(point);hotTarget_=pressedTarget_;
@@ -2310,7 +2698,7 @@ LRESULT CALLBACK Controller::StripProc(HWND h, UINT m, WPARAM w, LPARAM l)
             return LresultFromObject(IID_IAccessible, w, static_cast<IAccessible *>(self));
         break;
     case WM_SETFOCUS:
-        if(!self->TargetChild(self->focusedTarget_)&&!self->tabs_.empty())self->focusedTarget_={header::TargetKind::Tab,self->tabs_[self->active_].id};
+        if(!self->TargetChild(self->focusedTarget_)&&!self->tabs_.empty())self->focusedTarget_={header::TargetKind::Tab,self->DisplayedId()};
         NotifyWinEvent(EVENT_OBJECT_FOCUS, h, OBJID_CLIENT,self->TargetChild(self->focusedTarget_));
         InvalidateRect(h,nullptr,FALSE);
         break;
@@ -2406,7 +2794,7 @@ LRESULT CALLBACK Controller::FrameProc(HWND h, UINT m, WPARAM w, LPARAM l, UINT_
         handled = true;
     }
     else if(m==WM_SYSCOMMAND&&self->focusMenuId_&&(w&0xFFF0)==self->focusMenuId_) {
-        if(self->Ready()&&!self->tabs_.empty())self->FocusTarget({header::TargetKind::Tab,self->tabs_[self->active_].id});
+        if(self->Ready()&&!self->tabs_.empty())self->FocusTarget({header::TargetKind::Tab,self->DisplayedId()});
         handled=true;
     }
     else if (m == SyncMessage)
@@ -2422,18 +2810,17 @@ LRESULT CALLBACK Controller::FrameProc(HWND h, UINT m, WPARAM w, LPARAM l, UINT_
     }
     else if (m == RestoreMessage)
     {
-        if (self->restoreState_)
-        {
-            const ViewState state=*self->restoreState_;ComPtr<IShellBrowser> browser=self->browser_;
-            timing::Mark("restore", self->restoreTries_);
-            Restore(browser.Get(),state);
-            if(self->restoreState_&&self->browser_.Get()==browser.Get())self->restoreTries_++;
-        }
+        self->ApplyRestore();
         handled = true;
     }
     else if (m == WM_TIMER && w == MaintenanceTimer)
     {
         self->Timer();
+        handled = true;
+    }
+    else if (m == WM_TIMER && w == SessionTimer)
+    {
+        self->FlushSession();
         handled = true;
     }
     else if (m == WM_COPYDATA && self->enabled_)
@@ -2465,7 +2852,7 @@ LRESULT CALLBACK Controller::FrameProc(HWND h, UINT m, WPARAM w, LPARAM l, UINT_
             self->Layout(true);
             handled = true;
         }
-        else if (m == WM_THEMECHANGED || m == WM_SETTINGCHANGE || m == WM_SYSCOLORCHANGE)
+        else if (m == WM_THEMECHANGED || m == WM_SETTINGCHANGE || m == WM_SYSCOLORCHANGE || m == WM_DWMCOLORIZATIONCOLORCHANGED)
         {
             header::Invalidate(h);
             result = DefSubclassProc(h, m, w, l);
@@ -2481,10 +2868,10 @@ LRESULT CALLBACK Controller::FrameProc(HWND h, UINT m, WPARAM w, LPARAM l, UINT_
             if(self->strip_)InvalidateRect(self->strip_,nullptr,FALSE);
             handled=true;
         }
-        else if (m == WM_CLOSE)
+        else if (m == WM_CLOSE || (m == WM_ENDSESSION && w))
         {
             self->Remember();
-            self->SaveSession();
+            self->FlushSession();
         }
         else if (m == WM_NCDESTROY)
         {
@@ -2551,6 +2938,70 @@ LRESULT CALLBACK Controller::TravelProc(HWND h, UINT m, WPARAM w, LPARAM l, UINT
     }
     return DefSubclassProc(h, m, w, l);
 }
+// Tab shortcuts follow Firefox where Explorer has no binding of its own.
+// Each row names its chord; 'repeats' lets auto-repeat step through tabs.
+bool Controller::Shortcut(UINT key, bool ctrl, bool shift, bool alt, bool repeated)
+{
+    using Action = bool (*)(Controller&, UINT key, bool repeated);
+    struct Binding { UINT first, last; bool ctrl, shift, alt, repeats; Action run; };
+    static constexpr auto step=[](Controller& c,int delta){
+        if(c.tabs_.empty())return true;
+        const auto count=static_cast<long long>(c.tabs_.size());
+        c.Activate(static_cast<size_t>(((static_cast<long long>(c.DisplayedIndex())+delta)%count+count)%count));
+        return true;
+    };
+    static const Binding bindings[]{
+        {'T','T',true,false,false,false,[](Controller& c,UINT,bool){c.NewTab();return true;}},
+        {'T','T',true,true,false,false,[](Controller& c,UINT,bool){c.Reopen();return true;}},
+        {'W','W',true,false,false,false,[](Controller& c,UINT,bool){c.Close(c.DisplayedIndex());return true;}},
+        {VK_TAB,VK_TAB,true,false,false,true,[](Controller& c,UINT,bool){return step(c,1);}},
+        {VK_TAB,VK_TAB,true,true,false,true,[](Controller& c,UINT,bool){return step(c,-1);}},
+        {VK_NEXT,VK_NEXT,true,false,false,true,[](Controller& c,UINT,bool){return step(c,1);}},
+        {VK_PRIOR,VK_PRIOR,true,false,false,true,[](Controller& c,UINT,bool){return step(c,-1);}},
+        {VK_NEXT,VK_NEXT,true,true,false,true,[](Controller& c,UINT,bool){c.MoveTab(1);return true;}},
+        {VK_PRIOR,VK_PRIOR,true,true,false,true,[](Controller& c,UINT,bool){c.MoveTab(-1);return true;}},
+        {'1','9',true,false,false,true,[](Controller& c,UINT k,bool){
+            if(!c.tabs_.empty())c.Activate(k=='9'?c.tabs_.size()-1:k-'1');return true;}},
+        {VK_LEFT,VK_LEFT,false,false,true,false,[](Controller& c,UINT,bool){c.History(-1);return true;}},
+        {VK_RIGHT,VK_RIGHT,false,false,true,false,[](Controller& c,UINT,bool){c.History(1);return true;}},
+        {VK_BACK,VK_BACK,false,false,false,true,[](Controller& c,UINT,bool r){return c.BackspaceTravels(r);}},
+    };
+    for(const auto& b:bindings)
+    {
+        if(key<b.first||key>b.last||ctrl!=b.ctrl||shift!=b.shift||alt!=b.alt)continue;
+        // A held chord that should act once is still swallowed, so Explorer
+        // never sees half of it.
+        return !b.repeats&&repeated?true:b.run(*this,key,repeated);
+    }
+    return false;
+}
+bool Controller::BackspaceTravels(bool repeated)
+{
+    // Explorer editors share DirectUI hosts. Ask the actual folder view for its
+    // focus path rather than guessing an editor class name or taking over the
+    // whole frame.
+    ComPtr<IShellView> view;HWND viewWindow{};const HWND focus=GetFocus();
+    if(browser_&&SUCCEEDED(browser_->QueryActiveShellView(&view)))view->GetWindow(&viewWindow);
+    GUITHREADINFO info{sizeof(info)};GetGUIThreadInfo(ownerThread_,&info);
+    wchar_t name[64]{};GetClassNameW(focus,name,64);
+    const bool editor=info.hwndCaret||!_wcsicmp(name,L"Edit")||!_wcsnicmp(name,L"RichEdit",8);
+    if(!viewWindow||(focus!=viewWindow&&!IsChild(viewWindow,focus))||editor)return false;
+    if(!repeated)History(-1);
+    return true;
+}
+void Controller::MoveTab(int direction)
+{
+    // Moves the shown tab one place without wrapping, as Firefox does. Tabs
+    // are tracked by identity, so a navigation in flight is unaffected.
+    const size_t from=DisplayedIndex();
+    if(from>=tabs_.size())return;
+    const size_t to=direction<0?from-1:from+1;
+    if((direction<0&&from==0)||to>=tabs_.size())return;
+    const ULONGLONG committed=CommittedId();
+    std::swap(tabs_[from],tabs_[to]);
+    if(const int index=Index(committed);index>=0)active_=static_cast<size_t>(index);
+    TabChanged();
+}
 LRESULT CALLBACK Controller::KeyProc(int code, WPARAM remove, LPARAM data)
 {
     if (code >= 0 && remove == PM_REMOVE)
@@ -2566,63 +3017,11 @@ LRESULT CALLBACK Controller::KeyProc(int code, WPARAM remove, LPARAM data)
             bool eat = false;
             if (message->message == WM_KEYDOWN || message->message == WM_SYSKEYDOWN)
             {
-                bool ctrl = (GetKeyState(VK_CONTROL) & 0x8000) != 0, shift = (GetKeyState(VK_SHIFT) & 0x8000) != 0,
-                     alt = (GetKeyState(VK_MENU) & 0x8000) != 0;
-                UINT key = static_cast<UINT>(message->wParam);
+                const bool ctrl = (GetKeyState(VK_CONTROL) & 0x8000) != 0, shift = (GetKeyState(VK_SHIFT) & 0x8000) != 0,
+                           alt = (GetKeyState(VK_MENU) & 0x8000) != 0;
+                const UINT key = static_cast<UINT>(message->wParam);
                 if(key==VK_ESCAPE)self->CancelPointer();
-                bool repeated = (message->lParam & (1ll << 30)) != 0;
-                if (ctrl && !alt && key == 'T')
-                {
-                    if (!repeated)
-                    {
-                        if (shift)
-                            self->Reopen();
-                        else
-                            self->NewTab();
-                    }
-                    eat = true;
-                }
-                else if (ctrl && !alt && !shift && key == 'W')
-                {
-                    if (!repeated)
-                        self->Close(self->active_);
-                    eat = true;
-                }
-                else if (ctrl && !alt && key == VK_TAB)
-                {
-                    if (!self->tabs_.empty())
-                        self->Activate((self->active_ + self->tabs_.size() + (shift ? -1 : 1)) % self->tabs_.size());
-                    eat = true;
-                }
-                else if (ctrl && !alt && !shift && key >= '1' && key <= '9')
-                {
-                    size_t index = key == '9' ? self->tabs_.size() - 1 : key - '1';
-                    self->Activate(index);
-                    eat = true;
-                }
-                else if (alt && !ctrl && !shift && (key == VK_LEFT || key == VK_RIGHT))
-                {
-                    if (!repeated)
-                        self->History(key == VK_LEFT ? -1 : 1);
-                    eat = true;
-                }
-                else if (!ctrl && !alt && !shift && key == VK_BACK)
-                {
-                    // Explorer editors share DirectUI hosts. Ask the actual
-                    // folder view for its focus path rather than guessing an
-                    // editor class name or taking over the whole frame.
-                    ComPtr<IShellView> view;HWND viewWindow{};HWND focus=GetFocus();
-                    if(self->browser_&&SUCCEEDED(self->browser_->QueryActiveShellView(&view)))view->GetWindow(&viewWindow);
-                    GUITHREADINFO info{sizeof(info)};GetGUIThreadInfo(self->ownerThread_,&info);
-                    wchar_t name[64]{};GetClassNameW(focus,name,64);
-                    const bool editor=info.hwndCaret||!_wcsicmp(name,L"Edit")||!_wcsnicmp(name,L"RichEdit",8);
-                    if (viewWindow&&(focus==viewWindow||IsChild(viewWindow,focus))&&!editor)
-                    {
-                        if (!repeated)
-                            self->History(-1);
-                        eat = true;
-                    }
-                }
+                eat = self->Shortcut(key, ctrl, shift, alt, (message->lParam & (1ll << 30)) != 0);
             }
             else if (message->message == WM_XBUTTONUP)
             {
@@ -2631,6 +3030,8 @@ LRESULT CALLBACK Controller::KeyProc(int code, WPARAM remove, LPARAM data)
             }
             else if (message->message == WM_XBUTTONDOWN)
                 eat = true;
+            if (!eat && self->restoreState_ && self->IsViewInput(*message))
+                self->CancelRestore();
             if (eat)
             {
                 message->message = WM_NULL;
@@ -2667,7 +3068,9 @@ HRESULT Controller::Invoke(DISPID id, REFIID, LCID, WORD flags, DISPPARAMS *para
     {
         timing::Mark("naverror");
         pending_.reset();
-        restoreState_.reset();
+        switching_.Abandon();
+        busyShown_ = false;
+        CancelRestore();
         PostMessageW(frame_, SyncMessage, 0, 0);
     }
     return S_OK;
@@ -2760,10 +3163,7 @@ bool Controller::Import(Tab tab, bool replaceInitial)
     {
         tabs_[0] = std::move(tab);
         active_ = 0;
-        restoreState_ = tabs_[0].history[tabs_[0].position];
-        restoreTries_ = 0;
-        PostMessageW(frame_, RestoreMessage, 0, 0);
-        SetTimer(frame_, MaintenanceTimer, 100, nullptr);
+        BeginRestore(tabs_[0].history[tabs_[0].position]);
         TabChanged();
         return true;
     }
@@ -2846,91 +3246,88 @@ void Controller::StartDrag(size_t index)
         inDrag_ = false;
     Release();
 }
+void Controller::RetryHeader()
+{
+    if(!headerRetryDeadline_)return;
+    if(tearingDown_||closingFrame_||!(patch::LoadConfig().flags&patch::ExplorerTabs)||GetTickCount64()>=headerRetryDeadline_)headerRetryDeadline_=0;
+    else Enable(true);
+}
+void Controller::NavigationDuty()
+{
+    if(!pending_)return;
+    Synchronize();
+    if(!pending_)return;
+    const ULONGLONG elapsed=GetTickCount64()-pending_->start;
+    if(elapsed>15000)
+    {
+        pending_.reset();
+        switching_.Abandon();
+        busyShown_=false;
+        Synchronize();
+        Layout();
+        patch::Log(L"ExplorerTabs", L"The requested folder did not become ready within 15 seconds. The current "
+                                    L"Explorer location was retained.");
+        return;
+    }
+    // A slow folder earns a busy mark on its tab; a quick one never flashes it.
+    if(!busyShown_&&tabs::SwitchModel::Busy(true,elapsed)){busyShown_=true;if(strip_)InvalidateRect(strip_,nullptr,FALSE);}
+}
+void Controller::DetachDuty()
+{
+    if(!detached_)return;
+    // All borrowed storage is copied before COM or another window can
+    // reenter this owner. Only the automation object's actual HWND accepts.
+    const Detached attempt=*detached_;
+    ComPtr<IServiceProvider> provider;ComPtr<IShellBrowser> targetBrowser;
+    const HWND target=attempt.window;
+    const auto sameRequest=[&]{return enabled_&&detached_&&detached_->id==attempt.id&&
+        detached_->window==attempt.window&&detached_->created.Get()==attempt.created.Get();};
+    if(!pending_&&active_<tabs_.size()&&tabs_[active_].id==attempt.id)Remember();
+    int source=Index(attempt.id);
+    if(sameRequest()&&!pending_&&(source<0||Serialize(tabs_[source],frame_)!=attempt.packet)) {
+        detached_.reset();patch::Log(L"ExplorerTabs",L"The source tab changed while its new window was opening; the source was kept.");
+    }
+    bool ready=sameRequest()&&!pending_&&!attempt.transferred&&IsWindow(target)&&GetPropW(target,patch::TabsActiveProperty)&&
+        SUCCEEDED(attempt.created.As(&provider))&&
+        SUCCEEDED(provider->QueryService(SID_STopLevelBrowser,IID_PPV_ARGS(&targetBrowser)));
+    if(ready&&Equal(CurrentFolder(targetBrowser.Get()),attempt.expected)&&sameRequest()&&!pending_&&
+       (source=Index(attempt.id))>=0&&Serialize(tabs_[source],frame_)==attempt.packet)
+    {
+        COPYDATASTRUCT data{PacketMagic,static_cast<DWORD>(attempt.packet.size()),const_cast<BYTE*>(attempt.packet.data())};
+        DWORD_PTR accepted{};
+        const bool transferred=SendMessageTimeoutW(target,WM_COPYDATA,reinterpret_cast<WPARAM>(frame_),reinterpret_cast<LPARAM>(&data),SMTO_ABORTIFHUNG|SMTO_BLOCK,1000,&accepted)&&accepted;
+        if(transferred&&sameRequest())detached_->transferred=true;
+    }
+    if(sameRequest()&&detached_->transferred&&!pending_) {
+        source=Index(attempt.id);
+        if(source<0)detached_.reset();
+        else if(Serialize(tabs_[source],frame_)!=attempt.packet)detached_.reset();
+        else if(!detached_->closeRequested) {
+            const bool last=tabs_.size()==1;
+            Close(source,&attempt.packet);
+            if(sameRequest()) {
+                if(Index(attempt.id)<0)detached_.reset();
+                else if(last)detached_->closeRequested=true;
+            }
+        }
+    }
+    if(detached_&&GetTickCount64()-detached_->start>10000) {
+        detached_.reset();patch::Log(L"ExplorerTabs",L"The created window did not accept the detached tab. The original tab was kept.");
+    }
+}
 void Controller::Timer()
 {
-    if(headerRetryDeadline_){
-        if(tearingDown_||closingFrame_||!(patch::LoadConfig().flags&patch::ExplorerTabs)||GetTickCount64()>=headerRetryDeadline_)headerRetryDeadline_=0;
-        else Enable(true);
-    }
+    RetryHeader();
     if (tabs_.empty() && startupPending_)
         Synchronize();
     if (startupPending_ && GetTickCount64() - startupStart_ >= 10000)
         CompleteStartupGuard();
-    if (pending_)
-    {
-        Synchronize();
-        if (pending_ && GetTickCount64() - pending_->start > 15000)
-        {
-            pending_.reset();
-            Synchronize();
-            patch::Log(L"ExplorerTabs", L"The requested folder did not become ready within 15 seconds. The current "
-                                        L"Explorer location was retained.");
-        }
-    }
-    if (restoreState_)
-    {
-        const ViewState state=*restoreState_;ComPtr<IShellBrowser> browser=browser_;
-        const bool matches=Equal(CurrentFolder(browser.Get()),state.folder);
-        if(!enabled_||!frame_||browser_.Get()!=browser.Get()||!restoreState_)return;
-        if (matches&&Equal(restoreState_->folder,state.folder))
-        {
-            timing::Mark("restore", restoreTries_);
-            Restore(browser.Get(),state);
-            if(!enabled_||!frame_||browser_.Get()!=browser.Get()||!restoreState_)return;
-            if (++restoreTries_ >= 10)
-            {
-                restoreState_.reset();
-                Remember();
-                SaveSession();
-            }
-        }
-        else
-            restoreState_.reset();
-    }
-    if(detached_)
-    {
-        // All borrowed storage is copied before COM or another window can
-        // reenter this owner. Only the automation object's actual HWND accepts.
-        const Detached attempt=*detached_;
-        ComPtr<IServiceProvider> provider;ComPtr<IShellBrowser> targetBrowser;
-        const HWND target=attempt.window;
-        const auto sameRequest=[&]{return enabled_&&detached_&&detached_->id==attempt.id&&
-            detached_->window==attempt.window&&detached_->created.Get()==attempt.created.Get();};
-        if(!pending_&&active_<tabs_.size()&&tabs_[active_].id==attempt.id)Remember();
-        int source=Index(attempt.id);
-        if(sameRequest()&&!pending_&&(source<0||Serialize(tabs_[source],frame_)!=attempt.packet)) {
-            detached_.reset();patch::Log(L"ExplorerTabs",L"The source tab changed while its new window was opening; the source was kept.");
-        }
-        bool ready=sameRequest()&&!pending_&&!attempt.transferred&&IsWindow(target)&&GetPropW(target,patch::TabsActiveProperty)&&
-            SUCCEEDED(attempt.created.As(&provider))&&
-            SUCCEEDED(provider->QueryService(SID_STopLevelBrowser,IID_PPV_ARGS(&targetBrowser)));
-        if(ready&&Equal(CurrentFolder(targetBrowser.Get()),attempt.expected)&&sameRequest()&&!pending_&&
-           (source=Index(attempt.id))>=0&&Serialize(tabs_[source],frame_)==attempt.packet)
-        {
-            COPYDATASTRUCT data{PacketMagic,static_cast<DWORD>(attempt.packet.size()),const_cast<BYTE*>(attempt.packet.data())};
-            DWORD_PTR accepted{};
-            const bool transferred=SendMessageTimeoutW(target,WM_COPYDATA,reinterpret_cast<WPARAM>(frame_),reinterpret_cast<LPARAM>(&data),SMTO_ABORTIFHUNG|SMTO_BLOCK,1000,&accepted)&&accepted;
-            if(transferred&&sameRequest())detached_->transferred=true;
-        }
-        if(sameRequest()&&detached_->transferred&&!pending_) {
-            source=Index(attempt.id);
-            if(source<0)detached_.reset();
-            else if(Serialize(tabs_[source],frame_)!=attempt.packet)detached_.reset();
-            else if(!detached_->closeRequested) {
-                const bool last=tabs_.size()==1;
-                Close(source,&attempt.packet);
-                if(sameRequest()) {
-                    if(Index(attempt.id)<0)detached_.reset();
-                    else if(last)detached_->closeRequested=true;
-                }
-            }
-        }
-        if(detached_&&GetTickCount64()-detached_->start>10000) {
-            detached_.reset();patch::Log(L"ExplorerTabs",L"The created window did not accept the detached tab. The original tab was kept.");
-        }
-    }
-    if(enabled_&&GetPropW(frame_,WindowSessionProperty))LoadWindowSession();
-    if (!startupPending_ && !pending_ && !restoreState_ && !detached_ && !headerRetryDeadline_&&!GetPropW(frame_,WindowSessionProperty))
+    NavigationDuty();
+    if (restoreState_ && GetTickCount64() >= restoreDeadline_)
+        ApplyRestore();
+    DetachDuty();
+    if(enabled_&&frame_&&GetPropW(frame_,WindowSessionProperty))LoadWindowSession();
+    if (frame_ && !startupPending_ && !pending_ && !restoreState_ && !detached_ && !headerRetryDeadline_&&!GetPropW(frame_,WindowSessionProperty))
         KillTimer(frame_, MaintenanceTimer);
 }
 void Controller::BindFolderDrop()
@@ -3190,7 +3587,7 @@ HRESULT Controller::get_accState(VARIANT v, VARIANT *out)
     if (target.kind==header::TargetKind::Tab)
     {
         out->lVal |= STATE_SYSTEM_SELECTABLE;
-        if (Index(target.tab)==static_cast<int>(active_))
+        if (target.tab==DisplayedId())
             out->lVal |= STATE_SYSTEM_SELECTED;
         const auto* tab=layout_.Find(target.tab);
         if(!tab||!tab->Visible()||!header::IsCurrent(frame_,layout_.allocation))
@@ -3199,8 +3596,8 @@ HRESULT Controller::get_accState(VARIANT v, VARIANT *out)
     if (!enabled_ || !strip_)
         out->lVal |= STATE_SYSTEM_INVISIBLE;
     RECT bounds{};if(child&&(!ChildRect(child,bounds)||IsRectEmpty(&bounds)))out->lVal|=STATE_SYSTEM_OFFSCREEN;
-    if(!Ready()||pending_||(target.kind==header::TargetKind::NewTab&&tabs_.size()>=MaxTabs))out->lVal|=STATE_SYSTEM_UNAVAILABLE;
-    if(pending_)out->lVal|=STATE_SYSTEM_BUSY;
+    if(!Ready()||(target.kind==header::TargetKind::NewTab&&tabs_.size()>=MaxTabs))out->lVal|=STATE_SYSTEM_UNAVAILABLE;
+    if(busyShown_&&(child==0||target.tab==DisplayedId()))out->lVal|=STATE_SYSTEM_BUSY;
     if (GetFocus() == strip_ && (child==0||target==focusedTarget_))
         out->lVal |= STATE_SYSTEM_FOCUSED;
     return S_OK;
@@ -3257,7 +3654,7 @@ HRESULT Controller::accDoDefaultAction(VARIANT v)
 {
     if (!ValidChild(v)||!v.lVal)
         return E_INVALIDARG;
-    if(!Ready()||pending_)return S_FALSE;
+    if(!Ready())return S_FALSE;
     const auto target=ChildTarget(v.lVal);
     if(target.kind==header::TargetKind::NewTab&&tabs_.size()>=MaxTabs)return S_FALSE;
     InvokeTarget(target);return S_OK;
@@ -3270,7 +3667,7 @@ HRESULT Controller::accSelect(long flags,VARIANT child)
     const auto target=ChildTarget(child.lVal);
     if(flags&~(SELFLAG_TAKEFOCUS|SELFLAG_TAKESELECTION))return E_INVALIDARG;
     if((flags&SELFLAG_TAKESELECTION)&&target.kind!=header::TargetKind::Tab)return E_INVALIDARG;
-    if(!Ready()||pending_)return S_FALSE;
+    if(!Ready())return S_FALSE;
     if(flags&SELFLAG_TAKEFOCUS)FocusTarget(target);
     if(flags&SELFLAG_TAKESELECTION)return Activate(Index(target.tab))?S_OK:S_FALSE;
     return S_OK;
@@ -3614,6 +4011,67 @@ extern "C" HRESULT WINAPI RunModelTests(const wchar_t *report)
     writer.bytes.resize(MaxPacket);
     writer.number(DWORD{1});
     checks.emplace_back("serializer_hard_memory_bound", !writer.ok && writer.bytes.size() == MaxPacket);
+    {
+        // LastSession budget: every tab survives, detail is given up in steps.
+        struct SyntheticItem { USHORT cb; BYTE data[196]; USHORT end; };
+        auto item = [](BYTE seed) {
+            SyntheticItem raw{};
+            raw.cb = sizeof(raw.cb) + sizeof(raw.data);
+            std::memset(raw.data, seed, sizeof(raw.data));
+            return Pidl(reinterpret_cast<PCIDLIST_ABSOLUTE>(&raw));
+        };
+        auto decode = [](const std::vector<BYTE> &bytes, std::vector<Tab> &tabs, DWORD &active) {
+            Reader reader{bytes.data(), bytes.size()};
+            if (reader.number<DWORD>() != PacketMagic || reader.number<DWORD>() != 3)
+                return false;
+            const auto count = reader.number<DWORD>();
+            active = reader.number<DWORD>();
+            for (DWORD i = 0; i < count && reader.ok; ++i)
+                tabs.push_back(reader.tab());
+            return reader.ok && !reader.left && tabs.size() == count && active < count;
+        };
+        auto build = [&](size_t entries, size_t selected) {
+            std::vector<Tab> tabs(MaxTabs);
+            for (size_t i = 0; i < tabs.size(); ++i)
+                for (size_t e = 0; e < entries; ++e)
+                {
+                    ViewState entry;
+                    entry.folder = item(static_cast<BYTE>(e + 1));
+                    entry.focused = item(static_cast<BYTE>(e + 2));
+                    entry.anchor = item(static_cast<BYTE>(e + 3));
+                    for (size_t k = 0; k < selected; ++k)
+                        entry.selected.push_back(item(static_cast<BYTE>(k + 7)));
+                    tabs[i].history.push_back(std::move(entry));
+                    tabs[i].position = entries - 1;
+                }
+            return tabs;
+        };
+        const size_t active = 3;
+        auto trimmed = build(60, 2);
+        auto bytes = EncodeSession(trimmed, active, SessionBudget);
+        std::vector<Tab> decoded;
+        DWORD decodedActive{};
+        const bool decodedOk = decode(bytes, decoded, decodedActive);
+        checks.emplace_back("session_budget_trims_background_history",
+                            !bytes.empty() && bytes.size() <= SessionBudget && decodedOk && decodedActive == active &&
+                                decoded[active].history.size() == 60 && decoded[0].history.size() == BackgroundHistory + 1 &&
+                                decoded[0].position == BackgroundHistory && decoded[0].history.back().selected.size() == 2 &&
+                                decoded[0].history.front().selected.empty());
+        auto heavy = build(20, 100);
+        bytes = EncodeSession(heavy, active, SessionBudget);
+        decoded.clear();
+        const bool heavyOk = decode(bytes, decoded, decodedActive);
+        checks.emplace_back("session_budget_keeps_every_tab",
+                            !bytes.empty() && bytes.size() <= SessionBudget && heavyOk && decoded.size() == MaxTabs &&
+                                decoded[0].history.size() == 1 && decoded[0].history[0].selected.empty() &&
+                                decoded[active].history[0].selected.size() == 100);
+        auto light = build(3, 1);
+        bytes = EncodeSession(light, active, SessionBudget);
+        decoded.clear();
+        checks.emplace_back("session_small_keeps_full_detail",
+                            decode(bytes, decoded, decodedActive) && decoded[5].history.size() == 3 &&
+                                decoded[5].history[0].selected.size() == 1);
+    }
     // Exercise the asynchronous path with a message-only test window. No
     // Explorer window, registration or controller is involved in this check.
     WNDCLASSW testClass{};testClass.hInstance=module;testClass.lpfnWndProc=DefWindowProcW;

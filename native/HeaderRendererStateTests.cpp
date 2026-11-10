@@ -46,11 +46,11 @@ int wmain(int argc,wchar_t** argv){
             Pump(150);Capture(host,std::wstring(argv[1])+L"\\renderer-dpi-"+std::to_wstring(dpi)+L".png");
             if(index++)report<<',';report<<static_cast<LONG>(hr);
         }
-        state.busy=true;state.canCreate=false;
+        state.busyTab=state.layout.active;state.canCreate=false;
         HRESULT hr=renderer.Paint(child,state);success=SUCCEEDED(hr)&&success;
         Pump(150);Capture(host,std::wstring(argv[1])+L"\\renderer-busy-disabled.png");
         report<<','<<static_cast<LONG>(hr);
-        state.busy=false;renderer.ThemeChanged();
+        state.busyTab=0;renderer.ThemeChanged();
         hr=renderer.Paint(child,state);success=SUCCEEDED(hr)&&success;
         Pump(150);Capture(host,std::wstring(argv[1])+L"\\renderer-create-disabled.png");report<<','<<static_cast<LONG>(hr);
         renderer.Reset();

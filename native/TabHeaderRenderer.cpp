@@ -45,6 +45,25 @@ HTHEME NativeControlTheme(HWND owned,const wchar_t* wanted) {
     return search.theme;
 }
 }
+// Two states draw the same pixels. Allocation owner/revision only track
+// identity, so they are not compared.
+bool SamePixels(const VisualState& a,const VisualState& b) {
+    const auto same=[](const RECT& x,const RECT& y){return EqualRect(&x,&y)!=FALSE;};
+    const auto& l=a.layout;const auto& r=b.layout;
+    if(!same(l.allocation.bounds,r.allocation.bounds)||l.allocation.dpi!=r.allocation.dpi||!same(l.viewport,r.viewport)||
+       !same(l.newTab,r.newTab)||!same(l.overflow,r.overflow)||l.active!=r.active||l.tabs.size()!=r.tabs.size()||
+       a.tabs.size()!=b.tabs.size()||!(a.hot==b.hot)||!(a.pressed==b.pressed)||!(a.focus==b.focus)||a.active!=b.active||
+       a.focused!=b.focused||a.canCreate!=b.canCreate||a.busyTab!=b.busyTab)return false;
+    for(size_t i=0;i<l.tabs.size();++i) {
+        const auto& x=l.tabs[i];const auto& y=r.tabs[i];
+        if(x.id!=y.id||!same(x.bounds,y.bounds)||!same(x.body,y.body)||!same(x.close,y.close)||!same(x.closeGlyph,y.closeGlyph))return false;
+    }
+    for(size_t i=0;i<a.tabs.size();++i) {
+        const auto& x=a.tabs[i];const auto& y=b.tabs[i];
+        if(x.id!=y.id||x.iconRevision!=y.iconRevision||x.icon!=y.icon||x.title!=y.title)return false;
+    }
+    return true;
+}
 struct TabHeaderRenderer::Impl {
     ComPtr<ID3D11Device> graphics;
     ComPtr<IDCompositionDevice> composition;
@@ -65,6 +84,9 @@ struct TabHeaderRenderer::Impl {
     HWND window{};
     UINT width{},height{},dpi{};
     bool firstSurface{true};
+    // DirectComposition keeps presented content; an identical state is not redrawn.
+    VisualState painted;
+    bool hasPainted{};
     HRESULT Initialize(HWND owned) {
         HRESULT hr=S_OK;
         if(!drawing&&FAILED(hr=D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED,drawing.GetAddressOf())))return hr;
@@ -168,7 +190,9 @@ struct TabHeaderRenderer::Impl {
             const auto* geometry=state.layout.Find(tab.id);
             if(!geometry||!geometry->Visible())continue;
             const bool selected=tab.id==state.layout.active;
-            const bool enabled=!state.busy;
+            // A slow tab shows a clock on its icon; the rest of the strip stays
+            // usable so the user can retarget at once.
+            constexpr bool enabled=true;
             const TargetId body{TargetKind::Tab,tab.id},close{TargetKind::Close,tab.id};
             if(selected)fill(geometry->bounds,selectedFill,contrast?1.f:(state.active?.26f:.16f));
             // A body hover includes its close button; the independent button
@@ -207,15 +231,15 @@ struct TabHeaderRenderer::Impl {
                 RECT focus=state.focus==body?geometry->body:geometry->close;InflateRect(&focus,-px(3),-px(3));
                 brush->SetColor(Color(ink,.8f));draw->DrawRectangle(Box(focus),brush.Get(),stroke);
             }
-            if(selected&&state.busy) {
+            if(state.busyTab&&tab.id==state.busyTab) {
                 const float x=bounds.left+pad+icon/2.f,y=(bounds.top+bounds.bottom)/2.f,r=px(6)*1.f;
                 brush->SetColor(Color(text,.8f));draw->DrawEllipse(D2D1::Ellipse(D2D1::Point2F(x,y),r,r),brush.Get(),stroke);
                 line(x,y,x,y-r*.6f,text,1.f,stroke);line(x,y,x+r*.5f,y,text,1.f,stroke);
             }
         }
-        const bool newEnabled=!state.busy&&state.canCreate;
+        const bool newEnabled=state.canCreate;
         affordance({TargetKind::NewTab,0},state.layout.newTab,newEnabled);
-        affordance({TargetKind::Overflow,0},state.layout.overflow,!state.busy);
+        affordance({TargetKind::Overflow,0},state.layout.overflow,true);
         auto controlInk=[&](TargetId id,bool enabled) {
             return !enabled?disabled:contrast&&state.hot==id?GetSysColor(COLOR_HIGHLIGHTTEXT):text;
         };
@@ -224,7 +248,7 @@ struct TabHeaderRenderer::Impl {
         const COLORREF plusInk=controlInk({TargetKind::NewTab,0},newEnabled);
         line(cx-r,cy,cx+r,cy,plusInk,1.f,stroke);line(cx,cy-r,cx,cy+r,plusInk,1.f,stroke);
         const float ox=(overflow.left+overflow.right)/2.f,oy=(overflow.top+overflow.bottom)/2.f;
-        const COLORREF overflowInk=controlInk({TargetKind::Overflow,0},!state.busy);
+        const COLORREF overflowInk=controlInk({TargetKind::Overflow,0},true);
         line(ox-r,oy-r/2,ox,oy+r/2,overflowInk,1.f,stroke);
         line(ox,oy+r/2,ox+r,oy-r/2,overflowInk,1.f,stroke);
         if(state.focused&&(state.focus.kind==TargetKind::NewTab||state.focus.kind==TargetKind::Overflow)) {
@@ -239,6 +263,8 @@ struct TabHeaderRenderer::Impl {
         return S_OK;
     }
     HRESULT Paint(HWND owned,const VisualState& state) {
+        if(hasPainted&&dpi&&window==owned&&SamePixels(painted,state))return S_FALSE;
+        hasPainted=false;
         HRESULT hr=Initialize(owned);
         if(FAILED(hr)||FAILED(hr=Font(state.layout.allocation.dpi)))return hr;
         const UINT w=state.layout.viewport.right,h=state.layout.viewport.bottom;
@@ -281,6 +307,7 @@ struct TabHeaderRenderer::Impl {
             if(FAILED(hr=composition->WaitForCommitCompletion()))return hr;
             firstSurface=false;
         }
+        painted=state;hasPainted=true;
         return S_OK;
     }
     ~Impl() {
@@ -301,5 +328,5 @@ HRESULT TabHeaderRenderer::Paint(HWND window,const VisualState& state) {
     } catch(...) {return E_OUTOFMEMORY;}
 }
 void TabHeaderRenderer::Reset(){impl_.reset();}
-void TabHeaderRenderer::ThemeChanged(){if(impl_)impl_->dpi=0;}
+void TabHeaderRenderer::ThemeChanged(){if(impl_){impl_->dpi=0;impl_->hasPainted=false;}}
 }
