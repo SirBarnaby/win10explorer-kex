@@ -2747,7 +2747,9 @@ void Controller::Mouse(UINT message, WPARAM, LPARAM data)
         // Closing with the mouse keeps tab widths until the pointer leaves the
         // strip, so the next close button lands under it (Firefox).
         if(valid&&was.kind==header::TargetKind::Close&&!layout_.overflowing)lockedWidth_=layout_.tabWidth;
-        if(valid)InvokeTarget(was);
+        // Scroll arrows act on press and repeat while held; release only stops them.
+        const bool arrow=was.kind==header::TargetKind::ScrollLeft||was.kind==header::TargetKind::ScrollRight;
+        if(valid&&!arrow)InvokeTarget(was);
         return;
     }
     if (message == WM_MBUTTONUP)
