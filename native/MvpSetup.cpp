@@ -1,0 +1,432 @@
+#include "Patch.h"
+#include "LegacyMigration.h"
+#include "MvpHostProtocol.h"
+#include <bcrypt.h>
+#include <commctrl.h>
+#include <shellapi.h>
+#include <shlobj.h>
+#include <shobjidl.h>
+#include <algorithm>
+#include <cstdint>
+#include <cstring>
+#include <cwctype>
+#include <utility>
+
+namespace patch {
+// Production recovery/reconciliation routines shared with ApplyConfig. Setup
+// needs the exact pre-attempt gesture state when a later metadata step fails.
+bool RollbackGestureAttempt(std::wstring& error);
+bool ReconcileTabsRuntime(const Config& config,std::wstring& error);
+}
+
+namespace {
+constexpr wchar_t RunKey[]=L"Software\\Microsoft\\Windows\\CurrentVersion\\Run";
+constexpr wchar_t UninstallKey[]=L"Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\ExplorerMvp";
+constexpr wchar_t HostRun[]=L"Win10NativePatch.ExplorerMvp.v1";
+constexpr wchar_t SnapRun[]=L"Win10NativePatch.NativeSnap.v2";
+constexpr wchar_t LegacyRun[]=L"Win10NativeSnap";
+constexpr wchar_t PendingValue[]=L"MvpRemovalPending";
+constexpr wchar_t ReplaceQtValue[]=L"MvpReplaceOwnedQt";
+constexpr std::array<const wchar_t*,8> Payload{
+    L"ExplorerTabs.dll",L"ExplorerMvpHost.exe",L"NativeSnap.exe",L"Win10PatchOptions.exe",
+    L"ExplorerMvpSetup.exe",L"Source.zip",L"LICENSE.txt",L"README.txt"};
+constexpr std::array<const wchar_t*,11> ArpNames{
+    L"DisplayName",L"DisplayVersion",L"Publisher",L"InstallLocation",L"UninstallString",
+    L"QuietUninstallString",L"ModifyPath",L"DisplayIcon",L"NoRepair",L"NoModify",L"EstimatedSize"};
+struct Handle {
+    HANDLE value=INVALID_HANDLE_VALUE;
+    explicit Handle(HANDLE h=INVALID_HANDLE_VALUE):value(h){}
+    ~Handle(){if(value&&value!=INVALID_HANDLE_VALUE)CloseHandle(value);}
+    Handle(const Handle&)=delete;Handle& operator=(const Handle&)=delete;
+    Handle(Handle&& other) noexcept:value(other.value){other.value=INVALID_HANDLE_VALUE;}
+    Handle& operator=(Handle&& other) noexcept {if(this!=&other){if(value&&value!=INVALID_HANDLE_VALUE)CloseHandle(value);value=other.value;other.value=INVALID_HANDLE_VALUE;}return *this;}
+    explicit operator bool()const{return value&&value!=INVALID_HANDLE_VALUE;}
+};
+struct SetupLock {
+    Handle handle{CreateMutexW(nullptr,FALSE,L"Local\\Win10NativePatch.MvpSetup.v1")};bool owned=false;
+    SetupLock(){if(handle){DWORD r=WaitForSingleObject(handle.value,0);owned=r==WAIT_OBJECT_0||r==WAIT_ABANDONED;}}
+    ~SetupLock(){if(owned)ReleaseMutex(handle.value);}
+};
+struct Value {bool present=false;DWORD type=REG_NONE;std::vector<BYTE> bytes;};
+struct Paths {std::wstring local,root,links,legacy;};
+struct Options {
+    enum class Action { Dialog,RemoveDialog,Install,Disable,Uninstall,SelfTest } action=Action::Dialog;
+    int tabs=-1,gestures=-1;std::wstring report;
+};
+struct Result {int code=1;std::wstring message;};
+struct ShortcutSnapshot {std::wstring path;bool present=false;std::vector<BYTE> bytes;};
+struct Snapshot {
+    Value directory,config,pending,replaceQt,hostRun,snapRun,legacyRun;
+    bool arpExisted=false;std::array<Value,ArpNames.size()> arp;
+    std::array<ShortcutSnapshot,2> links;
+};
+std::wstring Join(const std::wstring& path,const wchar_t* leaf){return path+L"\\"+leaf;}
+std::wstring Quote(const std::wstring& path){return L"\""+path+L"\"";}
+bool Equal(const std::wstring& a,const std::wstring& b){return !_wcsicmp(a.c_str(),b.c_str());}
+bool FullPath(const std::wstring& input,std::wstring& output) {
+    // Own files are always ordinary, absolute, local DOS paths. Device and UNC
+    // spellings are unnecessary here and make ownership comparisons ambiguous.
+    if(input.size()<3||!iswalpha(input[0])||input[1]!=L':'||(input[2]!=L'\\'&&input[2]!=L'/')||input.find(L':',2)!=std::wstring::npos||input.find(L'\0')!=std::wstring::npos)return false;
+    std::wstring buffer(32768,L'\0');DWORD n=GetFullPathNameW(input.c_str(),static_cast<DWORD>(buffer.size()),buffer.data(),nullptr);
+    if(!n||n>=buffer.size())return false;buffer.resize(n);std::replace(buffer.begin(),buffer.end(),L'/',L'\\');
+    while(buffer.size()>3&&buffer.back()==L'\\')buffer.pop_back();output=std::move(buffer);return true;
+}
+bool SamePath(const std::wstring& a,const std::wstring& b){std::wstring x,y;return FullPath(a,x)&&FullPath(b,y)&&Equal(x,y);}
+bool PackageId(const std::wstring& id){return id.size()==64&&std::all_of(id.begin(),id.end(),[](wchar_t c){return(c>=L'0'&&c<=L'9')||(c>=L'a'&&c<=L'f');});}
+bool OwnedPackage(const std::wstring& root,const std::wstring& candidate) {
+    std::wstring r,p;if(!FullPath(root,r)||!FullPath(candidate,p)||p.size()!=r.size()+65||_wcsnicmp(r.c_str(),p.c_str(),r.size())||p[r.size()]!=L'\\')return false;
+    return PackageId(p.substr(r.size()+1));
+}
+bool OwnedCommand(const std::wstring& command,const std::wstring& executable){return Equal(command,executable)||Equal(command,Quote(executable));}
+bool ReadValue(const wchar_t* key,const wchar_t* name,Value& value,std::wstring& error) {
+    value={};HKEY handle{};LONG code=RegOpenKeyExW(HKEY_CURRENT_USER,key,0,KEY_QUERY_VALUE,&handle);
+    if(code==ERROR_FILE_NOT_FOUND||code==ERROR_PATH_NOT_FOUND)return true;
+    if(code!=ERROR_SUCCESS){error=L"Windows could not read the existing installation settings.";return false;}
+    DWORD size{};code=RegQueryValueExW(handle,name,nullptr,&value.type,nullptr,&size);
+    if(code==ERROR_FILE_NOT_FOUND){RegCloseKey(handle);return true;}
+    if(code!=ERROR_SUCCESS||size>1024*1024){RegCloseKey(handle);error=L"An installation setting could not be read safely.";return false;}
+    value.bytes.resize(size);code=RegQueryValueExW(handle,name,nullptr,&value.type,value.bytes.data(),&size);RegCloseKey(handle);
+    if(code!=ERROR_SUCCESS){error=L"The installation settings changed while they were being read. Try again.";return false;}
+    value.bytes.resize(size);value.present=true;return true;
+}
+bool StringValue(const Value& value,std::wstring& text) {
+    if(!value.present||value.type!=REG_SZ||value.bytes.size()<sizeof(wchar_t)||value.bytes.size()%sizeof(wchar_t))return false;
+    std::wstring result(value.bytes.size()/sizeof(wchar_t),L'\0');std::memcpy(result.data(),value.bytes.data(),value.bytes.size());
+    if(result.back()!=L'\0'||result.find(L'\0')!=result.size()-1)return false;result.pop_back();text=std::move(result);return true;
+}
+bool StoreValue(const wchar_t* key,const wchar_t* name,const Value& value) {
+    HKEY handle{};LONG code=RegCreateKeyExW(HKEY_CURRENT_USER,key,0,nullptr,0,KEY_SET_VALUE,nullptr,&handle,nullptr);if(code!=ERROR_SUCCESS)return false;
+    code=value.present?RegSetValueExW(handle,name,0,value.type,value.bytes.data(),static_cast<DWORD>(value.bytes.size())):RegDeleteValueW(handle,name);
+    if(code==ERROR_FILE_NOT_FOUND)code=ERROR_SUCCESS;if(code==ERROR_SUCCESS)code=RegFlushKey(handle);RegCloseKey(handle);return code==ERROR_SUCCESS;
+}
+bool StoreString(const wchar_t* key,const wchar_t* name,const std::wstring& text){Value v;v.present=true;v.type=REG_SZ;v.bytes.resize((text.size()+1)*sizeof(wchar_t));std::memcpy(v.bytes.data(),text.c_str(),v.bytes.size());return StoreValue(key,name,v);}
+bool StoreDword(const wchar_t* key,const wchar_t* name,DWORD number){Value v;v.present=true;v.type=REG_DWORD;v.bytes.resize(sizeof(number));std::memcpy(v.bytes.data(),&number,sizeof(number));return StoreValue(key,name,v);}
+bool KnownFolder(REFKNOWNFOLDERID id,std::wstring& path){PWSTR value{};if(FAILED(SHGetKnownFolderPath(id,0,nullptr,&value)))return false;bool ok=FullPath(value,path);CoTaskMemFree(value);return ok;}
+bool GetPaths(Paths& paths,std::wstring& error) {
+    std::wstring programs;if(!KnownFolder(FOLDERID_LocalAppData,paths.local)||!KnownFolder(FOLDERID_Programs,programs)){error=L"Your Windows profile folders are unavailable.";return false;}
+    paths.root=Join(Join(paths.local,L"Programs"),L"Explorer MVP");paths.links=Join(programs,L"Explorer MVP");paths.legacy=Join(Join(Join(paths.local,L"Programs"),L"Win10NativePatch"),L"NativeSnap.exe");return true;
+}
+bool SafeDirectory(const std::wstring& directory,bool create,std::wstring& error) {
+    std::wstring path;if(!FullPath(directory,path)){error=L"An installation directory is not a supported local path.";return false;}
+    // Check every ancestor rather than only the last component: a redirected
+    // parent must never redirect deletion outside this product's directory.
+    for(size_t i=3;i<=path.size();++i)if(i==path.size()||path[i]==L'\\') {
+        std::wstring part=path.substr(0,i);DWORD attr=GetFileAttributesW(part.c_str());
+        if(attr==INVALID_FILE_ATTRIBUTES&&create){if(!CreateDirectoryW(part.c_str(),nullptr)&&GetLastError()!=ERROR_ALREADY_EXISTS){error=L"Windows could not create the per-user installation directory.";return false;}attr=GetFileAttributesW(part.c_str());}
+        if(attr==INVALID_FILE_ATTRIBUTES||!(attr&FILE_ATTRIBUTE_DIRECTORY)||(attr&FILE_ATTRIBUTE_REPARSE_POINT)){error=L"An installation directory is missing, redirected or inaccessible. No files were removed.";return false;}
+    }return true;
+}
+bool RegularFile(const std::wstring& path){DWORD a=GetFileAttributesW(path.c_str());return a!=INVALID_FILE_ATTRIBUTES&&!(a&(FILE_ATTRIBUTE_DIRECTORY|FILE_ATTRIBUTE_REPARSE_POINT));}
+bool FileBytes(const std::wstring& path,std::vector<BYTE>& bytes) {
+    if(!RegularFile(path))return false;Handle file(CreateFileW(path.c_str(),GENERIC_READ,FILE_SHARE_READ,nullptr,OPEN_EXISTING,FILE_FLAG_OPEN_REPARSE_POINT,nullptr));LARGE_INTEGER size{};
+    if(!file||!GetFileSizeEx(file.value,&size)||size.QuadPart<0||size.QuadPart>1024*1024)return false;bytes.resize(static_cast<size_t>(size.QuadPart));DWORD read{};
+    return bytes.empty()||(ReadFile(file.value,bytes.data(),static_cast<DWORD>(bytes.size()),&read,nullptr)&&read==bytes.size());
+}
+bool WriteBytes(const std::wstring& path,const std::vector<BYTE>& bytes) {
+    Handle file(CreateFileW(path.c_str(),GENERIC_WRITE,0,nullptr,CREATE_ALWAYS,FILE_ATTRIBUTE_NORMAL|FILE_FLAG_OPEN_REPARSE_POINT,nullptr));if(!file)return false;DWORD written{};
+    return (bytes.empty()||(WriteFile(file.value,bytes.data(),static_cast<DWORD>(bytes.size()),&written,nullptr)&&written==bytes.size()))&&FlushFileBuffers(file.value);
+}
+bool Digest(const std::wstring& directory,std::wstring& hex,std::uint64_t& total,std::wstring& error) {
+    BCRYPT_ALG_HANDLE algorithm{};BCRYPT_HASH_HANDLE hash{};DWORD objectSize{},resultSize{};std::vector<BYTE> object;std::array<BYTE,32> digest{};
+    bool ok=BCryptOpenAlgorithmProvider(&algorithm,BCRYPT_SHA256_ALGORITHM,nullptr,0)>=0&&BCryptGetProperty(algorithm,BCRYPT_OBJECT_LENGTH,reinterpret_cast<PUCHAR>(&objectSize),sizeof(objectSize),&resultSize,0)>=0;
+    if(ok){object.resize(objectSize);ok=BCryptCreateHash(algorithm,&hash,object.data(),objectSize,nullptr,0,0)>=0;}
+    total=0;std::array<BYTE,64*1024> buffer{};
+    for(const auto* leaf:Payload) {
+        if(!ok)break;const std::wstring filePath=Join(directory,leaf);if(!RegularFile(filePath)){ok=false;break;}
+        Handle file(CreateFileW(filePath.c_str(),GENERIC_READ,FILE_SHARE_READ,nullptr,OPEN_EXISTING,FILE_FLAG_SEQUENTIAL_SCAN|FILE_FLAG_OPEN_REPARSE_POINT,nullptr));LARGE_INTEGER length{};
+        if(!file||!GetFileSizeEx(file.value,&length)||length.QuadPart<=0){ok=false;break;}
+        total+=static_cast<std::uint64_t>(length.QuadPart);
+        // Fixed ordering, zero-terminated ASCII name, then 64-bit LE size and
+        // file bytes make a unique combined payload hash, including setup itself.
+        std::string name;for(const wchar_t* c=leaf;*c;++c)name.push_back(static_cast<char>(*c));name.push_back('\0');
+        std::array<BYTE,8> size{};for(unsigned i=0;i<8;++i)size[i]=static_cast<BYTE>(static_cast<std::uint64_t>(length.QuadPart)>>(8*i));
+        ok=BCryptHashData(hash,reinterpret_cast<PUCHAR>(name.data()),static_cast<ULONG>(name.size()),0)>=0&&BCryptHashData(hash,size.data(),static_cast<ULONG>(size.size()),0)>=0;
+        std::uint64_t seen=0;DWORD count{};
+        while(ok){if(!ReadFile(file.value,buffer.data(),static_cast<DWORD>(buffer.size()),&count,nullptr)){ok=false;break;}if(!count)break;seen+=count;ok=BCryptHashData(hash,buffer.data(),count,0)>=0;}
+        if(seen!=static_cast<std::uint64_t>(length.QuadPart))ok=false;
+    }
+    if(ok)ok=BCryptFinishHash(hash,digest.data(),static_cast<ULONG>(digest.size()),0)>=0;
+    if(hash)BCryptDestroyHash(hash);if(algorithm)BCryptCloseAlgorithmProvider(algorithm,0);
+    if(!ok){error=L"The complete package could not be verified. Keep all eight package files together and try again.";return false;}
+    constexpr wchar_t digits[]=L"0123456789abcdef";hex.clear();for(BYTE byte:digest){hex.push_back(digits[byte>>4]);hex.push_back(digits[byte&15]);}return true;
+}
+bool StagePackage(const Paths& paths,const std::wstring& source,std::wstring& target,std::uint64_t& bytes,std::wstring& error) {
+    std::wstring expected;if(!Digest(source,expected,bytes,error))return false;
+    target=Join(paths.root,expected.c_str());if(!OwnedPackage(paths.root,target)||!SafeDirectory(paths.root,true,error))return false;
+    DWORD attr=GetFileAttributesW(target.c_str());
+    if(attr!=INVALID_FILE_ATTRIBUTES) {
+        std::wstring actual;std::uint64_t ignored{};
+        if(!SafeDirectory(target,false,error)||!Digest(target,actual,ignored,error)||actual!=expected){error=L"An existing version directory is incomplete or changed. It has not been overwritten. Extract this package into a separate folder and remove the incomplete installation before retrying.";return false;}return true;
+    }
+    if(!CreateDirectoryW(target.c_str(),nullptr)){error=L"Windows could not create the version directory.";return false;}
+    std::vector<std::wstring> copied;bool ok=true;
+    for(const auto* leaf:Payload){auto destination=Join(target,leaf);if(!CopyFileW(Join(source,leaf).c_str(),destination.c_str(),TRUE)){ok=false;break;}copied.push_back(destination);}
+    std::wstring actual;std::uint64_t verified{};if(ok)ok=Digest(target,actual,verified,error)&&actual==expected;
+    if(!ok){for(const auto& file:copied)DeleteFileW(file.c_str());RemoveDirectoryW(target.c_str());error=L"The new version could not be copied and verified. The previous installation is unchanged.";return false;}return true;
+}
+bool WindowMatches(HWND window,const std::wstring& expected,Handle& process,std::wstring& error) {
+    DWORD pid{};GetWindowThreadProcessId(window,&pid);if(!pid){error=L"An existing feature process could not be identified.";return false;}
+    Handle opened(OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION|SYNCHRONIZE,FALSE,pid));std::wstring actual(32768,L'\0');DWORD size=static_cast<DWORD>(actual.size());
+    if(!opened||!QueryFullProcessImageNameW(opened.value,0,actual.data(),&size)){error=L"Windows could not verify an existing feature process. It has been left running.";return false;}
+    actual.resize(size);if(!SamePath(actual,expected)){error=L"A running feature does not match this installation's recorded executable. It has been left unchanged.";return false;}process=std::move(opened);return true;
+}
+bool CheckRuntime(const std::wstring& directory,std::wstring& error) {
+    for(const auto& item:std::array<std::pair<const wchar_t*,const wchar_t*>,2>{{{patch::mvp::HostClass,L"ExplorerMvpHost.exe"},{patch::SnapWindowClass,L"NativeSnap.exe"}}}) {
+        HWND window=FindWindowW(item.first,nullptr);Handle process;if(window&&!WindowMatches(window,Join(directory,item.second),process,error))return false;
+    }return true;
+}
+bool StopWindow(const wchar_t* windowClass,const std::wstring& expected,std::wstring& error,bool preserveSession=false) {
+    HWND window=FindWindowW(windowClass,nullptr);if(!window)return true;Handle process;if(!WindowMatches(window,expected,process,error))return false;
+    if(preserveSession&&!GetPropW(window,patch::mvp::SessionHandoffCapability)){
+        bool active=false;
+        EnumWindows([](HWND frame,LPARAM state)->BOOL{
+            if(GetPropW(frame,patch::TabsActiveProperty))*reinterpret_cast<bool*>(state)=true;
+            return TRUE;
+        },reinterpret_cast<LPARAM>(&active));
+        if(active){error=L"Close the existing Explorer windows before updating this older version. Their tabs have been preserved.";return false;}
+    }
+    if(!wcscmp(windowClass,patch::mvp::HostClass)){
+        if(patch::mvp::StopHost(window,process.value,preserveSession))return true;
+        error=L"Explorer integration did not finish stopping. Its stop request was cancelled; wait a moment and try again.";return false;
+    }
+    const bool posted=PostMessageW(window,WM_CLOSE,0,0)!=FALSE;
+    if(posted&&WaitForSingleObject(process.value,5000)==WAIT_OBJECT_0)return true;
+    error=L"A feature is still stopping. Explorer was not restarted. Wait a moment and try again.";return false;
+}
+bool StopRuntime(const std::wstring& directory,std::wstring& error,bool preserveSession=false){return CheckRuntime(directory,error)&&StopWindow(patch::mvp::HostClass,Join(directory,L"ExplorerMvpHost.exe"),error,preserveSession)&&StopWindow(patch::SnapWindowClass,Join(directory,L"NativeSnap.exe"),error);}
+bool ReadDirectory(std::wstring& directory,Value* snapshot,std::wstring& error) {
+    Value value;if(!ReadValue(patch::SettingsKey,L"InstallDirectory",value,error))return false;if(snapshot)*snapshot=value;
+    if(!value.present){directory=patch::ModuleDirectory();return FullPath(directory,directory);}
+    if(!StringValue(value,directory)||!FullPath(directory,directory)){error=L"The existing installation directory is invalid. It was not changed.";return false;}return true;
+}
+bool CheckRun(const Value& value,const std::wstring& expected,std::wstring& error) {
+    std::wstring command;if(!value.present||(StringValue(value,command)&&OwnedCommand(command,expected)))return true;
+    error=L"A startup entry with this project's name points elsewhere. Setup has preserved it.";return false;
+}
+bool ShortcutOwned(const std::wstring& path,const std::wstring& expected,const wchar_t* arguments) {
+    if(!RegularFile(path))return false;IShellLinkW* link{};IPersistFile* persist{};bool ok=false;
+    if(SUCCEEDED(CoCreateInstance(CLSID_ShellLink,nullptr,CLSCTX_INPROC_SERVER,IID_PPV_ARGS(&link)))&&SUCCEEDED(link->QueryInterface(IID_PPV_ARGS(&persist)))&&SUCCEEDED(persist->Load(path.c_str(),STGM_READ))) {
+        std::array<wchar_t,32768> target{},args{};WIN32_FIND_DATAW data{};
+        ok=SUCCEEDED(link->GetPath(target.data(),static_cast<int>(target.size()),&data,SLGP_RAWPATH))&&SUCCEEDED(link->GetArguments(args.data(),static_cast<int>(args.size())))&&SamePath(target.data(),expected)&&args.data()==std::wstring(arguments);
+    }if(persist)persist->Release();if(link)link->Release();return ok;
+}
+bool SaveShortcut(const std::wstring& path,const std::wstring& target,const std::wstring& directory,const wchar_t* arguments,const wchar_t* description) {
+    IShellLinkW* link{};IPersistFile* persist{};bool ok=false;
+    if(SUCCEEDED(CoCreateInstance(CLSID_ShellLink,nullptr,CLSCTX_INPROC_SERVER,IID_PPV_ARGS(&link)))) {
+        ok=SUCCEEDED(link->SetPath(target.c_str()))&&SUCCEEDED(link->SetWorkingDirectory(directory.c_str()))&&SUCCEEDED(link->SetArguments(arguments))&&SUCCEEDED(link->SetDescription(description))&&SUCCEEDED(link->SetIconLocation(target.c_str(),0))&&SUCCEEDED(link->QueryInterface(IID_PPV_ARGS(&persist)))&&SUCCEEDED(persist->Save(path.c_str(),TRUE));
+    }if(persist)persist->Release();if(link)link->Release();return ok;
+}
+bool ArpOwned(const std::wstring& expected,bool& exists,std::wstring& error) {
+    HKEY key{};LONG code=RegOpenKeyExW(HKEY_CURRENT_USER,UninstallKey,0,KEY_QUERY_VALUE,&key);if(code==ERROR_FILE_NOT_FOUND||code==ERROR_PATH_NOT_FOUND){exists=false;return true;}if(code!=ERROR_SUCCESS){error=L"Windows could not read the Apps & Features entry.";return false;}RegCloseKey(key);exists=true;
+    Value location,name;std::wstring l,n;if(!ReadValue(UninstallKey,L"InstallLocation",location,error)||!ReadValue(UninstallKey,L"DisplayName",name,error))return false;
+    if(!StringValue(location,l)||!SamePath(l,expected)||!StringValue(name,n)||n!=L"Explorer MVP"){error=L"The Apps & Features entry does not match this installation. It was preserved.";return false;}return true;
+}
+bool Capture(const Paths& paths,const std::wstring& directory,Snapshot& state,std::wstring& error) {
+    if(!ReadValue(patch::SettingsKey,L"InstallDirectory",state.directory,error)||!ReadValue(patch::SettingsKey,L"Config",state.config,error)||!ReadValue(patch::SettingsKey,PendingValue,state.pending,error)||!ReadValue(patch::SettingsKey,ReplaceQtValue,state.replaceQt,error)||!ReadValue(RunKey,HostRun,state.hostRun,error)||!ReadValue(RunKey,SnapRun,state.snapRun,error)||!ReadValue(RunKey,LegacyRun,state.legacyRun,error))return false;
+    if(!CheckRun(state.hostRun,Join(directory,L"ExplorerMvpHost.exe"),error)||!CheckRun(state.snapRun,Join(directory,L"NativeSnap.exe"),error)||!ArpOwned(directory,state.arpExisted,error))return false;
+    for(size_t i=0;i<ArpNames.size();++i)if(!ReadValue(UninstallKey,ArpNames[i],state.arp[i],error))return false;
+    const std::array<const wchar_t*,2> names{L"Explorer MVP Options.lnk",L"Change or Remove Explorer MVP.lnk"};
+    const std::array<const wchar_t*,2> targets{L"Win10PatchOptions.exe",L"ExplorerMvpSetup.exe"};
+    DWORD attributes=GetFileAttributesW(paths.links.c_str());if(attributes!=INVALID_FILE_ATTRIBUTES&&!SafeDirectory(paths.links,false,error))return false;
+    for(size_t i=0;i<names.size();++i){auto& saved=state.links[i];saved.path=Join(paths.links,names[i]);saved.present=GetFileAttributesW(saved.path.c_str())!=INVALID_FILE_ATTRIBUTES;if(saved.present&&(!ShortcutOwned(saved.path,Join(directory,targets[i]),L"")||!FileBytes(saved.path,saved.bytes))){error=L"A Start menu shortcut with this name belongs to something else. It was preserved.";return false;}}
+    return CheckRuntime(directory,error);
+}
+bool RestoreMetadata(const Snapshot& state) {
+    bool ok=StoreValue(patch::SettingsKey,PendingValue,state.pending)&&StoreValue(patch::SettingsKey,ReplaceQtValue,state.replaceQt);
+    for(size_t i=0;i<ArpNames.size();++i)ok=StoreValue(UninstallKey,ArpNames[i],state.arp[i])&&ok;
+    if(!state.arpExisted){LONG code=RegDeleteKeyW(HKEY_CURRENT_USER,UninstallKey);ok=(code==ERROR_SUCCESS||code==ERROR_FILE_NOT_FOUND)&&ok;}
+    for(const auto& saved:state.links){if(saved.present)ok=WriteBytes(saved.path,saved.bytes)&&ok;else if(!DeleteFileW(saved.path.c_str())&&GetLastError()!=ERROR_FILE_NOT_FOUND&&GetLastError()!=ERROR_PATH_NOT_FOUND)ok=false;}return ok;
+}
+bool RegisterMetadata(const Paths& paths,const std::wstring& directory,std::uint64_t bytes,std::wstring& error) {
+    const std::wstring setup=Join(directory,L"ExplorerMvpSetup.exe");
+    bool ok=StoreString(UninstallKey,L"DisplayName",L"Explorer MVP")&&StoreString(UninstallKey,L"DisplayVersion",L"0.1.0")&&StoreString(UninstallKey,L"Publisher",L"Explorer MVP project")&&StoreString(UninstallKey,L"InstallLocation",directory)&&StoreString(UninstallKey,L"UninstallString",Quote(setup)+L" --uninstall-ui")&&StoreString(UninstallKey,L"QuietUninstallString",Quote(setup)+L" --uninstall")&&StoreString(UninstallKey,L"ModifyPath",Quote(setup))&&StoreString(UninstallKey,L"DisplayIcon",Quote(setup)+L",0")&&StoreDword(UninstallKey,L"NoRepair",1)&&StoreDword(UninstallKey,L"NoModify",0)&&StoreDword(UninstallKey,L"EstimatedSize",static_cast<DWORD>(std::min<std::uint64_t>(bytes/1024,MAXDWORD)))&&StoreValue(patch::SettingsKey,PendingValue,Value{});
+    if(ok)ok=SafeDirectory(paths.links,true,error)&&SaveShortcut(Join(paths.links,L"Explorer MVP Options.lnk"),Join(directory,L"Win10PatchOptions.exe"),directory,L"",L"Configure Explorer title-bar tabs and snapping")&&SaveShortcut(Join(paths.links,L"Change or Remove Explorer MVP.lnk"),setup,directory,L"",L"Install, disable or remove Explorer MVP");
+    if(!ok&&error.empty())error=L"Windows could not create the Start menu or Apps & Features entries.";return ok;
+}
+bool StartHidden(const std::wstring& executable) {
+    std::wstring command=Quote(executable);STARTUPINFOW start{sizeof(start)};start.dwFlags=STARTF_USESHOWWINDOW;start.wShowWindow=SW_HIDE;PROCESS_INFORMATION process{};
+    if(!CreateProcessW(executable.c_str(),command.data(),nullptr,nullptr,FALSE,CREATE_NO_WINDOW,nullptr,nullptr,&start,&process))return false;CloseHandle(process.hThread);CloseHandle(process.hProcess);return true;
+}
+bool RetireLegacy(const Paths& paths,const Snapshot& state,bool& stopped,std::wstring& error) {
+    stopped=false;const auto status=patch::ReadGestureStatus();if(status.state!=patch::EffectiveState::Enabled||!status.privateBindingsActive)return true;
+    HWND receiver=FindWindowW(patch::SnapWindowClass,nullptr);Handle active;
+    std::wstring directory;if(!ReadDirectory(directory,nullptr,error))return false;
+    if(!receiver||!WindowMatches(receiver,Join(directory,L"NativeSnap.exe"),active,error)||!(static_cast<DWORD>(reinterpret_cast<ULONG_PTR>(GetPropW(receiver,L"Win10NativePatch.ActiveInputs.v2")))&patch::TouchpadGestures)){error=L"The new gesture receiver has not confirmed its assignments. The previous receiver was preserved.";return false;}
+    std::wstring command;if(!state.legacyRun.present||!StringValue(state.legacyRun,command)||!OwnedCommand(command,paths.legacy))return true;
+    HWND legacy=FindWindowW(L"Win10NativePatch.NativeSnap.v1",nullptr);Handle process;
+    if(legacy&&!WindowMatches(legacy,paths.legacy,process,error))return false;
+    if(!StoreValue(RunKey,LegacyRun,Value{})){error=L"The previous receiver's startup entry could not be retired.";return false;}
+    if(legacy){stopped=true;if(!PostMessageW(legacy,WM_CLOSE,0,0)||WaitForSingleObject(process.value,5000)!=WAIT_OBJECT_0){error=L"The previous receiver is still stopping. Its startup entry will be restored.";return false;}}return true;
+}
+Result Install(const Options& options) {
+    SetupLock lock;if(!lock.owned)return {1,L"Another Explorer MVP setup is running."};if(!patch::SupportedWindows())return {1,L"Explorer MVP supports Windows 10 22H2 x64 (build 19045)."};
+    Paths paths;Snapshot before;std::wstring error,previous,target;std::uint64_t bytes{};
+    if(!GetPaths(paths,error)||!ReadDirectory(previous,nullptr,error)||!Capture(paths,previous,before,error))return {1,error};
+    patch::Config old=patch::LoadConfig(),next=old;
+    // Only feature checkboxes change here. Keyboard mappings and the user's
+    // restore-session choice survive every update and feature toggle.
+    if(!before.config.present)next=patch::Config{};
+    if(options.tabs>=0){if(options.tabs)next.flags|=patch::ExplorerTabs;else next.flags&=~patch::ExplorerTabs;}
+    if(options.gestures>=0){if(options.gestures)next.flags|=patch::TouchpadGestures;else next.flags&=~patch::TouchpadGestures;}
+    if(!StagePackage(paths,patch::ModuleDirectory(),target,bytes,error))return {1,error};
+    migration::Legacy legacy;
+    if(!migration::ReadLegacy(Join(Join(paths.local,L"Win10NativePatch"),L"installation.clixml"),legacy,error)||!migration::PrepareLegacyImport(error))return {1,error};
+    Value imported;if(!ReadValue(patch::SettingsKey,L"LegacyGestureBaseline",imported,error))return {1,error};
+    const bool gestureChange=((old.flags^next.flags)&patch::TouchpadGestures)||(!(next.flags&patch::TouchpadGestures)&&imported.present);
+    bool changedDirectory=!SamePath(previous,target),selected=false,gestureCommitted=false,metadataTouched=false,legacyStopped=false;
+    const auto oldGestureStatus=patch::ReadGestureStatus();
+    auto rollback=[&]() {
+        std::wstring details;bool ok=true;
+        if(selected&&changedDirectory)ok=StopRuntime(target,details,true);
+        if(gestureCommitted)ok=patch::RollbackGestureAttempt(details)&&ok;
+        ok=StoreValue(patch::SettingsKey,L"InstallDirectory",before.directory)&&ok;
+        ok=StoreValue(patch::SettingsKey,ReplaceQtValue,before.replaceQt)&&ok;
+        // ApplyConfig(old) would perform a new disable against the imported
+        // original baseline and discard a working v1 route. Roll back its exact
+        // production gesture attempt, then restore config and runtimes directly.
+        ok=StoreValue(patch::SettingsKey,L"Config",before.config)&&ok;
+        std::wstring runtimeError;ok=patch::ReconcileSnapRuntime(old,runtimeError)&&ok;ok=patch::ReconcileTabsRuntime(old,runtimeError)&&ok;
+        const auto restored=patch::ReadGestureStatus();
+        if(restored.state==patch::EffectiveState::Pending&&oldGestureStatus.state!=patch::EffectiveState::Pending)error+=L" Windows reports gesture restoration pending; sign out and sign in before retrying.";
+        ok=StoreValue(RunKey,HostRun,before.hostRun)&&ok;ok=StoreValue(RunKey,SnapRun,before.snapRun)&&ok;
+        ok=StoreValue(RunKey,LegacyRun,before.legacyRun)&&ok;
+        if(metadataTouched)ok=RestoreMetadata(before)&&ok;
+        if(legacyStopped)ok=StartHidden(paths.legacy)&&ok;
+        patch::NotifySettingsChanged();if(!ok)error+=L" Recovery did not fully complete. Features may be disabled; run this setup again. "+details+L" "+runtimeError;
+    };
+    if(changedDirectory&&!StopRuntime(previous,error,true)){rollback();return {1,error};}
+    if(!StoreString(patch::SettingsKey,L"InstallDirectory",target)){error=L"Windows could not select the verified version.";rollback();return {1,error};}
+    selected=true;
+    if(!(legacy.found&&legacy.qtOwned?StoreDword(patch::SettingsKey,ReplaceQtValue,1):StoreValue(patch::SettingsKey,ReplaceQtValue,Value{}))){error=L"Windows could not save the owned extension replacement preference.";rollback();return {1,error};}
+    patch::GestureStatus status;if(!patch::ApplyConfig(next,status,error)){rollback();return {1,error};}gestureCommitted=gestureChange;
+    metadataTouched=true;if(!RegisterMetadata(paths,target,bytes,error)||!RetireLegacy(paths,before,legacyStopped,error)){rollback();return {1,error};}
+    if(status.state==patch::EffectiveState::Pending)return {3,L"Explorer MVP is installed. Windows still needs to apply or restore the touchpad assignments. Sign out when convenient, sign in, then open Options to confirm. The receiver remains installed until restoration is complete."};
+    return {0,L"Explorer MVP is installed for your account. Open Options to adjust the features. Existing Explorer windows are updated without restarting Explorer."};
+}
+bool DeleteOwnedValue(const wchar_t* name,const std::wstring& executable,std::wstring& error) {
+    Value value;if(!ReadValue(RunKey,name,value,error))return false;std::wstring command;
+    if(!value.present)return true;if(!StringValue(value,command)||!OwnedCommand(command,executable)){error=L"A startup entry no longer belongs to this installation. It was preserved.";return false;}
+    if(!StoreValue(RunKey,name,Value{})){error=L"Windows could not remove a startup entry.";return false;}return true;
+}
+bool RemoveMetadata(const Paths& paths,const std::wstring& directory,std::wstring& error) {
+    bool exists=false;if(!ArpOwned(directory,exists,error))return false;
+    for(const auto& entry:std::array<std::pair<const wchar_t*,const wchar_t*>,2>{{{L"Explorer MVP Options.lnk",L"Win10PatchOptions.exe"},{L"Change or Remove Explorer MVP.lnk",L"ExplorerMvpSetup.exe"}}}) {
+        const auto link=Join(paths.links,entry.first);DWORD attr=GetFileAttributesW(link.c_str());if(attr==INVALID_FILE_ATTRIBUTES)continue;
+        if(!SafeDirectory(paths.links,false,error)||!ShortcutOwned(link,Join(directory,entry.second),L"")){error=L"A Start menu shortcut changed after installation. It was preserved.";return false;}
+        if(!DeleteFileW(link.c_str())){error=L"Windows could not remove a Start menu shortcut.";return false;}
+    }
+    if(exists&&RegDeleteTreeW(HKEY_CURRENT_USER,UninstallKey)!=ERROR_SUCCESS){error=L"Windows could not remove the Apps & Features entry.";return false;}
+    RemoveDirectoryW(paths.links.c_str());return true;
+}
+bool ListPackages(const Paths& paths,std::vector<std::wstring>& packages,std::wstring& error) {
+    DWORD attributes=GetFileAttributesW(paths.root.c_str());if(attributes==INVALID_FILE_ATTRIBUTES)return true;if(!SafeDirectory(paths.root,false,error))return false;
+    WIN32_FIND_DATAW entry{};HANDLE search=FindFirstFileW(Join(paths.root,L"*").c_str(),&entry);if(search==INVALID_HANDLE_VALUE){error=L"The installation directory could not be inspected.";return false;}
+    bool ok=true;do{if(entry.cFileName==std::wstring(L".")||entry.cFileName==std::wstring(L".."))continue;
+        if(!(entry.dwFileAttributes&FILE_ATTRIBUTE_DIRECTORY)||!PackageId(entry.cFileName))continue;
+        auto directory=Join(paths.root,entry.cFileName);if((entry.dwFileAttributes&FILE_ATTRIBUTE_REPARSE_POINT)||!OwnedPackage(paths.root,directory)||!SafeDirectory(directory,false,error)){ok=false;break;}packages.push_back(directory);
+    }while(FindNextFileW(search,&entry));DWORD ended=GetLastError();FindClose(search);if(ok&&ended!=ERROR_NO_MORE_FILES){error=L"The installation directory changed while being inspected.";ok=false;}return ok;
+}
+bool DeletePayload(const std::wstring& directory,bool includeSetup) {
+    bool ok=true;for(const auto* leaf:Payload){if(!includeSetup&&!wcscmp(leaf,L"ExplorerMvpSetup.exe"))continue;
+        const auto file=Join(directory,leaf);DWORD attributes=GetFileAttributesW(file.c_str());if(attributes==INVALID_FILE_ATTRIBUTES){DWORD e=GetLastError();if(e!=ERROR_FILE_NOT_FOUND&&e!=ERROR_PATH_NOT_FOUND)ok=false;continue;}
+        if((attributes&(FILE_ATTRIBUTE_DIRECTORY|FILE_ATTRIBUTE_REPARSE_POINT))||!DeleteFileW(file.c_str()))ok=false;
+    }return ok;
+}
+Result DisableOrRemove(bool remove) {
+    SetupLock lock;if(!lock.owned)return {1,L"Another Explorer MVP setup is running."};if(!patch::SupportedWindows())return {1,L"Explorer MVP supports Windows 10 22H2 x64 (build 19045)."};
+    Paths paths;Snapshot before;std::wstring directory,error;if(!GetPaths(paths,error)||!ReadDirectory(directory,nullptr,error)||!Capture(paths,directory,before,error))return {1,error};
+    patch::Config disabled=patch::LoadConfig();disabled.flags&=~DWORD(patch::ExplorerTabs|patch::TouchpadGestures|patch::KeyboardShortcuts);
+    if(!migration::PrepareLegacyImport(error))return {1,error};patch::GestureStatus status;if(!patch::ApplyConfig(disabled,status,error))return {1,error};
+    if(status.state==patch::EffectiveState::Pending||status.privateBindingsActive){if(remove)StoreDword(patch::SettingsKey,PendingValue,1);return {3,L"Features are disabled, but Windows has not finished restoring the touchpad assignments. Sign out when convenient, sign in, then run Remove again. The receiver and setup are retained until restoration is confirmed."};}
+    if(!StopRuntime(directory,error))return {1,L"Features are disabled. "+error};
+    if(!remove)return {0,L"Explorer tabs, touchpad snapping and optional keyboard shortcuts are disabled. Your choices and recovery data are kept. Use Install / Update or Options to enable features again."};
+    if(!before.directory.present||!OwnedPackage(paths.root,directory)){return {3,L"Features are disabled. This is not an Explorer MVP version directory, so setup has preserved its files. Remove that earlier installation using its original installer."};}
+    if(!DeleteOwnedValue(HostRun,Join(directory,L"ExplorerMvpHost.exe"),error)||!DeleteOwnedValue(SnapRun,Join(directory,L"NativeSnap.exe"),error))return {1,L"Features are disabled. "+error};
+    StoreDword(patch::SettingsKey,PendingValue,1);std::vector<std::wstring> packages;if(!ListPackages(paths,packages,error))return {1,L"Features are disabled. "+error};
+    // Windows compares directory names without case. Include the recorded
+    // package even if somebody changed the displayed case of its hash folder.
+    if(GetFileAttributesW(directory.c_str())!=INVALID_FILE_ATTRIBUTES&&std::none_of(packages.begin(),packages.end(),[&](const auto& p){return SamePath(p,directory);})){
+        if(!SafeDirectory(directory,false,error))return {1,L"Features are disabled. "+error};packages.push_back(directory);
+    }
+    bool all=true;for(const auto& package:packages)all=DeletePayload(package,false)&&all;
+    if(!all)return {3,L"Features are disabled. Removal is pending because files are still in use or inaccessible. Setup and its Change / Remove entry are retained. Close folder windows and retry; if a file remains loaded, sign out and sign in before retrying. Explorer was not restarted."};
+    // Delete setup last so an in-use DLL never strands the user's uninstaller.
+    // A running installed setup cannot delete itself. In that case keep the
+    // entry and clearly report pending removal; an extracted copy can finish it.
+    for(const auto& package:packages){const auto setup=Join(package,L"ExplorerMvpSetup.exe");DWORD a=GetFileAttributesW(setup.c_str());if(a==INVALID_FILE_ATTRIBUTES){DWORD code=GetLastError();if(code!=ERROR_FILE_NOT_FOUND&&code!=ERROR_PATH_NOT_FOUND)all=false;}else if((a&(FILE_ATTRIBUTE_DIRECTORY|FILE_ATTRIBUTE_REPARSE_POINT))||!DeleteFileW(setup.c_str()))all=false;}
+    if(!all)return {3,L"Features are disabled and feature files were removed, but setup itself is still in use. Run Remove from an extracted copy of this package to finish. The Change / Remove entry is retained until that succeeds."};
+    if(!RemoveMetadata(paths,directory,error))return {1,L"Features are disabled and payload files were removed. "+error+L" Run setup from an extracted package to finish cleanup."};
+    if(!StoreValue(patch::SettingsKey,L"InstallDirectory",Value{})||!StoreValue(patch::SettingsKey,PendingValue,Value{})||!StoreValue(patch::SettingsKey,ReplaceQtValue,Value{}))return {1,L"Feature files were removed, but Windows could not clear the installation record. Run setup from an extracted package again."};
+    bool directories=true;for(const auto& package:packages)if(!RemoveDirectoryW(package.c_str())&&GetLastError()!=ERROR_FILE_NOT_FOUND)directories=false;
+    if(!RemoveDirectoryW(paths.root.c_str())){DWORD code=GetLastError();if(code!=ERROR_FILE_NOT_FOUND&&code!=ERROR_PATH_NOT_FOUND)directories=false;}
+    if(!directories)return {3,L"Explorer MVP feature files and registration were removed. A version folder contains other files or could not be removed; it was preserved. Gesture recovery records and disabled preferences are also retained."};
+    return {0,L"Explorer MVP was removed. Disabled preferences and gesture recovery records were retained. Earlier QTTabBar files and settings were preserved."};
+}
+bool Parse(const std::vector<std::wstring>& arguments,Options& options) {
+    options={};if(arguments.empty())return true;
+    if(arguments[0]==L"--install")options.action=Options::Action::Install;
+    else if(arguments[0]==L"--disable")options.action=Options::Action::Disable;
+    else if(arguments[0]==L"--uninstall")options.action=Options::Action::Uninstall;
+    else if(arguments[0]==L"--uninstall-ui"&&arguments.size()==1){options.action=Options::Action::RemoveDialog;return true;}
+    else if(arguments[0]==L"--self-test"&&arguments.size()==2&&!arguments[1].empty()){options.action=Options::Action::SelfTest;options.report=arguments[1];return true;}
+    else return false;
+    for(size_t i=1;i<arguments.size();++i){if(options.action!=Options::Action::Install)return false;const auto& value=arguments[i];
+        if(value==L"--tabs"||value==L"--no-tabs"){if(options.tabs!=-1)return false;options.tabs=value==L"--tabs"?1:0;}
+        else if(value==L"--gestures"||value==L"--no-gestures"){if(options.gestures!=-1)return false;options.gestures=value==L"--gestures"?1:0;}
+        else return false;
+    }return true;
+}
+int SelfTest(const std::wstring& report) {
+    unsigned passed=0,total=0;std::vector<std::string> failed;auto test=[&](const char* name,bool ok){++total;if(ok)++passed;else failed.emplace_back(name);};
+    const std::wstring root=L"C:\\Users\\Example\\AppData\\Local\\Programs\\Explorer MVP",id(64,L'a');Options options;
+    test("valid-package",OwnedPackage(root,Join(root,id.c_str())));test("root-is-not-package",!OwnedPackage(root,root));
+    test("prefix-confusion",!OwnedPackage(root,Join(root+L" other",id.c_str())));test("nested-directory",!OwnedPackage(root,Join(Join(root,id.c_str()),L"extra")));
+    test("escape-parent",!OwnedPackage(root,root+L"\\..\\"+id));test("absolute-other-drive",!OwnedPackage(root,L"D:\\"+id));
+    test("reject-short-id",!OwnedPackage(root,Join(root,L"abcd")));test("reject-non-hex",!OwnedPackage(root,Join(root,std::wstring(64,L'g').c_str())));
+    test("reject-device-path",!OwnedPackage(root,L"\\\\?\\C:\\"+id));test("reject-stream",!OwnedPackage(root,Join(root,(id+L":data").c_str())));
+    test("reject-unc",!OwnedPackage(root,L"\\\\server\\share\\"+id));test("path-case",OwnedPackage(root,L"c:\\users\\example\\AppData\\Local\\Programs\\Explorer MVP\\"+id));
+    const auto exe=Join(root,L"NativeSnap.exe");test("quoted-owned-run",OwnedCommand(Quote(exe),exe));test("unquoted-owned-run",OwnedCommand(exe,exe));
+    test("run-with-arguments",!OwnedCommand(Quote(exe)+L" --anything",exe));test("other-run-program",!OwnedCommand(Quote(exe+L".other"),exe));
+    test("default-dialog",Parse({},options)&&options.action==Options::Action::Dialog);
+    test("install-default-choices",Parse({L"--install"},options)&&options.tabs==-1&&options.gestures==-1);
+    test("independent-choices",Parse({L"--install",L"--no-tabs",L"--gestures"},options)&&options.tabs==0&&options.gestures==1);
+    test("opposite-choices",Parse({L"--install",L"--tabs",L"--no-gestures"},options)&&options.tabs==1&&options.gestures==0);
+    test("disable-route",Parse({L"--disable"},options)&&options.action==Options::Action::Disable);
+    test("uninstall-route",Parse({L"--uninstall"},options)&&options.action==Options::Action::Uninstall);
+    test("interactive-uninstall-route",Parse({L"--uninstall-ui"},options)&&options.action==Options::Action::RemoveDialog);
+    test("reject-duplicate-choice",!Parse({L"--install",L"--tabs",L"--no-tabs"},options));test("reject-unknown",!Parse({L"--install",L"--silent-ish"},options));
+    test("reject-uninstall-switches",!Parse({L"--uninstall",L"--tabs"},options));test("reject-multiple-actions",!Parse({L"--install",L"--disable"},options));
+    test("reject-empty-report",!Parse({L"--self-test",L""},options));test("self-test-route",Parse({L"--self-test",L"report.json"},options)&&options.action==Options::Action::SelfTest);
+    Value value;value.present=true;value.type=REG_SZ;value.bytes={0,0};std::wstring decoded;
+    test("registry-empty-string",StringValue(value,decoded)&&decoded.empty());value.bytes={L'a',0};test("registry-missing-terminator",!StringValue(value,decoded));
+    value.bytes={L'a',0,0,0,L'b',0,0,0};test("registry-embedded-terminator",!StringValue(value,decoded));value.type=REG_BINARY;test("registry-wrong-type",!StringValue(value,decoded));
+    std::string json="{\"success\":"+std::string(passed==total?"true":"false")+",\"passed\":"+std::to_string(passed)+",\"total\":"+std::to_string(total)+",\"liveSettingsModified\":false,\"filesystemOwnershipTests\":true,\"argumentTests\":true,\"failed\":[";
+    for(size_t i=0;i<failed.size();++i){if(i)json+=",";json+="\""+failed[i]+"\"";}json+="]}\n";
+    std::vector<BYTE> bytes(json.begin(),json.end());return WriteBytes(report,bytes)?(passed==total?0:1):2;
+}
+struct DialogState {bool busy=false,removeOnOpen=false;int result=0;std::wstring message;};
+void Refresh(HWND dialog,const DialogState& state) {
+    const bool supported=patch::SupportedWindows();for(int id:{1501,1502,1503,1504,1505,1506,IDCANCEL})EnableWindow(GetDlgItem(dialog,id),!state.busy&&(id==IDCANCEL||supported));
+    std::wstring directory,error;bool installed=ReadDirectory(directory,nullptr,error)&&RegularFile(Join(directory,L"Win10PatchOptions.exe"));EnableWindow(GetDlgItem(dialog,1504),!state.busy&&installed&&supported);
+    const auto text=!supported?L"This MVP supports Windows 10 22H2 x64 (build 19045) only.":state.message.empty()?L"Choose either feature independently. Keyboard shortcuts and restoring tabs at sign-in are off by default. Use Options to change them.":state.message.c_str();SetDlgItemTextW(dialog,1510,text);
+}
+INT_PTR CALLBACK Dialog(HWND dialog,UINT message,WPARAM w,LPARAM l) {
+    auto state=reinterpret_cast<DialogState*>(GetWindowLongPtrW(dialog,GWLP_USERDATA));
+    if(message==WM_INITDIALOG){state=reinterpret_cast<DialogState*>(l);SetWindowLongPtrW(dialog,GWLP_USERDATA,l);Value value;std::wstring ignored;bool configured=ReadValue(patch::SettingsKey,L"Config",value,ignored)&&value.present;const auto config=patch::LoadConfig();CheckDlgButton(dialog,1501,!configured||(config.flags&patch::ExplorerTabs)?BST_CHECKED:BST_UNCHECKED);CheckDlgButton(dialog,1502,!configured||(config.flags&patch::TouchpadGestures)?BST_CHECKED:BST_UNCHECKED);SendMessageW(dialog,WM_SETICON,ICON_BIG,reinterpret_cast<LPARAM>(LoadIconW(GetModuleHandleW(nullptr),MAKEINTRESOURCEW(101))));Refresh(dialog,*state);if(state->removeOnOpen)PostMessageW(dialog,WM_COMMAND,1506,0);return TRUE;}
+    if(!state)return FALSE;if(message==WM_CLOSE||(message==WM_COMMAND&&LOWORD(w)==IDCANCEL)){if(!state->busy)EndDialog(dialog,state->result);return TRUE;}
+    if(message!=WM_COMMAND||state->busy)return FALSE;const int action=LOWORD(w);if(action==1504){patch::OpenOptions(dialog);return TRUE;}if(action!=1503&&action!=1505&&action!=1506)return FALSE;
+    if(action==1506&&MessageBoxW(dialog,L"Disable both features and remove this account's Explorer MVP files? If Windows still needs to restore gestures, or Explorer is using a file, removal will stay pending. Explorer will not be restarted.",L"Remove Explorer MVP",MB_YESNO|MB_ICONQUESTION|MB_DEFBUTTON2)!=IDYES)return TRUE;
+    state->busy=true;state->message=L"Applying your choices...";Refresh(dialog,*state);UpdateWindow(dialog);Result result;
+    if(action==1503){Options options;options.action=Options::Action::Install;options.tabs=IsDlgButtonChecked(dialog,1501)==BST_CHECKED?1:0;options.gestures=IsDlgButtonChecked(dialog,1502)==BST_CHECKED?1:0;result=Install(options);}else result=DisableOrRemove(action==1506);
+    state->busy=false;state->result=result.code;state->message=result.message;Refresh(dialog,*state);MessageBoxW(dialog,result.message.c_str(),result.code?L"Explorer MVP needs attention":L"Explorer MVP",MB_OK|(result.code?MB_ICONWARNING:MB_ICONINFORMATION));return TRUE;
+}
+}
+int WINAPI wWinMain(HINSTANCE instance,HINSTANCE,PWSTR,int) {
+    int argc{};LPWSTR* argv=CommandLineToArgvW(GetCommandLineW(),&argc);if(!argv)return 2;std::vector<std::wstring> arguments;for(int i=1;i<argc;++i)arguments.emplace_back(argv[i]);LocalFree(argv);Options options;
+    if(!Parse(arguments,options)){OutputDebugStringW(L"Explorer MVP Setup: use --install [--tabs|--no-tabs] [--gestures|--no-gestures], --disable, --uninstall, or --self-test <json>.\n");return 2;}
+    if(options.action==Options::Action::SelfTest)return SelfTest(options.report);
+    const HRESULT initialized=CoInitializeEx(nullptr,COINIT_APARTMENTTHREADED);if(FAILED(initialized))return 1;int code=0;
+    if(options.action==Options::Action::Dialog||options.action==Options::Action::RemoveDialog){INITCOMMONCONTROLSEX controls{sizeof(controls),ICC_STANDARD_CLASSES};InitCommonControlsEx(&controls);DialogState state;state.removeOnOpen=options.action==Options::Action::RemoveDialog;INT_PTR result=DialogBoxParamW(instance,MAKEINTRESOURCEW(401),nullptr,Dialog,reinterpret_cast<LPARAM>(&state));code=result<0?1:static_cast<int>(result);}
+    else {Result result=options.action==Options::Action::Install?Install(options):DisableOrRemove(options.action==Options::Action::Uninstall);code=result.code;OutputDebugStringW((L"Explorer MVP Setup: "+result.message+L"\n").c_str());}
+    CoUninitialize();return code;
+}

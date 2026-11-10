@@ -1,5 +1,6 @@
 #include "Patch.h"
 #include "MvpHostProtocol.h"
+#include "HeaderIntegration.h"
 #include <dwmapi.h>
 #include <shellapi.h>
 #include <algorithm>
@@ -53,6 +54,13 @@ void Queue(HWND window) {
     }
 }
 void Refresh() {
+    for(auto i=observed.begin();i!=observed.end();) {
+        if(!ExplorerFrame(*i))i=observed.erase(i);else ++i;
+    }
+    for(auto i=hooks.begin();i!=hooks.end();) {
+        bool used=std::any_of(observed.begin(),observed.end(),[&](HWND window){return GetWindowThreadProcessId(window,nullptr)==i->first;});
+        if(!used){UnhookWindowsHookEx(i->second);i=hooks.erase(i);}else ++i;
+    }
     EnumWindows([](HWND window,LPARAM)->BOOL{Queue(window);return TRUE;},0);
 }
 void CALLBACK WindowEvent(HWINEVENTHOOK,DWORD event,HWND window,LONG object,LONG child,DWORD,DWORD) {
@@ -61,15 +69,26 @@ void CALLBACK WindowEvent(HWINEVENTHOOK,DWORD event,HWND window,LONG object,LONG
         if(observed.erase(window)) {pending.erase(window);PostMessageW(host,RefreshWindow,0,0);}
     } else if(ExplorerFrame(window))PostMessageW(host,RefreshWindow,reinterpret_cast<WPARAM>(window),0);
 }
-void DetachAll() {
-    for(HWND window:observed) {
+bool DetachAll(bool preserveSession,ULONG_PTR request) {
+    // Owner callbacks can close a frame while the external call is running.
+    const std::vector<HWND> windows(observed.begin(),observed.end());
+    bool complete=true;
+    for(HWND window:windows) {
+        if(request&&reinterpret_cast<ULONG_PTR>(GetPropW(host,patch::mvp::StopRequest))!=request){complete=false;break;}
         if(!IsWindow(window))continue;
         DWORD_PTR result{};
-        SendMessageTimeoutW(window,patch::mvp::DetachMessage(),0,0,SMTO_ABORTIFHUNG|SMTO_BLOCK,1000,&result);
+        if(!SendMessageTimeoutW(window,patch::mvp::DetachMessage(),patch::mvp::DetachParameters(preserveSession,request),request?reinterpret_cast<LPARAM>(host):0,SMTO_ABORTIFHUNG|SMTO_BLOCK,1000,&result)||
+           GetPropW(window,L"Win10NativePatch.ExplorerController.v2"))complete=false;
         RemovePropW(window,patch::mvp::AttachResult);
+    }
+    if(request&&reinterpret_cast<ULONG_PTR>(GetPropW(host,patch::mvp::StopRequest))!=request)complete=false;
+    if(!complete){
+        if(request&&reinterpret_cast<ULONG_PTR>(GetPropW(host,patch::mvp::StopRequest))==request)RemovePropW(host,patch::mvp::StopRequest);
+        Refresh();return false;
     }
     for(auto [thread,hook]:hooks){(void)thread;UnhookWindowsHookEx(hook);}
     hooks.clear();pending.clear();
+    return true;
 }
 LRESULT CALLBACK HostProc(HWND window,UINT message,WPARAM w,LPARAM l) {
     if(message==patch::SettingsChangedMessage()) {Refresh();return 1;}
@@ -89,7 +108,22 @@ LRESULT CALLBACK HostProc(HWND window,UINT message,WPARAM w,LPARAM l) {
             if(pending.empty())KillTimer(window,1);
         }
         return 0;
-    case WM_CLOSE: DetachAll();DestroyWindow(window);return 0;
+    case WM_CLOSE: {
+        const auto request=static_cast<ULONG_PTR>(l);
+        if((request||w==1)&&(!request||reinterpret_cast<ULONG_PTR>(GetPropW(window,patch::mvp::StopRequest))!=request))return 0;
+        if(DetachAll(w==1,request)){
+            if(request){
+                if(!SetPropW(window,patch::mvp::StopCommitted,reinterpret_cast<HANDLE>(request))){
+                    RemovePropW(window,patch::mvp::StopRequest);Refresh();return 0;
+                }
+                if(reinterpret_cast<ULONG_PTR>(GetPropW(window,patch::mvp::StopRequest))!=request){
+                    RemovePropW(window,patch::mvp::StopCommitted);Refresh();return 0;
+                }
+            }
+            DestroyWindow(window);
+        }
+        return 0;
+    }
     case WM_DESTROY:PostQuitMessage(0);return 0;
     }
     return DefWindowProcW(window,message,w,l);
@@ -115,7 +149,9 @@ int Probe(const std::wstring& path) {
         o<<"{\"hwnd\":"<<reinterpret_cast<ULONG_PTR>(window)<<",\"pid\":"<<pid<<",\"thread\":"<<thread
          <<",\"tabsActive\":"<<(GetPropW(window,patch::TabsActiveProperty)?"true":"false")
          <<",\"attachResult\":"<<reinterpret_cast<ULONG_PTR>(GetPropW(window,patch::mvp::AttachResult))
-         <<",\"rejected\":"<<reinterpret_cast<ULONG_PTR>(GetPropW(window,L"Win10NativePatch.TabsRejected.v2"))<<",\"outer\":";
+         <<",\"legacyQtHidden\":"<<(GetPropW(window,L"Win10NativePatch.LegacyQtHidden.v1")?"true":"false")
+         <<",\"rejected\":"<<reinterpret_cast<ULONG_PTR>(GetPropW(window,L"Win10NativePatch.TabsRejected.v2"))
+         <<",\"headerRowHeight\":"<<reinterpret_cast<ULONG_PTR>(GetPropW(window,header::RowProperty))<<",\"outer\":";
         Rect(o,rect);o<<",\"client\":";Rect(o,client);o<<",\"captionButtons\":";Rect(o,buttons);o<<",\"children\":[";
         Context children{&o};
         EnumChildWindows(window,[](HWND child,LPARAM value)->BOOL{
@@ -137,8 +173,7 @@ int WINAPI wWinMain(HINSTANCE instance,HINSTANCE,PWSTR,int) {
     if(args.size()==1&&args[0]==L"--stop") {
         HWND target=FindWindowW(patch::mvp::HostClass,nullptr);if(!target)return 0;
         DWORD pid{};GetWindowThreadProcessId(target,&pid);HANDLE process=OpenProcess(SYNCHRONIZE,FALSE,pid);
-        bool posted=PostMessageW(target,WM_CLOSE,0,0)!=FALSE;
-        bool stopped=process&&posted&&WaitForSingleObject(process,5000)==WAIT_OBJECT_0;
+        bool stopped=process&&patch::mvp::StopHost(target,process,false);
         if(process)CloseHandle(process);return stopped?0:1;
     }
     if(args.size()==2&&args[0]==L"--window") {
@@ -156,6 +191,7 @@ int WINAPI wWinMain(HINSTANCE instance,HINSTANCE,PWSTR,int) {
     if(!RegisterClassW(&cls)){FreeLibrary(extension);CloseHandle(mutex);return 1;}
     host=CreateWindowExW(WS_EX_TOOLWINDOW,cls.lpszClassName,L"Explorer integration",WS_POPUP,0,0,0,0,nullptr,nullptr,instance,nullptr);
     if(!host){FreeLibrary(extension);CloseHandle(mutex);return 1;}
+    SetPropW(host,patch::mvp::SessionHandoffCapability,reinterpret_cast<HANDLE>(1));
     HWINEVENTHOOK events=SetWinEventHook(EVENT_OBJECT_CREATE,EVENT_OBJECT_HIDE,nullptr,WindowEvent,0,0,WINEVENT_OUTOFCONTEXT|WINEVENT_SKIPOWNPROCESS);
     Refresh();MSG message{};
     while(GetMessageW(&message,nullptr,0,0)>0){TranslateMessage(&message);DispatchMessageW(&message);}

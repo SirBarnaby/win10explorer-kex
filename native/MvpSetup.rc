@@ -1,0 +1,19 @@
+#include <windows.h>
+101 ICON "NativeSnap.ico"
+401 DIALOGEX 0,0,356,235
+STYLE DS_SETFONT | DS_MODALFRAME | WS_POPUP | WS_CAPTION | WS_SYSMENU
+CAPTION "Explorer MVP Setup"
+FONT 9,"Segoe UI"
+BEGIN
+ LTEXT "Add features to your existing File Explorer",-1,14,12,328,15
+ CONTROL "Tabs in Explorer's title bar",1501,"Button",BS_AUTOCHECKBOX | WS_TABSTOP,16,36,322,15
+ CONTROL "Touchpad snapping: left, right and corners",1502,"Button",BS_AUTOCHECKBOX | WS_TABSTOP,16,57,322,15
+ LTEXT "Installed for your Windows account. No tray icon or administrator approval.",-1,16,81,322,27
+ LTEXT "",1510,16,113,322,47
+ DEFPUSHBUTTON "Install / Update",1503,14,169,89,18
+ PUSHBUTTON "Open Options",1504,111,169,89,18
+ PUSHBUTTON "Close",IDCANCEL,267,169,75,18
+ PUSHBUTTON "Disable features",1505,14,196,89,18
+ PUSHBUTTON "Remove...",1506,111,196,89,18
+ LTEXT "Removal never restarts Explorer.",-1,209,198,133,22
+END

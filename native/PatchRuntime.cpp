@@ -61,7 +61,7 @@ std::wstring ModuleDirectory() {
     if(!n||n>=path.size())return {};path.resize(n);size_t slash=path.find_last_of(L"\\/");return slash==std::wstring::npos?L"":path.substr(0,slash);
 }
 std::wstring SiblingPath(const wchar_t* name){wchar_t dir[32768];for(HKEY hive:{HKEY_CURRENT_USER,HKEY_LOCAL_MACHINE}){DWORD size=sizeof(dir);if(RegGetValueW(hive,SettingsKey,L"InstallDirectory",RRF_RT_REG_SZ,nullptr,dir,&size)==ERROR_SUCCESS){std::wstring target=dir;if(!target.empty()&&target.back()!=L'\\'&&target.back()!=L'/')target+=L'\\';target+=name;DWORD attr=GetFileAttributesW(target.c_str());if(attr!=INVALID_FILE_ATTRIBUTES&&!(attr&FILE_ATTRIBUTE_DIRECTORY))return target;}}return ModuleDirectory()+L"\\"+name;}
-void OpenOptions(HWND owner){std::wstring args=owner?L"--owner "+std::to_wstring(reinterpret_cast<ULONG_PTR>(GetAncestor(owner,GA_ROOT))):L"";ShellExecuteW(owner,L"open",SiblingPath(L"Win10PatchOptions.exe").c_str(),args.empty()?nullptr:args.c_str(),ModuleDirectory().c_str(),SW_SHOWNORMAL);}
+void OpenOptions(HWND owner){HWND frame=owner?GetAncestor(owner,GA_ROOT):nullptr;wchar_t type[64]{};if(frame)GetClassNameW(frame,type,64);std::wstring args=frame&&!wcscmp(type,L"CabinetWClass")?L"--owner "+std::to_wstring(reinterpret_cast<ULONG_PTR>(frame)):L"";ShellExecuteW(owner,L"open",SiblingPath(L"Win10PatchOptions.exe").c_str(),args.empty()?nullptr:args.c_str(),ModuleDirectory().c_str(),SW_SHOWNORMAL);}
 void Log(const wchar_t* component,const std::wstring& message){std::wstring text=L"[Win10NativePatch/"+std::wstring(component)+L"] "+message+L"\n";OutputDebugStringW(text.c_str());}
 bool SupportedWindows() {
     using RtlGetVersionFn=LONG(WINAPI*)(OSVERSIONINFOW*);HMODULE nt=GetModuleHandleW(L"ntdll.dll");
@@ -105,8 +105,21 @@ bool ReconcileTabsRuntime(const Config& config,std::wstring& error) {
     RegCloseKey(run);
     if(code!=ERROR_SUCCESS){error=L"Windows could not save Explorer startup settings.";return false;}
     HWND host=FindWindowW(mvp::HostClass,nullptr);
-    if(!needed){if(host)PostMessageW(host,WM_CLOSE,0,0);return true;}
-    if(host){PostMessageW(host,SettingsChangedMessage(),0,0);return true;}
+    if(!needed){
+        if(!host)return true;
+        DWORD pid{};GetWindowThreadProcessId(host,&pid);HANDLE process=OpenProcess(SYNCHRONIZE,FALSE,pid);
+        const bool stopped=process&&mvp::StopHost(host,process,false);if(process)CloseHandle(process);
+        if(!stopped)error=L"Explorer integration has not finished stopping. Wait a moment and try again.";
+        return stopped;
+    }
+    if(host){
+        const ULONGLONG deadline=GetTickCount64()+4000;
+        while(IsWindow(host)&&mvp::Stopping(host)&&GetTickCount64()<deadline)Sleep(30);
+        if(IsWindow(host)){
+            if(mvp::Stopping(host)){error=L"Explorer integration is still stopping. Recovery has not confirmed a ready runtime.";return false;}
+            PostMessageW(host,SettingsChangedMessage(),0,0);return true;
+        }
+    }
     STARTUPINFOW start{sizeof(start)};start.dwFlags=STARTF_USESHOWWINDOW;start.wShowWindow=SW_HIDE;PROCESS_INFORMATION process{};
     if(!CreateProcessW(app.c_str(),command.data(),nullptr,nullptr,FALSE,CREATE_NO_WINDOW,nullptr,ModuleDirectory().c_str(),&start,&process)){error=L"Explorer integration could not start.";return false;}
     CloseHandle(process.hThread);bool ready=false;ULONGLONG deadline=GetTickCount64()+4000;

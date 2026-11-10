@@ -4,6 +4,7 @@
 // RectangleWin's eligibility filter cites Microsoft PowerToys, MIT licensed.
 // The state machine, frame compensation and verification below are new.
 #include "Patch.h"
+#include "SnapLayout.h"
 #ifndef UNICODE
 #define UNICODE
 #endif
@@ -16,10 +17,13 @@
 #include <shellapi.h>
 #include <dwmapi.h>
 #include <algorithm>
+#include <atomic>
 #include <cstdint>
 #include <cstring>
+#include <deque>
 #include <fstream>
 #include <map>
+#include <optional>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -28,8 +32,14 @@ namespace {
 constexpr const wchar_t* kClass = patch::SnapWindowClass;
 constexpr wchar_t kTestClass[] = L"Win10NativePatch.NativeSnap.Test.v1";
 enum class Action { Left, Right, Up, Down };
-struct State { DWORD pid{}; RECT last{}; int side{}; bool maximized{}; };
+struct State { DWORD pid{};HANDLE marker{}; RECT last{}, beforeMaximize{}; int side{}, row{}; bool maximized{}; };
 struct Bounds { RECT outer{}, frame{}, work{}, monitor{}; HMONITOR display{}; };
+struct Target {HWND window{};DWORD pid{};FILETIME created{};HANDLE marker{};};
+struct Request {Target target;Action action;ULONGLONG queued{};};
+std::deque<Request> requests;
+bool stopping=false;
+std::map<HWND,HANDLE> targetMarkers;
+std::atomic<ULONG_PTR> markerSerial{1};
 std::map<HWND, State> states;
 HWND mainWindow{};
 bool arranging = false;
@@ -43,6 +53,10 @@ bool testNoFrame=false;
 std::wstring lastError;
 using IsWindowArrangedFn = BOOL(WINAPI*)(HWND);
 IsWindowArrangedFn isWindowArranged{};
+snap::Preferences splitPreferences;
+struct Resize {Target target,partner;RECT before{},partnerBefore{},last{},partnerLast{};HMONITOR display{};ULONGLONG deadline{};unsigned stable{};};
+std::optional<Resize> resizing;
+HWINEVENTHOOK resizeEvents{};
 template<class T> T Procedure(const char* name) {
     FARPROC address=GetProcAddress(GetModuleHandle(L"user32.dll"),name);
     T result{};static_assert(sizeof(result)==sizeof(address));
@@ -66,6 +80,14 @@ RECT Quarter(const RECT& w, bool right, bool bottom) {
 }
 void DetectTile(const RECT& frame,const RECT& work,int& side,int& row) {
     side=0;row=0;
+    bool left=abs(frame.left-work.left)<=3&&frame.right>work.left&&frame.right<work.right-3;
+    bool right=abs(frame.right-work.right)<=3&&frame.left>work.left+3&&frame.left<work.right;
+    LONG middle=work.top+Height(work)/2;
+    if(left||right){
+        if(abs(frame.top-work.top)<=3&&abs(frame.bottom-work.bottom)<=3){side=left?-1:1;return;}
+        if(abs(frame.top-work.top)<=3&&abs(frame.bottom-middle)<=3){side=left?-1:1;row=-1;return;}
+        if(abs(frame.top-middle)<=3&&abs(frame.bottom-work.bottom)<=3){side=left?-1:1;row=1;return;}
+    }
     for(int column:{-1,1}) {
         if(Near(frame,Half(work,column>0))){side=column;return;}
         for(int vertical:{-1,1})if(Near(frame,Quarter(work,column>0,vertical>0))){side=column;row=vertical;return;}
@@ -128,6 +150,125 @@ void Pump() {
         TranslateMessage(&message); DispatchMessage(&message);
     }
 }
+const wchar_t* TargetProperty(){
+    static const std::wstring name=[] {
+        FILETIME created{},exit{},kernel{},user{};GetProcessTimes(GetCurrentProcess(),&created,&exit,&kernel,&user);
+        ULARGE_INTEGER value{};value.LowPart=created.dwLowDateTime;value.HighPart=created.dwHighDateTime;
+        return L"Win10NativePatch.SnapTarget."+std::to_wstring(GetCurrentProcessId())+L"."+std::to_wstring(value.QuadPart);
+    }();return name.c_str();
+}
+bool ReadTarget(HWND window,Target& target){
+    DWORD pid{};if(!GetWindowThreadProcessId(window,&pid))return false;
+    HANDLE process=OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION,FALSE,pid);if(!process)return false;
+    FILETIME created{},exit{},kernel{},user{};bool ok=GetProcessTimes(process,&created,&exit,&kernel,&user)!=FALSE;CloseHandle(process);
+    if(ok)target={window,pid,created,GetPropW(window,TargetProperty())};return ok;
+}
+bool CaptureTarget(HWND window,Target& target){
+    if(!ReadTarget(window,target))return false;
+    if(!target.marker){
+        target.marker=reinterpret_cast<HANDLE>(markerSerial.fetch_add(1));
+        if(!SetPropW(window,TargetProperty(),target.marker))return false;
+        targetMarkers[window]=target.marker;
+    }
+    for(auto i=targetMarkers.begin();i!=targetMarkers.end();)if(!IsWindow(i->first)||GetPropW(i->first,TargetProperty())!=i->second)i=targetMarkers.erase(i);else ++i;
+    return true;
+}
+bool SameTarget(const Target& target){Target now;return ReadTarget(target.window,now)&&now.pid==target.pid&&now.marker==target.marker&&target.marker&&CompareFileTime(&now.created,&target.created)==0;}
+void ClearTargetMarkers(){for(auto [window,marker]:targetMarkers)if(GetPropW(window,TargetProperty())==marker)RemovePropW(window,TargetProperty());targetMarkers.clear();}
+bool ModifiersReleased(){
+    for(int key:{VK_SHIFT,VK_CONTROL,VK_MENU,VK_LWIN,VK_RWIN,VK_F13,VK_F14,VK_F15,VK_F16})if(GetAsyncKeyState(key)&0x8000)return false;
+    return true;
+}
+bool InputReady(const Target& target){return !stopping&&SameTarget(target)&&GetForegroundWindow()==target.window;}
+bool WaitForRelease(const Target& target){
+    ULONGLONG deadline=GetTickCount64()+1500;
+    do{Pump();if(!InputReady(target))return false;if(ModifiersReleased())return true;Sleep(10);}while(GetTickCount64()<deadline);
+    return false;
+}
+bool OnRequestedSide(const Bounds& b,int side){
+    return side<0?abs(b.frame.left-b.work.left)<=3&&b.frame.right<b.work.right-3:
+                  abs(b.frame.right-b.work.right)<=3&&b.frame.left>b.work.left+3;
+}
+bool NativeSide(const Target& target,int side){
+    if(!isWindowArranged)return false;
+    for(int attempt=0;attempt<3;++attempt){
+        Bounds b;if(!SameTarget(target)||!ReadBounds(target.window,b))return false;
+        // Reposition an arranged window directly. Win+Arrow would restore it
+        // through its floating position before selecting the opposite side.
+        if(isWindowArranged(target.window))return true;
+        if(!InputReady(target)||!ModifiersReleased())return false;
+        WORD arrow=side<0?VK_LEFT:VK_RIGHT;
+        INPUT input[4]{};for(auto& i:input)i.type=INPUT_KEYBOARD;
+        input[0].ki.wVk=VK_LWIN;input[1].ki.wVk=arrow;input[1].ki.dwFlags=KEYEVENTF_EXTENDEDKEY;
+        input[2].ki.wVk=arrow;input[2].ki.dwFlags=KEYEVENTF_EXTENDEDKEY|KEYEVENTF_KEYUP;
+        input[3].ki.wVk=VK_LWIN;input[3].ki.dwFlags=KEYEVENTF_KEYUP;
+        UINT sent=SendInput(4,input,sizeof(INPUT));
+        if(sent!=4){
+            if(sent){
+                INPUT release[2]{};for(auto& i:release)i.type=INPUT_KEYBOARD;UINT count=0;
+                if(sent==2){release[count].ki.wVk=arrow;release[count++].ki.dwFlags=KEYEVENTF_EXTENDEDKEY|KEYEVENTF_KEYUP;}
+                release[count].ki.wVk=VK_LWIN;release[count++].ki.dwFlags=KEYEVENTF_KEYUP;SendInput(count,release,sizeof(INPUT));
+            }
+            lastError=L"Windows did not accept the native snap command. The target may require administrator access.";return false;
+        }
+        RECT last=b.frame;bool beforeArranged=isWindowArranged(target.window)!=FALSE,beforeMaximized=IsZoomed(target.window)!=FALSE;unsigned stable=0;
+        ULONGLONG deadline=GetTickCount64()+550;
+        do{
+            Pump();Bounds now;if(!SameTarget(target)||!ReadBounds(target.window,now))return false;
+            bool currentArranged=isWindowArranged(target.window)!=FALSE,currentMaximized=IsZoomed(target.window)!=FALSE;
+            if(currentArranged&&OnRequestedSide(now,side))return true;
+            bool changed=!Near(now.frame,b.frame,0)||currentArranged!=beforeArranged||currentMaximized!=beforeMaximized;
+            stable=changed&&Near(now.frame,last,0)?stable+1:0;last=now.frame;
+            if(stable>=3&&!currentArranged&&!currentMaximized)break;
+            Sleep(10);
+        }while(GetTickCount64()<deadline);
+    }
+    Bounds b;return SameTarget(target)&&ReadBounds(target.window,b)&&isWindowArranged(target.window)&&
+        OnRequestedSide(b,side);
+}
+void BeginResize(HWND window){
+    if(mainWindow)KillTimer(mainWindow,5);
+    resizing.reset();
+    if(arranging||!mainWindow||!isWindowArranged||!isWindowArranged(window)||!Eligible(window))return;
+    Bounds target;if(!ReadBounds(window,target))return;
+    Resize candidate;if(!CaptureTarget(window,candidate.target))return;
+    candidate.before=target.frame;candidate.display=target.display;
+    struct Search{HWND source;Bounds target;Resize* candidate;bool found=false;}search{window,target,&candidate};
+    EnumWindows([](HWND h,LPARAM value)->BOOL{
+        auto& s=*reinterpret_cast<Search*>(value);Bounds b;
+        if(h==s.source||!isWindowArranged(h)||!Eligible(h)||!ReadBounds(h,b)||b.display!=s.target.display)return TRUE;
+        if(!snap::SharedSplit(s.target.frame,b.frame,b.work)&&!snap::SharedSplit(b.frame,s.target.frame,b.work))return TRUE;
+        if(!CaptureTarget(h,s.candidate->partner))return TRUE;
+        s.candidate->partnerBefore=b.frame;s.found=true;return FALSE;
+    },reinterpret_cast<LPARAM>(&search));
+    if(search.found)resizing=candidate;
+}
+void FinishResize(HWND window){
+    if(resizing&&resizing->target.window==window){resizing->deadline=GetTickCount64()+1000;SetTimer(mainWindow,5,100,nullptr);}
+}
+void SettleResize(){
+    if(!resizing){KillTimer(mainWindow,5);return;}
+    auto& r=*resizing;Bounds a,b;
+    bool valid=!arranging&&SameTarget(r.target)&&SameTarget(r.partner)&&isWindowArranged(r.target.window)&&isWindowArranged(r.partner.window)&&
+        ReadBounds(r.target.window,a)&&ReadBounds(r.partner.window,b)&&a.display==r.display&&b.display==r.display&&EqualRect(&a.work,&b.work);
+    auto share=valid?snap::SharedSplit(a.frame,b.frame,a.work):std::nullopt;
+    if(valid&&!share)share=snap::SharedSplit(b.frame,a.frame,a.work);
+    if(share&&!Near(a.frame,r.before,2)&&!Near(b.frame,r.partnerBefore,2)){
+        r.stable=Near(a.frame,r.last,0)&&Near(b.frame,r.partnerLast,0)?r.stable+1:0;
+        r.last=a.frame;r.partnerLast=b.frame;
+        if(r.stable>=2){
+            std::wstring display=snap::DisplayIdentity(r.display);
+            if(!display.empty()&&!splitPreferences.Save(display,*share))patch::Log(L"NativeSnap",L"The display split could not be saved.");
+            resizing.reset();KillTimer(mainWindow,5);return;
+        }
+    }
+    if(GetTickCount64()>=r.deadline){resizing.reset();KillTimer(mainWindow,5);}
+}
+void CALLBACK ResizeEvent(HWINEVENTHOOK,DWORD event,HWND h,LONG object,LONG child,DWORD,DWORD){
+    if(object!=OBJID_WINDOW||child!=CHILDID_SELF||stopping)return;
+    if(event==EVENT_SYSTEM_MOVESIZESTART)BeginResize(h);
+    else if(event==EVENT_SYSTEM_MOVESIZEEND)FinishResize(h);
+}
 bool WaitState(HWND h, bool maximized) {
     ULONGLONG deadline=GetTickCount64()+500;
     do {
@@ -145,8 +286,8 @@ bool Restore(HWND h) {
     }
     return true;
 }
-bool MoveFrame(HWND h, RECT wanted, Bounds& actual) {
-    if (!Restore(h) || !ReadBounds(h,actual)) return false;
+bool MoveFrame(HWND h, RECT wanted, Bounds& actual,bool keepArranged=false) {
+    if ((!keepArranged&&!Restore(h)) || !ReadBounds(h,actual)) return false;
     SIZE minimum;
     if (!Minimum(h,minimum)) return false;
     long extraX=Width(actual.outer)-Width(actual.frame), extraY=Height(actual.outer)-Height(actual.frame);
@@ -186,28 +327,48 @@ bool MoveFrame(HWND h, RECT wanted, Bounds& actual) {
     lastError=L"The application did not accept the requested window position.";
     return false;
 }
-bool Apply(HWND h, Action action, bool test=false) {
+bool Apply(HWND h, Action action, bool test=false,const Target* captured=nullptr) {
     lastError.clear();
+    Target target;
+    if(!test){
+        if(captured)target=*captured;else if(!CaptureTarget(h,target))return false;
+        if(!WaitForRelease(target)){lastError=L"The snap command was cancelled because focus changed or its modifiers stayed pressed.";return false;}
+    }
     if (!Eligible(h,test)) {lastError=L"The selected window cannot be arranged safely."; return false;}
     Bounds b;
     if (!ReadBounds(h,b)) return false;
     DWORD pid{}; GetWindowThreadProcessId(h,&pid);
     int side{},row{};DetectTile(b.frame,b.work,side,row);
     auto found=states.find(h);
-    if (found!=states.end() && (found->second.pid!=pid ||
+    if (found!=states.end() && (found->second.pid!=pid || (!test&&found->second.marker!=target.marker) ||
         found->second.maximized!=!!IsZoomed(h) || !Near(found->second.last,b.frame))) {
         states.erase(found); found=states.end();
     }
-    if (found!=states.end() && !side) side=found->second.side;
+    if (found!=states.end() && !side) {side=found->second.side;row=found->second.row;}
     bool vertical=action==Action::Up||action==Action::Down;
-    // Vertical gestures only refine an existing side; they do not choose a side,
-    // restore to the centre, maximize, or minimize a floating window.
+    bool restoreCorner=found!=states.end()&&found->second.maximized&&IsZoomed(h)&&action==Action::Down;
+    RECT beforeMaximize=restoreCorner?found->second.beforeMaximize:RECT{};
+    if (vertical&&IsZoomed(h)&&!restoreCorner) return true;
     if (vertical && !side) return true;
     int targetSide=vertical?side:(action==Action::Left?-1:1);
-    int targetRow=vertical?(action==Action::Up?-1:1):0;
-    RECT target=targetRow?Quarter(b.work,targetSide>0,targetRow>0):Half(b.work,targetSide>0);
-    if (!MoveFrame(h,target,b)) return false;
-    State& s=states[h];s.pid=pid;s.side=targetSide;s.maximized=false;s.last=b.frame;
+    int targetRow=restoreCorner?-1:vertical?(action==Action::Up?-1:1):0;
+    bool maximize=action==Action::Up&&row<0&&!IsZoomed(h);
+    if (maximize) {
+        if(!test&&!InputReady(target))return false;
+        beforeMaximize=b.frame;
+        if (!ShowWindowAsync(h,SW_MAXIMIZE)||!WaitState(h,true)||!ReadBounds(h,b)) {
+            lastError=L"The application did not accept maximization.";return false;
+        }
+    } else {
+        if(!test&&!NativeSide(target,targetSide))return false;
+        if(!test&&!ReadBounds(h,b))return false;
+        std::uint32_t share=test?snap::DefaultShare:splitPreferences.Load(snap::DisplayIdentity(b.display));
+        RECT destination=restoreCorner?beforeMaximize:
+            snap::Tile(b.work,targetSide>0,targetRow,share);
+        if (!MoveFrame(h,destination,b,!test)||(!test&&!isWindowArranged(h))) return false;
+    }
+    State& s=states[h];s.pid=pid;s.marker=target.marker;s.side=targetSide;s.row=targetRow;
+    s.maximized=maximize;s.beforeMaximize=maximize?beforeMaximize:RECT{};s.last=b.frame;
     for (auto i=states.begin();i!=states.end();) {
         if (!IsWindow(i->first)) i=states.erase(i); else ++i;
     }
@@ -282,18 +443,34 @@ LRESULT CALLBACK WindowProc(HWND h, UINT message, WPARAM w, LPARAM l) {
     }
     switch(message) {
     case WM_HOTKEY:
-        if (!arranging) {
+        {
             auto binding=std::find_if(activeBindings.begin(),activeBindings.end(),[&](const Binding& b){return b.id==static_cast<int>(w);});
             if(binding==activeBindings.end())return 0;Action action=binding->action;
             if(binding->id<201&&!(activeConfig.flags&patch::TouchpadGestures))return 0;
-            arranging=true;
-            if (!Apply(GetForegroundWindow(),action)) MessageBeep(MB_ICONWARNING);
-            arranging=false;
+            Target target;if(CaptureTarget(GetForegroundWindow(),target)){requests.push_back({target,action,GetTickCount64()});PostMessageW(h,WM_APP+1,0,0);}else MessageBeep(MB_ICONWARNING);
         }
         return 0;
+    case WM_APP+1:
+        if(!arranging&&!requests.empty()){
+            const auto& pending=requests.front();Bounds destination;
+            bool resizePending=resizing&&ReadBounds(pending.target.window,destination)&&destination.display==resizing->display;
+            if(!InputReady(pending.target)||(resizePending&&GetTickCount64()-pending.queued>1500)){
+                requests.pop_front();MessageBeep(MB_ICONWARNING);if(!requests.empty())PostMessageW(h,WM_APP+1,0,0);else KillTimer(h,6);return 0;
+            }
+            if(resizePending){
+                if(resizing->deadline)SettleResize();
+                if(resizing){SetTimer(h,6,25,nullptr);return 0;}
+            }
+            KillTimer(h,6);
+            Request next=requests.front();requests.pop_front();arranging=true;
+            if(!Apply(next.target.window,next.action,false,&next.target))MessageBeep(MB_ICONWARNING);
+            arranging=false;if(!requests.empty())PostMessageW(h,WM_APP+1,0,0);
+        }
+        return 0;
+    case WM_TIMER:if(w==5){SettleResize();return 0;}if(w==6){PostMessageW(h,WM_APP+1,0,0);return 0;}break;
     case WM_CLOSE: DestroyWindow(h);return 0;
-    case WM_DESTROY: UnregisterKeys(h);PostQuitMessage(0);return 0;
-    case WM_DISPLAYCHANGE: states.clear();return 0;
+    case WM_DESTROY: stopping=true;requests.clear();UnregisterKeys(h);PostQuitMessage(0);return 0;
+    case WM_DISPLAYCHANGE: states.clear();resizing.reset();KillTimer(h,5);return 0;
     }
     return DefWindowProc(h,message,w,l);
 }
@@ -349,9 +526,10 @@ int SelfTest(HINSTANCE instance, const std::wstring& path) {
             int targetSide=vertical?tile.side:(actions[i]==Action::Left?-1:1);
             int targetRow=vertical?(actions[i]==Action::Up?-1:1):0;
             RECT expected=targetRow?Quarter(before.work,targetSide>0,targetRow>0):Half(before.work,targetSide>0);
+            bool expectMaximized=tile.row<0&&actions[i]==Action::Up;
             check(std::string("transition_")+tile.name+"_"+actionNames[i],
-                seededOk&&Apply(h,actions[i],true)&&!IsIconic(h)&&!IsZoomed(h)&&
-                ReadBounds(h,after)&&Near(after.frame,expected,2));
+                seededOk&&Apply(h,actions[i],true)&&!IsIconic(h)&&ReadBounds(h,after)&&
+                (expectMaximized?!!IsZoomed(h):!IsZoomed(h)&&Near(after.frame,expected,2)));
         }
         states.erase(h);Bounds floating;
         bool floatingOk=MoveFrame(h,before.frame,floating);states.erase(h);
@@ -392,12 +570,14 @@ int SelfTest(HINSTANCE instance, const std::wstring& path) {
         check("left_down_down_stays_visible_bottom_left",Apply(h,Action::Down,true)&&!IsIconic(h)&&ReadBounds(h,after)&&Near(first,after.frame,0));
         check("left_down_left_selects_left_half",Apply(h,Action::Left,true)&&ReadBounds(h,after)&&Near(after.frame,Half(after.work,false),2));
         check("left_corner_up_is_top_left",Apply(h,Action::Up,true)&&ReadBounds(h,after)&&Near(after.frame,Quarter(after.work,false,false),2));
-        first=after.frame;
-        check("left_up_up_is_stable",Apply(h,Action::Up,true)&&ReadBounds(h,after)&&Near(first,after.frame,0));
+        check("left_up_up_maximizes",Apply(h,Action::Up,true)&&IsZoomed(h)&&!IsIconic(h));
+        check("left_up_up_up_stays_maximized",Apply(h,Action::Up,true)&&IsZoomed(h)&&!IsIconic(h));
+        check("left_maximized_down_restores_top_corner",Apply(h,Action::Down,true)&&!IsZoomed(h)&&!IsIconic(h)&&ReadBounds(h,after)&&Near(after.frame,Quarter(after.work,false,false),2));
         check("left_corner_right_selects_right_half",Apply(h,Action::Right,true)&&ReadBounds(h,after)&&Near(after.frame,Half(after.work,true),2));
         check("right_up_is_top_right",Apply(h,Action::Up,true)&&ReadBounds(h,after)&&Near(after.frame,Quarter(after.work,true,false),2));
-        first=after.frame;
-        check("right_up_up_is_stable",Apply(h,Action::Up,true)&&ReadBounds(h,after)&&Near(first,after.frame,0));
+        check("right_up_up_maximizes",Apply(h,Action::Up,true)&&IsZoomed(h)&&!IsIconic(h));
+        check("right_up_up_up_stays_maximized",Apply(h,Action::Up,true)&&IsZoomed(h)&&!IsIconic(h));
+        check("right_maximized_down_restores_top_corner",Apply(h,Action::Down,true)&&!IsZoomed(h)&&!IsIconic(h)&&ReadBounds(h,after)&&Near(after.frame,Quarter(after.work,true,false),2));
         check("right_up_right_selects_right_half",Apply(h,Action::Right,true)&&ReadBounds(h,after)&&Near(after.frame,Half(after.work,true),2));
         check("right_corner_down_is_bottom_right",Apply(h,Action::Down,true)&&ReadBounds(h,after)&&Near(after.frame,Quarter(after.work,true,true),2));
         first=after.frame;
@@ -453,7 +633,7 @@ int WINAPI wWinMain(HINSTANCE instance,HINSTANCE,PWSTR,int) {
             Action action;wchar_t* end{};auto value=wcstoull(args[2].c_str(),&end,0);
             if(!ParseAction(args[1],action)||!end||*end||!value)return 2;
             bool ok=Apply(reinterpret_cast<HWND>(static_cast<uintptr_t>(value)),action);
-            Output(ok?"{\"success\":true}\n":"{\"success\":false}\n");return ok?0:1;
+            ClearTargetMarkers();Output(ok?"{\"success\":true}\n":"{\"success\":false}\n");return ok?0:1;
         }
         return 2;
     }
@@ -467,10 +647,13 @@ int WINAPI wWinMain(HINSTANCE instance,HINSTANCE,PWSTR,int) {
     if(!mainWindow){CloseHandle(mutex);return 2;}
     if(!RegisterKeys(mainWindow)){DestroyWindow(mainWindow);CloseHandle(mutex);return 1;}
     if(activeBindings.empty()){RemoveIdleStartup();DestroyWindow(mainWindow);CloseHandle(mutex);return 0;}
+    resizeEvents=SetWinEventHook(EVENT_SYSTEM_MOVESIZESTART,EVENT_SYSTEM_MOVESIZEEND,nullptr,ResizeEvent,0,0,WINEVENT_OUTOFCONTEXT);
     settingsEvent=CreateEventW(nullptr,FALSE,FALSE,L"Local\\Win10NativePatch.SettingsChanged.v2");
     MSG message{};bool running=true;
     while(running){DWORD wait=MsgWaitForMultipleObjects(settingsEvent?1:0,settingsEvent?&settingsEvent:nullptr,FALSE,INFINITE,QS_ALLINPUT);
         if(settingsEvent&&wait==WAIT_OBJECT_0){SendMessageW(mainWindow,patch::SettingsChangedMessage(),0,0);continue;}
         while(PeekMessageW(&message,nullptr,0,0,PM_REMOVE)){if(message.message==WM_QUIT){running=false;break;}TranslateMessage(&message);DispatchMessageW(&message);}}
+    if(resizeEvents)UnhookWinEvent(resizeEvents);
+    ClearTargetMarkers();
     if(settingsEvent)CloseHandle(settingsEvent);CloseHandle(mutex);return 0;
 }

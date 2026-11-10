@@ -8,7 +8,7 @@ $ErrorActionPreference='Stop'
 $stamp=Get-Date -Format 'yyyyMMdd-HHmmss'
 $lab=Join-Path $PSScriptRoot ('evidence\mvp-explorer\'+$stamp)
 New-Item -ItemType Directory -Path $lab -Force | Out-Null
-foreach($name in 'ExplorerTabs.dll','ExplorerMvpHost.exe','Win10PatchOptions.exe','NativeSnap.exe') {
+foreach($name in 'ExplorerTabs.dll','ExplorerMvpHost.exe','ExplorerHeaderProbe.exe','Win10PatchOptions.exe','NativeSnap.exe') {
  Copy-Item -LiteralPath (Join-Path $BinaryDirectory $name) -Destination $lab
 }
 $key='HKCU:\Software\Win10NativePatch\v2'
@@ -33,10 +33,20 @@ try {
  if($p.ExitCode){throw 'Explorer inspection failed.'}
  $state=Get-Content -LiteralPath $report -Raw | ConvertFrom-Json
  $target=@($state.windows | Where-Object {$_.hwnd-eq $Window})
- $tabs=if($target.Count-eq 1){@($target[0].children | Where-Object {$_.class-eq 'Win10NativePatch.ExplorerTabs.v2'})}else{@()}
+ $tabs=if($target.Count-eq 1){@($target[0].children | Where-Object {$_.class.StartsWith('Win10NativePatch.ExplorerTabs.v2')})}else{@()}
  $sameFrame=$tabs.Count-eq 1-and $tabs[0].parent-eq $Window
  $topRow=$sameFrame-and $tabs[0].rect[1]-ge $target[0].outer[1]-and $tabs[0].rect[3]-le ($target[0].outer[1]+$target[0].captionButtons[3]+2)
- $result=[ordered]@{success=($target.Count-eq 1-and $target[0].tabsActive-and $sameFrame-and $topRow);window=$Window;shellPid=$state.shellPid;explorerPid=if($target.Count){$target[0].pid}else{0};realExplorerChild=$sameFrame;captionRow=$topRow;attachResult=if($target.Count){$target[0].attachResult}else{0};rejected=if($target.Count){$target[0].rejected}else{0};physicalGesturesTested=$false;visualAppearanceVerified=$false;dllSha256=(Get-FileHash -LiteralPath (Join-Path $lab 'ExplorerTabs.dll')).Hash;lab=$lab}
+ $headerFailure=$null
+ $headerReport=Join-Path $lab 'header-commands.json'
+ try {
+  & (Join-Path $PSScriptRoot 'Test-HeaderIntegration.ps1') -Window $Window -BinaryDirectory $lab -Report $headerReport | Out-Null
+ } catch { $headerFailure=$_.Exception.Message }
+ $header=if(Test-Path -LiteralPath $headerReport){Get-Content -LiteralPath $headerReport -Raw | ConvertFrom-Json}else{$null}
+ $allocatedRow=$sameFrame-and $target[0].headerRowHeight-gt 0-and $header-and ($tabs[0].rect[3]-$tabs[0].rect[1])-eq $target[0].headerRowHeight-and $tabs[0].rect[3]-le $header.navigationRect[1]
+ $result=[ordered]@{success=($target.Count-eq 1-and $target[0].tabsActive-and $sameFrame-and ($topRow-or $allocatedRow));window=$Window;shellPid=$state.shellPid;explorerPid=if($target.Count){$target[0].pid}else{0};realExplorerChild=$sameFrame;captionRow=$topRow;allocatedHeaderRow=$allocatedRow;attachResult=if($target.Count){$target[0].attachResult}else{0};rejected=if($target.Count){$target[0].rejected}else{0};physicalGesturesTested=$false;visualAppearanceVerified=$false;dllSha256=(Get-FileHash -LiteralPath (Join-Path $lab 'ExplorerTabs.dll')).Hash;lab=$lab}
+ $result.nativeCommandsUncovered=($null-eq $headerFailure)
+ $result.headerFailure=$headerFailure
+ $result.success=$result.success-and $result.nativeCommandsUncovered
  $result | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $lab 'result.json') -Encoding UTF8
  $result | ConvertTo-Json
  if(-not $result.success){throw 'The real Explorer title-bar check did not pass. See the recorded result.'}

@@ -1,0 +1,17 @@
+MinHook v1.3.4, upstream tag published 2025-03-28.
+Source: https://github.com/TsudaKageyu/minhook/tree/v1.3.4
+Archive: https://codeload.github.com/TsudaKageyu/minhook/zip/refs/tags/v1.3.4
+Archive SHA-256: 172708123DAA0C98D20D3A980B16A50BE14AF243DC95DEE6F79C24193AD010E4
+License: BSD-style, see LICENSE.txt and src/hde's original notices.
+
+Only include/, src/ and LICENSE.txt are vendored. The native CMake target builds
+the x64 implementation. No network access or top-level vendor tree is needed.
+
+Local change in src/hook.c: verify the expected original bytes before enabling
+and our exact jump bytes before disabling, including hotpatch entries. Check
+before freezing and again before writing. Ownership loss returns the existing
+MH_ERROR_UNSUPPORTED_FUNCTION status. The single-target disable uses the
+ACTION_DISABLE instruction-pointer mapping. The production caller retains
+trampolines/module lifetime and never uninitializes this private library copy;
+later chained extensions cannot be left pointing into freed memory. No queue,
+all-hooks, or remove/uninitialize operation is used by production.

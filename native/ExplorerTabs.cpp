@@ -7,6 +7,8 @@
 
 #include "Patch.h"
 #include "MvpHostProtocol.h"
+#include "HeaderIntegration.h"
+#include "TabHeaderRenderer.h"
 #include <algorithm>
 #include <atomic>
 #include <commctrl.h>
@@ -38,10 +40,14 @@ namespace
 {
 HINSTANCE module{};
 std::atomic<long> objectCount{}, serverLocks{};
-constexpr wchar_t TabClass[] = L"Win10NativePatch.ExplorerTabs.v2";
+const wchar_t* TabWindowClass(){
+    static const std::wstring name=L"Win10NativePatch.ExplorerTabs.v2."+std::to_wstring(reinterpret_cast<ULONG_PTR>(module));
+    return name.c_str();
+}
 constexpr wchar_t ControllerProperty[] = L"Win10NativePatch.ExplorerController.v2";
 constexpr wchar_t ProofProperty[] = L"Win10NativePatch.IsolatedProof.v2";
 constexpr wchar_t SessionKey[] = L"Software\\Win10NativePatch\\v2\\ExplorerTabs";
+constexpr wchar_t WindowSessionProperty[]=L"Win10NativePatch.WindowSession.v1";
 constexpr UINT_PTR MaintenanceTimer = 0x57545032;
 constexpr UINT SyncMessage = WM_APP + 0x482;
 constexpr UINT RestoreMessage = WM_APP + 0x483;
@@ -646,17 +652,6 @@ std::wstring ModulePath()
     GetModuleFileNameW(module, path, 32768);
     return path;
 }
-bool Dark()
-{
-    HIGHCONTRASTW hc{sizeof(hc)};
-    if (SystemParametersInfoW(SPI_GETHIGHCONTRAST, sizeof(hc), &hc, 0) && (hc.dwFlags & HCF_HIGHCONTRASTON))
-        return false;
-    DWORD light = 1, size = 4;
-    RegGetValueW(HKEY_CURRENT_USER, L"Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize",
-                 L"AppsUseLightTheme", RRF_RT_REG_DWORD, nullptr, &light, &size);
-    return light == 0;
-}
-
 class DropData final : public IDataObject
 {
     std::atomic<ULONG> refs{1};
@@ -815,23 +810,24 @@ class Controller final : public IObjectWithSite, public IAccessible, public IDro
     ComPtr<IConnectionPoint> events_;
     ComPtr<ITypeInfo> accessInfo_;
     DWORD eventCookie_{};
-    HWND frame_{}, strip_{}, netui_{}, travel_{};
+    HWND frame_{}, strip_{}, travel_{};
     HHOOK keyboard_{};
-    HRGN oldRegion_{};
-    bool hadRegion_ = false, clipped_ = false;
+    bool headerAttached_=false,layingOut_=false,hasUsableSession_=false;
     DWORD ownerThread_{};
     bool enabled_ = false, tearingDown_ = false, inDrag_ = false, dropPrivate_ = false, sameWindowDrop_ = false;
-    bool frameHooked_ = false, selfHosted_ = false;
-    bool dark_ = false;
-    HFONT font_{};
+    bool frameHooked_ = false, selfHosted_ = false, legacyHidden_ = false, closingFrame_ = false;
     HICON folderIcon_{};
     UINT dpi_ = 96;
-    RECT tabArea_{};
-    std::vector<RECT> tabRects_;
-    RECT plusRect_{}, overflowRect_{};
-    size_t firstVisible_{};
-    int hot_ = -1, pressed_ = -1;
-    bool pressedClose_ = false;
+    header::LayoutState layout_;
+    header::TabHeaderRenderer renderer_;
+    bool rendererReady_=false;
+    bool rendering_=false;
+    std::uint64_t renderEpoch_{};
+    header::TargetId hotTarget_,pressedTarget_,focusedTarget_;
+    UINT pressedButton_{};
+    unsigned menuDepth_{};
+    HMENU systemMenu_{};
+    UINT focusMenuId_{};
     POINT dragStart_{};
     int backCommand_ = -1, forwardCommand_ = -1;
     std::vector<Tab> tabs_, closed_;
@@ -851,8 +847,11 @@ class Controller final : public IObjectWithSite, public IAccessible, public IDro
     {
         ULONGLONG id{};
         ULONGLONG start{};
-        std::unordered_set<HWND> oldWindows;
+        HWND window{};
+        ComPtr<IWebBrowser2> created;
+        Pidl expected;
         std::vector<BYTE> packet;
+        bool transferred{},closeRequested{};
     };
     std::optional<Detached> detached_;
     ComPtr<IDropTarget> folderDrop_;
@@ -861,6 +860,7 @@ class Controller final : public IObjectWithSite, public IAccessible, public IDro
     ULONGLONG hoverStart_{};
     bool startupPending_ = false;
     ULONGLONG startupStart_{};
+    ULONGLONG headerRetryDeadline_{};
     static LRESULT CALLBACK StripProc(HWND, UINT, WPARAM, LPARAM);
     static LRESULT CALLBACK FrameProc(HWND, UINT, WPARAM, LPARAM, UINT_PTR, DWORD_PTR);
     static LRESULT CALLBACK TravelProc(HWND, UINT, WPARAM, LPARAM, UINT_PTR, DWORD_PTR);
@@ -868,9 +868,11 @@ class Controller final : public IObjectWithSite, public IAccessible, public IDro
     bool Attach();
     void Detach();
     void Enable(bool);
-    void Layout();
+    void Layout(bool transient=false);
     void Paint();
-    void RebuildFont();
+    bool Render();
+    void HeaderFailed();
+    void RefreshAppearance();
     void RefreshTravel();
     void UpdateNavigationButtons();
     void Remember();
@@ -878,7 +880,7 @@ class Controller final : public IObjectWithSite, public IAccessible, public IDro
     bool Navigate(ULONGLONG, size_t, bool);
     bool Activate(size_t);
     void NewTab(const Pidl *folder = nullptr);
-    void Close(size_t);
+    void Close(size_t,const std::vector<BYTE>* expected=nullptr);
     void Reopen();
     void History(int);
     void HistoryMenu(bool, POINT);
@@ -886,6 +888,9 @@ class Controller final : public IObjectWithSite, public IAccessible, public IDro
     void LimitMemory();
     void SaveSession();
     void LoadSession();
+    bool SaveWindowSession();
+    bool LoadWindowSession();
+    void RemoveWindowSession();
     void TabChanged();
     void RefreshMetadata();
     void AcceptMetadata(ULONGLONG);
@@ -893,20 +898,28 @@ class Controller final : public IObjectWithSite, public IAccessible, public IDro
     void StartDrag(size_t);
     void DetachTab(size_t);
     bool Import(Tab, bool);
-    void SnapshotRoots(std::unordered_set<HWND> &);
     int Hit(POINT) const;
-    bool HitClose(int, POINT) const;
+    int Index(ULONGLONG id) const {for(size_t i=0;i<tabs_.size();++i)if(tabs_[i].id==id)return static_cast<int>(i);return -1;}
+    bool Ready() const {return enabled_&&!tearingDown_&&strip_&&rendererReady_&&IsWindowVisible(strip_)&&header::IsCurrent(frame_,layout_.allocation);}
+    void CancelPointer();
+    void SystemMenu(bool);
+    void FocusTarget(header::TargetId);
+    POINT MenuAnchor(header::TargetId) const;
+    void InvokeTarget(header::TargetId);
+    header::TargetId ChildTarget(LONG) const;
+    LONG TargetChild(header::TargetId) const;
+    bool ValidChild(VARIANT v) const {return v.vt==VT_I4&&v.lVal>=0&&v.lVal<=static_cast<LONG>(tabs_.size()*2+2);}
     void Mouse(UINT, WPARAM, LPARAM);
     bool BeginStartupGuard();
     void CompleteStartupGuard();
-    void ClipRibbon(bool);
+    void LegacyBand(bool);
     void BindFolderDrop();
     HRESULT ChildName(LONG, BSTR *);
     bool ChildRect(LONG, RECT &) const;
     HRESULT AccessTypeInfo();
 
   public:
-    void OwnMvpLifetime() { selfHosted_ = true; }
+    void OwnMvpLifetime() { selfHosted_ = true; if(enabled_)LegacyBand(true); }
     Controller()
     {
         objectCount++;
@@ -915,8 +928,6 @@ class Controller final : public IObjectWithSite, public IAccessible, public IDro
     {
         CancelMetadata(metadataCookie_);
         Detach();
-        if (font_)
-            DeleteObject(font_);
         if (folderIcon_)
             DestroyIcon(folderIcon_);
         objectCount--;
@@ -992,67 +1003,66 @@ class Controller final : public IObjectWithSite, public IAccessible, public IDro
     {
         if (!n)
             return E_POINTER;
-        *n = static_cast<LONG>(tabs_.size() + 2);
+        *n = static_cast<LONG>(tabs_.size()*2 + 2);
         return S_OK;
     }
-    HRESULT STDMETHODCALLTYPE get_accChild(VARIANT, IDispatch **p) override
-    {
-        if (!p)
-            return E_POINTER;
-        *p = nullptr;
-        return S_FALSE;
-    }
+    HRESULT STDMETHODCALLTYPE get_accChild(VARIANT, IDispatch **) override;
     HRESULT STDMETHODCALLTYPE get_accName(VARIANT v, BSTR *p) override
     {
-        return ChildName(v.vt == VT_I4 ? v.lVal : 0, p);
+        return ValidChild(v)?ChildName(v.lVal,p):E_INVALIDARG;
     }
-    HRESULT STDMETHODCALLTYPE get_accValue(VARIANT, BSTR *p) override
+    HRESULT STDMETHODCALLTYPE get_accValue(VARIANT v, BSTR *p) override
     {
         if (!p)
             return E_POINTER;
         *p = nullptr;
-        return S_FALSE;
+        return ValidChild(v)?S_FALSE:E_INVALIDARG;
     }
-    HRESULT STDMETHODCALLTYPE get_accDescription(VARIANT, BSTR *p) override
+    HRESULT STDMETHODCALLTYPE get_accDescription(VARIANT v, BSTR *p) override
     {
         if (!p)
             return E_POINTER;
-        *p = SysAllocString(L"Folders in this File Explorer window");
-        return S_OK;
+        *p=nullptr;if(!ValidChild(v))return E_INVALIDARG;if(v.lVal)return S_FALSE;
+        *p = SysAllocString(L"Folders in this File Explorer window");return *p?S_OK:E_OUTOFMEMORY;
     }
     HRESULT STDMETHODCALLTYPE get_accRole(VARIANT v, VARIANT *p) override
     {
         if (!p)
             return E_POINTER;
         VariantInit(p);
+        if(!ValidChild(v))return E_INVALIDARG;
         p->vt = VT_I4;
-        p->lVal = v.vt == VT_I4 && v.lVal > 0
-                      ? (v.lVal <= static_cast<LONG>(tabs_.size()) ? ROLE_SYSTEM_PAGETAB : ROLE_SYSTEM_PUSHBUTTON)
+        p->lVal = v.lVal > 0
+                      ? (ChildTarget(v.lVal).kind==header::TargetKind::Tab ? ROLE_SYSTEM_PAGETAB : ROLE_SYSTEM_PUSHBUTTON)
                       : ROLE_SYSTEM_PAGETABLIST;
         return S_OK;
     }
     HRESULT STDMETHODCALLTYPE get_accState(VARIANT, VARIANT *) override;
-    HRESULT STDMETHODCALLTYPE get_accHelp(VARIANT, BSTR *p) override
+    HRESULT STDMETHODCALLTYPE get_accHelp(VARIANT v, BSTR *p) override
     {
         if (!p)
             return E_POINTER;
         *p = nullptr;
-        return S_FALSE;
+        return ValidChild(v)?S_FALSE:E_INVALIDARG;
     }
-    HRESULT STDMETHODCALLTYPE get_accHelpTopic(BSTR *p, VARIANT, long *n) override
+    HRESULT STDMETHODCALLTYPE get_accHelpTopic(BSTR *p, VARIANT v, long *n) override
     {
         if (p)
             *p = nullptr;
         if (n)
             *n = 0;
-        return S_FALSE;
+        return ValidChild(v)?S_FALSE:E_INVALIDARG;
     }
     HRESULT STDMETHODCALLTYPE get_accKeyboardShortcut(VARIANT v, BSTR *p) override
     {
         if (!p)
             return E_POINTER;
-        *p = SysAllocString(v.vt == VT_I4 && v.lVal <= 9 ? L"Ctrl+number" : L"Ctrl+Tab");
-        return S_OK;
+        *p=nullptr;if(!ValidChild(v))return E_INVALIDARG;
+        const auto target=ChildTarget(v.lVal);std::wstring text;
+        if(target.kind==header::TargetKind::NewTab)text=L"Ctrl+T";
+        if(target.kind==header::TargetKind::Tab){const int index=Index(target.tab);if(index<8)text=L"Ctrl+"+std::to_wstring(index+1);else if(index==static_cast<int>(tabs_.size()-1))text=L"Ctrl+9";}
+        if(target.kind==header::TargetKind::Close&&Index(target.tab)==static_cast<int>(active_))text=L"Ctrl+W";
+        if(text.empty())return S_FALSE;*p=SysAllocString(text.c_str());return *p?S_OK:E_OUTOFMEMORY;
     }
     HRESULT STDMETHODCALLTYPE get_accFocus(VARIANT *p) override
     {
@@ -1062,7 +1072,7 @@ class Controller final : public IObjectWithSite, public IAccessible, public IDro
         if (GetFocus() == strip_)
         {
             p->vt = VT_I4;
-            p->lVal = static_cast<LONG>(active_ + 1);
+            p->lVal = TargetChild(focusedTarget_);
         }
         return S_OK;
     }
@@ -1071,21 +1081,19 @@ class Controller final : public IObjectWithSite, public IAccessible, public IDro
         if (!p)
             return E_POINTER;
         VariantInit(p);
-        p->vt = VT_I4;
-        p->lVal = static_cast<LONG>(active_ + 1);
+        if(active_<tabs_.size()){p->vt = VT_I4;p->lVal=TargetChild({header::TargetKind::Tab,tabs_[active_].id});}
         return S_OK;
     }
     HRESULT STDMETHODCALLTYPE get_accDefaultAction(VARIANT v, BSTR *p) override
     {
         if (!p)
             return E_POINTER;
-        *p = SysAllocString(v.vt == VT_I4 && v.lVal <= static_cast<LONG>(tabs_.size()) ? L"Switch" : L"Press");
-        return S_OK;
+        *p=nullptr;if(!ValidChild(v))return E_INVALIDARG;if(!v.lVal)return S_FALSE;
+        const auto target=ChildTarget(v.lVal);
+        *p = SysAllocString(target.kind==header::TargetKind::Tab?L"Switch":target.kind==header::TargetKind::Close?L"Close":L"Press");
+        return *p?S_OK:E_OUTOFMEMORY;
     }
-    HRESULT STDMETHODCALLTYPE accSelect(long, VARIANT v) override
-    {
-        return accDoDefaultAction(v);
-    }
+    HRESULT STDMETHODCALLTYPE accSelect(long, VARIANT) override;
     HRESULT STDMETHODCALLTYPE accLocation(long *, long *, long *, long *, VARIANT) override;
     HRESULT STDMETHODCALLTYPE accNavigate(long, VARIANT, VARIANT *) override;
     HRESULT STDMETHODCALLTYPE accHitTest(long, long, VARIANT *) override;
@@ -1099,7 +1107,54 @@ class Controller final : public IObjectWithSite, public IAccessible, public IDro
         return E_ACCESSDENIED;
     }
     HRESULT Proof(const wchar_t *);
+    LONG AccessibleChild(header::TargetId target) const {return TargetChild(target);}
 };
+
+// A retained child binds to the model identity. Its positional MSAA child ID
+// may change as siblings close, but it can never become a neighboring tab.
+class AccessibleTarget final : public IAccessible
+{
+    std::atomic<ULONG> refs_{1};Controller* owner_;header::TargetId target_;
+    HRESULT Resolve(VARIANT input,VARIANT& child) const {VariantInit(&child);if(input.vt!=VT_I4||input.lVal!=CHILDID_SELF)return E_INVALIDARG;child.vt=VT_I4;child.lVal=owner_->AccessibleChild(target_);return child.lVal?S_OK:E_INVALIDARG;}
+public:
+    AccessibleTarget(Controller* owner,header::TargetId target):owner_(owner),target_(target){owner_->AddRef();}
+    ~AccessibleTarget(){owner_->Release();}
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID id,void** out) override {if(!out)return E_POINTER;*out=nullptr;if(id!=IID_IUnknown&&id!=IID_IDispatch&&id!=IID_IAccessible)return E_NOINTERFACE;*out=static_cast<IAccessible*>(this);AddRef();return S_OK;}
+    ULONG STDMETHODCALLTYPE AddRef() override {return ++refs_;}ULONG STDMETHODCALLTYPE Release() override {ULONG n=--refs_;if(!n)delete this;return n;}
+    HRESULT STDMETHODCALLTYPE GetTypeInfoCount(UINT* out) override {return owner_->GetTypeInfoCount(out);}
+    HRESULT STDMETHODCALLTYPE GetTypeInfo(UINT i,LCID l,ITypeInfo** out) override {return owner_->GetTypeInfo(i,l,out);}
+    HRESULT STDMETHODCALLTYPE GetIDsOfNames(REFIID id,LPOLESTR* n,UINT c,LCID l,DISPID* out) override {return owner_->GetIDsOfNames(id,n,c,l,out);}
+    HRESULT STDMETHODCALLTYPE Invoke(DISPID id,REFIID,LCID,WORD flags,DISPPARAMS* p,VARIANT* out,EXCEPINFO* e,UINT* a) override {ComPtr<ITypeInfo> type;HRESULT hr=GetTypeInfo(0,LOCALE_SYSTEM_DEFAULT,&type);return SUCCEEDED(hr)?DispInvoke(static_cast<IAccessible*>(this),type.Get(),id,flags,p,out,e,a):hr;}
+    HRESULT STDMETHODCALLTYPE get_accParent(IDispatch** out) override {if(!out)return E_POINTER;*out=static_cast<IAccessible*>(owner_);owner_->AddRef();return S_OK;}
+    HRESULT STDMETHODCALLTYPE get_accChildCount(long* out) override {if(!out)return E_POINTER;*out=0;return S_OK;}
+    HRESULT STDMETHODCALLTYPE get_accChild(VARIANT,IDispatch** out) override {if(!out)return E_POINTER;*out=nullptr;return S_FALSE;}
+#define FORWARD_ACCESS(method,type) HRESULT STDMETHODCALLTYPE method(VARIANT input,type* out) override {VARIANT child{};HRESULT hr=Resolve(input,child);return SUCCEEDED(hr)?owner_->method(child,out):hr;}
+    FORWARD_ACCESS(get_accName,BSTR)
+    FORWARD_ACCESS(get_accValue,BSTR)
+    FORWARD_ACCESS(get_accDescription,BSTR)
+    FORWARD_ACCESS(get_accRole,VARIANT)
+    FORWARD_ACCESS(get_accState,VARIANT)
+    FORWARD_ACCESS(get_accHelp,BSTR)
+    FORWARD_ACCESS(get_accKeyboardShortcut,BSTR)
+    FORWARD_ACCESS(get_accDefaultAction,BSTR)
+#undef FORWARD_ACCESS
+    HRESULT STDMETHODCALLTYPE get_accHelpTopic(BSTR* out,VARIANT input,long* topic) override {VARIANT child{};HRESULT hr=Resolve(input,child);return SUCCEEDED(hr)?owner_->get_accHelpTopic(out,child,topic):hr;}
+    HRESULT STDMETHODCALLTYPE get_accFocus(VARIANT* out) override {if(!out)return E_POINTER;VariantInit(out);VARIANT focus{};owner_->get_accFocus(&focus);const auto child=owner_->AccessibleChild(target_);if(child&&focus.vt==VT_I4&&focus.lVal==child){out->vt=VT_I4;out->lVal=CHILDID_SELF;}return S_OK;}
+    HRESULT STDMETHODCALLTYPE get_accSelection(VARIANT* out) override {if(!out)return E_POINTER;VariantInit(out);return S_FALSE;}
+    HRESULT STDMETHODCALLTYPE accSelect(long flags,VARIANT input) override {VARIANT child{};HRESULT hr=Resolve(input,child);return SUCCEEDED(hr)?owner_->accSelect(flags,child):hr;}
+    HRESULT STDMETHODCALLTYPE accLocation(long* x,long* y,long* w,long* h,VARIANT input) override {VARIANT child{};HRESULT hr=Resolve(input,child);return SUCCEEDED(hr)?owner_->accLocation(x,y,w,h,child):hr;}
+    HRESULT STDMETHODCALLTYPE accNavigate(long direction,VARIANT input,VARIANT* out) override {if(!out)return E_POINTER;VariantInit(out);VARIANT child{},next{};HRESULT hr=Resolve(input,child);if(FAILED(hr))return hr;hr=owner_->accNavigate(direction,child,&next);if(hr!=S_OK)return hr;ComPtr<IDispatch> sibling;hr=owner_->get_accChild(next,&sibling);if(SUCCEEDED(hr)&&sibling){out->vt=VT_DISPATCH;out->pdispVal=sibling.Detach();}return hr;}
+    HRESULT STDMETHODCALLTYPE accHitTest(long x,long y,VARIANT* out) override {if(!out)return E_POINTER;VariantInit(out);VARIANT hit{};HRESULT hr=owner_->accHitTest(x,y,&hit);const auto child=owner_->AccessibleChild(target_);if(child&&hr==S_OK&&hit.vt==VT_I4&&hit.lVal==child){out->vt=VT_I4;out->lVal=CHILDID_SELF;return S_OK;}return S_FALSE;}
+    HRESULT STDMETHODCALLTYPE accDoDefaultAction(VARIANT input) override {VARIANT child{};HRESULT hr=Resolve(input,child);return SUCCEEDED(hr)?owner_->accDoDefaultAction(child):hr;}
+    HRESULT STDMETHODCALLTYPE put_accName(VARIANT,BSTR) override {return E_ACCESSDENIED;}
+    HRESULT STDMETHODCALLTYPE put_accValue(VARIANT,BSTR) override {return E_ACCESSDENIED;}
+};
+HRESULT Controller::get_accChild(VARIANT child,IDispatch** out)
+{
+    if(!out)return E_POINTER;*out=nullptr;
+    if(!ValidChild(child))return E_INVALIDARG;if(!child.lVal)return S_FALSE;
+    *out=new(std::nothrow) AccessibleTarget(this,ChildTarget(child.lVal));return *out?S_OK:E_OUTOFMEMORY;
+}
 
 HRESULT Controller::SetSite(IUnknown *site)
 {
@@ -1186,8 +1241,6 @@ void Controller::Detach()
 {
     if (tearingDown_)
         return;
-    tearingDown_ = true;
-    CancelMetadata(metadataCookie_);
     if (frame_ && ownerThread_ != GetCurrentThreadId())
     {
         // COM apartment ownership is a hard boundary, not an invitation to touch
@@ -1195,6 +1248,9 @@ void Controller::Detach()
         patch::Log(L"ExplorerTabs", L"Rejected teardown from a different apartment.");
         return;
     }
+    tearingDown_ = true;
+    CancelMetadata(metadataCookie_);
+    headerRetryDeadline_=0;
     if (!tabs_.empty())
         SaveSession();
     Enable(false);
@@ -1306,21 +1362,23 @@ void Controller::Enable(bool value)
         wc.lpfnWndProc = StripProc;
         wc.hInstance = module;
         wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
-        wc.lpszClassName = TabClass;
+        wc.lpszClassName = TabWindowClass();
         wc.style = CS_DBLCLKS;
         RegisterClassExW(&wc);
-        dark_ = Dark();
         dpi_ = GetDpiForWindow(frame_);
-        RebuildFont();
-        strip_ = CreateWindowExW(WS_EX_CONTROLPARENT, TabClass, L"File Explorer tabs",
-                                 WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_CLIPSIBLINGS, 0, 0, 0, 0, frame_, nullptr,
+        RefreshAppearance();
+        strip_ = CreateWindowExW(WS_EX_CONTROLPARENT | WS_EX_NOREDIRECTIONBITMAP, TabWindowClass(), L"File Explorer tabs",
+                                 WS_CHILD | WS_TABSTOP | WS_CLIPSIBLINGS, 0, 0, 0, 0, frame_, nullptr,
                                  module, this);
         if (!strip_)
         {
             CompleteStartupGuard();
             return;
         }
+        headerAttached_=header::Attach(frame_);
+        if(!headerAttached_){DestroyWindow(strip_);strip_=nullptr;CompleteStartupGuard();SetPropW(frame_,L"Win10NativePatch.TabsRejected.v2",reinterpret_cast<HANDLE>(3));return;}
         enabled_ = true;
+        SystemMenu(true);
         RegisterMetadata(metadataCookie_, frame_);
         SetPropW(frame_, patch::TabsActiveProperty, this);
         HRESULT drop = RegisterDragDrop(strip_, static_cast<IDropTarget *>(this));
@@ -1330,13 +1388,25 @@ void Controller::Enable(bool value)
         RefreshTravel();
         Layout();
         if(!enabled_||!strip_)return;
-        if ((patch::LoadConfig().flags & patch::RestoreTabs) && !sessionRestored.exchange(true))
+        headerRetryDeadline_=0;
+        hasUsableSession_=true;
+        if(selfHosted_)LegacyBand(true);
+        if (!LoadWindowSession()&&(patch::LoadConfig().flags & patch::RestoreTabs) && !sessionRestored.exchange(true))
             LoadSession();
         RefreshMetadata();
         NotifyWinEvent(EVENT_OBJECT_CREATE, strip_, OBJID_CLIENT, CHILDID_SELF);
     }
     else
     {
+        // Publish cancellation before any Shell/COM cleanup can reenter us.
+        enabled_=false;
+        SystemMenu(false);
+        if(menuDepth_)EndMenu();
+        rendererReady_=false;
+        hotTarget_={};pressedTarget_={};pressedButton_=0;
+        if(strip_){ShowWindow(strip_,SW_HIDE);if(GetCapture()==strip_)ReleaseCapture();}
+        renderer_.Reset();
+        LegacyBand(false);
         CancelMetadata(metadataCookie_);
         for(auto& t:tabs_)t.metadataPending=false;
         Remember();
@@ -1354,7 +1424,9 @@ void Controller::Enable(bool value)
             RemoveWindowSubclass(travel_, TravelProc, reinterpret_cast<UINT_PTR>(this));
             travel_ = nullptr;
         }
-        ClipRibbon(false);
+        enabled_=false;
+        layout_={};
+        if(headerAttached_){header::Detach(frame_,!closingFrame_);headerAttached_=false;}
         if (strip_)
         {
             RevokeDragDrop(strip_);
@@ -1370,15 +1442,9 @@ void Controller::Enable(bool value)
         RedrawWindow(frame_, nullptr, nullptr, RDW_INVALIDATE | RDW_FRAME | RDW_ALLCHILDREN);
     }
 }
-void Controller::RebuildFont()
+void Controller::RefreshAppearance()
 {
-    if (font_)
-        DeleteObject(font_);
-    LOGFONTW lf{};
-    NONCLIENTMETRICSW metrics{sizeof(metrics)};
-    if(SystemParametersInfoForDpi(SPI_GETNONCLIENTMETRICS,sizeof(metrics),&metrics,0,dpi_))lf=metrics.lfCaptionFont;
-    else {lf.lfHeight=-MulDiv(9,static_cast<int>(dpi_),72);lf.lfWeight=FW_NORMAL;wcscpy_s(lf.lfFaceName,L"Segoe UI");}
-    font_ = CreateFontIndirectW(&lf);
+    renderer_.ThemeChanged();
     if (!folderIcon_)
     {
         SHSTOCKICONINFO info{sizeof(info)};
@@ -1386,203 +1452,145 @@ void Controller::RebuildFont()
             folderIcon_ = info.hIcon;
     }
 }
-void Controller::ClipRibbon(bool value)
+void Controller::LegacyBand(bool hide)
 {
-    if (clipped_ && IsWindow(netui_))
+    if(!automation_)return;
+    if(hide)
     {
-        SetWindowRgn(netui_, hadRegion_ ? oldRegion_ : nullptr, TRUE);
-        if (hadRegion_)
-            oldRegion_ = nullptr;
-        clipped_ = false;
-        hadRegion_ = false;
-    }
-    if (oldRegion_)
-    {
-        DeleteObject(oldRegion_);
-        oldRegion_ = nullptr;
-    }
-    if (!value || !strip_)
-        return;
-    struct Search
-    {
-        HWND strip;
-        HWND found;
-    };
-    Search search{strip_, nullptr};
-    EnumChildWindows(
-        frame_,
-        [](HWND h, LPARAM p) -> BOOL {
-            auto &s = *reinterpret_cast<Search *>(p);
-            wchar_t c[64]{};
-            GetClassNameW(h, c, 64);
-            if (wcscmp(c, L"NetUIHWND"))
-                return TRUE;
-            RECT a{}, b{}, over{};
-            GetWindowRect(h, &a);
-            GetWindowRect(s.strip, &b);
-            if (IntersectRect(&over, &a, &b) && over.bottom > over.top)
-            {
-                s.found = h;
-                return FALSE;
-            }
+        DWORD owned{},size=sizeof(owned);
+        if(legacyHidden_ || RegGetValueW(HKEY_CURRENT_USER,patch::SettingsKey,L"MvpReplaceOwnedQt",
+                RRF_RT_REG_DWORD,nullptr,&owned,&size)!=ERROR_SUCCESS || owned!=1)return;
+        bool visible=false;
+        EnumChildWindows(frame_,[](HWND child,LPARAM value)->BOOL{
+            wchar_t name[128]{},parent[64]{};
+            GetClassNameW(child,name,128);GetClassNameW(GetParent(child),parent,64);
+            if(IsWindowVisible(child)&&wcsncmp(name,L"WindowsForms10.Window.",22)==0&&
+               wcscmp(parent,L"ReBarWindow32")==0){*reinterpret_cast<bool*>(value)=true;return FALSE;}
             return TRUE;
-        },
-        reinterpret_cast<LPARAM>(&search));
-    netui_ = search.found;
-    if (!netui_)
-        return;
-    oldRegion_ = CreateRectRgn(0, 0, 0, 0);
-    int result = GetWindowRgn(netui_, oldRegion_);
-    hadRegion_ = result != ERROR;
-    RECT client{}, tab{};
-    GetWindowRect(netui_, &client);
-    GetWindowRect(strip_, &tab);
-    OffsetRect(&tab, -client.left, -client.top);
-    HRGN region = hadRegion_ ? CreateRectRgn(0, 0, 0, 0)
-                             : CreateRectRgn(0, 0, client.right - client.left, client.bottom - client.top);
-    if (hadRegion_)
-        CombineRgn(region, oldRegion_, nullptr, RGN_COPY);
-    HRGN cut = CreateRectRgnIndirect(&tab);
-    CombineRgn(region, region, cut, RGN_DIFF);
-    DeleteObject(cut);
-    if (SetWindowRgn(netui_, region, TRUE))
-        clipped_ = true;
-    else
-        DeleteObject(region);
+        },reinterpret_cast<LPARAM>(&visible));
+        if(!visible)return;
+    }
+    else if(!legacyHidden_ || closingFrame_)return;
+    VARIANT clsid{},show{},size{};
+    clsid.vt=VT_BSTR;clsid.bstrVal=SysAllocString(L"{d2bf470e-ed1c-487f-a333-2bd8835eb6ce}");
+    if(!clsid.bstrVal)return;
+    show.vt=VT_BOOL;show.boolVal=hide?VARIANT_FALSE:VARIANT_TRUE;
+    HRESULT result=automation_->ShowBrowserBar(&clsid,&show,&size);
+    VariantClear(&clsid);
+    if(SUCCEEDED(result))
+    {
+        legacyHidden_=hide;
+        if(hide)SetPropW(frame_,L"Win10NativePatch.LegacyQtHidden.v1",reinterpret_cast<HANDLE>(1));
+        else RemovePropW(frame_,L"Win10NativePatch.LegacyQtHidden.v1");
+    }
 }
-void Controller::Layout()
+void Controller::Layout(bool transient)
 {
-    if (!enabled_ || !strip_)
+    if (!enabled_ || !strip_ || layingOut_)
         return;
+    struct LayoutGuard {bool& active;LayoutGuard(bool& value):active(value){active=true;}~LayoutGuard(){active=false;}} layoutGuard(layingOut_);
     if(IsIconic(frame_))return;
     UINT now = GetDpiForWindow(frame_);
     if (now != dpi_)
     {
         dpi_ = now;
-        RebuildFont();
+        RefreshAppearance();
     }
-    RECT client{},buttons{},outer{};GetClientRect(frame_,&client);GetWindowRect(frame_,&outer);
-    bool measured=SUCCEEDED(DwmGetWindowAttribute(frame_,DWMWA_CAPTION_BUTTON_BOUNDS,&buttons,sizeof(buttons)))&&buttons.right>buttons.left&&buttons.bottom>buttons.top;
-    POINT origin{};ClientToScreen(frame_,&origin);
-    // Explorer's ribbon window classes vary. The actual caption buttons supply
-    // the top row's geometry; ClipRibbon verifies its native paint owner below.
-    int right=buttons.left+outer.left-origin.x,height=buttons.bottom+outer.top-origin.y;
-    const int start = MulDiv(40, static_cast<int>(dpi_), 96), space = MulDiv(28, static_cast<int>(dpi_), 96);
-    right -= space;
-    if(!measured||height<MulDiv(16,static_cast<int>(dpi_),96)||height>MulDiv(56,static_cast<int>(dpi_),96)||right<start+space*2||right>client.right)
-    {
-        patch::Log(L"ExplorerTabs",L"Unsupported caption/ribbon geometry; ordinary Explorer chrome was restored.");
-        SetPropW(frame_,L"Win10NativePatch.TabsRejected.v2",reinterpret_cast<HANDLE>(1));
-        Enable(false);return;
+    const int space=MulDiv(30,static_cast<int>(dpi_),96);
+    header::Allocation allocation;
+    if(!header::Allocate(frame_,strip_,MulDiv(92,static_cast<int>(dpi_),96)+space*2,allocation,transient)){
+        patch::Log(L"ExplorerTabs",L"Native header allocation was unavailable; ordinary Explorer chrome was restored.");
+        SetPropW(frame_,L"Win10NativePatch.TabsRejected.v2",reinterpret_cast<HANDLE>(4));
+        if(!tearingDown_&&!closingFrame_&&!headerRetryDeadline_)headerRetryDeadline_=GetTickCount64()+2000;
+        Enable(false);
+        if(headerRetryDeadline_)SetTimer(frame_,MaintenanceTimer,100,nullptr);
+        return;
     }
-    tabArea_={start,0,right,height};
-    SetWindowPos(strip_, HWND_TOP, tabArea_.left, tabArea_.top, tabArea_.right - tabArea_.left,
-                 std::max<LONG>(20, tabArea_.bottom - tabArea_.top), SWP_NOACTIVATE);
-    RECT r{};
-    GetClientRect(strip_, &r);
-    int unit = MulDiv(30, static_cast<int>(dpi_), 96), minimum = MulDiv(92, static_cast<int>(dpi_), 96),
-        maximum = MulDiv(200, static_cast<int>(dpi_), 96);
-    int available = std::max(unit, static_cast<int>(r.right) - unit * 2);
-    size_t count = std::max<size_t>(1, tabs_.size());
-    int width = std::clamp(available / static_cast<int>(count), minimum, maximum);
-    size_t capacity = std::max<size_t>(1, available / width);
-    if (active_ < firstVisible_)
-        firstVisible_ = active_;
-    if (active_ >= firstVisible_ + capacity)
-        firstVisible_ = active_ - capacity + 1;
-    if (firstVisible_ >= tabs_.size())
-        firstVisible_ = 0;
-    tabRects_.assign(tabs_.size(), RECT{});
-    int x = 0;
-    for (size_t i = firstVisible_; i < tabs_.size() && i < firstVisible_ + capacity; i++)
-    {
-        tabRects_[i] = {x, 0, std::min(x + width, available), r.bottom};
-        x += width;
+    std::vector<std::uint64_t> identities;
+    identities.reserve(tabs_.size());
+    for(const auto& tab:tabs_)identities.push_back(tab.id);
+    auto next=header::BuildLayout(allocation,identities,active_<tabs_.size()?tabs_[active_].id:0,layout_.firstVisible);
+    const RECT area=allocation.bounds;
+    SetWindowPos(strip_, HWND_TOP,area.left,area.top,area.right-area.left,area.bottom-area.top,SWP_NOACTIVATE);
+    // A synchronous native reflow can invalidate a candidate while positioning
+    // its child. Consumers reject that candidate until the queued update runs.
+    layout_=std::move(next);
+    ++renderEpoch_;
+    rendererReady_=false;
+    if(header::IsCurrent(frame_,layout_.allocation)) {
+        if(!Render()){HeaderFailed();return;}
+        if(rendererReady_)ShowWindow(strip_,SW_SHOWNOACTIVATE);
+    } else ShowWindow(strip_,SW_HIDE);
+    if(strip_)InvalidateRect(strip_, nullptr, FALSE);
+}
+void Controller::HeaderFailed()
+{
+    if(!enabled_||!frame_)return;
+    rendererReady_=false;
+    if(strip_)ShowWindow(strip_,SW_HIDE);
+    SetPropW(frame_,L"Win10NativePatch.TabsRejected.v2",reinterpret_cast<HANDLE>(5));
+    if(!tearingDown_&&!closingFrame_&&!headerRetryDeadline_)headerRetryDeadline_=GetTickCount64()+2000;
+    Enable(false);
+    if(headerRetryDeadline_)SetTimer(frame_,MaintenanceTimer,100,nullptr);
+}
+bool Controller::Render()
+{
+    if(!enabled_||!strip_)return true;
+    if(rendering_)return true;
+    struct DrawGuard{bool& busy;DrawGuard(bool& value):busy(value){busy=true;}~DrawGuard(){busy=false;}} drawGuard(rendering_);
+    if(!header::IsCurrent(frame_,layout_.allocation)) {
+        rendererReady_=false;ShowWindow(strip_,SW_HIDE);return true;
     }
-    plusRect_ = {std::min(x, available), 0, std::min(x, available) + unit, r.bottom};
-    overflowRect_ = {r.right - unit, 0, r.right, r.bottom};
-    ClipRibbon(true);
-    if(!clipped_){patch::Log(L"ExplorerTabs",L"The native caption paint region could not be isolated; tabs were disabled.");SetPropW(frame_,L"Win10NativePatch.TabsRejected.v2",reinterpret_cast<HANDLE>(2));Enable(false);return;}
-    InvalidateRect(strip_, nullptr, FALSE);
+    const HWND window=strip_,frame=frame_;
+    const auto epoch=renderEpoch_;
+    header::VisualState visual;
+    visual.layout=layout_;
+    visual.active=GetForegroundWindow()==frame||GetActiveWindow()==frame;
+    visual.focused=GetFocus()==window;
+    visual.busy=pending_.has_value();
+    visual.canCreate=tabs_.size()<MaxTabs;
+    visual.hot=hotTarget_;visual.pressed=pressedTarget_;visual.focus=focusedTarget_;
+    // Keep metadata-owned HICONs alive across graphics/COM calls and use one
+    // copied model/layout for the complete draw.
+    std::vector<std::shared_ptr<Icon>> heldIcons;
+    for(const auto& tab:tabs_) {
+        heldIcons.push_back(tab.icon);
+        visual.tabs.push_back({tab.id,tab.metadataGeneration,tab.title,tab.icon?tab.icon->handle:folderIcon_});
+    }
+    const HRESULT result=renderer_.Paint(window,visual);
+    if(!enabled_||strip_!=window||frame_!=frame)return true;
+    if(FAILED(result)) {
+        rendererReady_=false;
+        if(strip_==window)ShowWindow(window,SW_HIDE);
+        patch::Log(L"ExplorerTabs",L"Owned header composition failed: "+std::to_wstring(result));
+        return false;
+    }
+    rendererReady_=enabled_&&strip_==window&&frame_==frame&&epoch==renderEpoch_&&
+        layout_.allocation.owner==visual.layout.allocation.owner&&
+        layout_.allocation.revision==visual.layout.allocation.revision&&
+        header::IsCurrent(frame,visual.layout.allocation);
+    if(!rendererReady_)PostMessageW(frame,header::ChangedMessage(),0,0);
+    return true;
 }
 void Controller::Paint()
 {
-    PAINTSTRUCT ps{};
-    HDC target = BeginPaint(strip_, &ps);
-    RECT r{};
-    GetClientRect(strip_, &r);
-    HDC dc = CreateCompatibleDC(target);
-    HBITMAP bitmap = CreateCompatibleBitmap(target, std::max<LONG>(1, r.right), std::max<LONG>(1, r.bottom));
-    HGDIOBJ prior = SelectObject(dc, bitmap), oldFont = SelectObject(dc, font_);
-    HIGHCONTRASTW hc{sizeof(hc)};
-    SystemParametersInfoW(SPI_GETHIGHCONTRAST, sizeof(hc), &hc, 0);
-    bool contrast = (hc.dwFlags & HCF_HIGHCONTRASTON) != 0;
-    COLORREF bg = contrast ? GetSysColor(COLOR_BTNFACE) : (dark_ ? RGB(32, 32, 32) : RGB(243, 243, 243));
-    COLORREF selected = contrast ? GetSysColor(COLOR_HIGHLIGHT) : (dark_ ? RGB(55, 55, 55) : RGB(255, 255, 255));
-    COLORREF text = contrast ? GetSysColor(COLOR_BTNTEXT) : (dark_ ? RGB(245, 245, 245) : RGB(25, 25, 25));
-    HBRUSH brush = CreateSolidBrush(bg);
-    FillRect(dc, &r, brush);
-    DeleteObject(brush);
-    SetBkMode(dc, TRANSPARENT);
-    SetTextColor(dc, text);
-    int pad = MulDiv(9, static_cast<int>(dpi_), 96), icon = MulDiv(16, static_cast<int>(dpi_), 96);
-    for (size_t i = 0; i < tabs_.size(); i++)
-    {
-        RECT t = tabRects_[i];
-        if (IsRectEmpty(&t))
-            continue;
-        if (i == active_ || static_cast<int>(i) == hot_)
-        {
-            HBRUSH b = CreateSolidBrush(i == active_ ? selected : (dark_ ? RGB(46, 46, 46) : RGB(226, 226, 226)));
-            FillRect(dc, &t, b);
-            DeleteObject(b);
-        }
-        if (i == active_)
-        {
-            HPEN pen = CreatePen(PS_SOLID, std::max(1, MulDiv(2, static_cast<int>(dpi_), 96)),
-                                 contrast ? GetSysColor(COLOR_HIGHLIGHTTEXT) : GetSysColor(COLOR_HIGHLIGHT));
-            HGDIOBJ old = SelectObject(dc, pen);
-            MoveToEx(dc, t.left, t.bottom - 1, nullptr);
-            LineTo(dc, t.right, t.bottom - 1);
-            SelectObject(dc, old);
-            DeleteObject(pen);
-        }
-        HICON tabIcon=tabs_[i].icon?tabs_[i].icon->handle:folderIcon_;
-        if (tabIcon)
-            DrawIconEx(dc, t.left + pad, (t.bottom - icon) / 2, tabIcon, icon, icon, 0, nullptr, DI_NORMAL);
-        RECT label = t;
-        label.left += pad + icon + pad;
-        label.right -= pad * 3;
-        if (contrast && i == active_)
-            SetTextColor(dc, GetSysColor(COLOR_HIGHLIGHTTEXT));
-        DrawTextW(dc, tabs_[i].title.c_str(), -1, &label, DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX);
-        SetTextColor(dc, text);
-        int cx = t.right - pad * 2, cy = t.bottom / 2;
-        HPEN pen = CreatePen(PS_SOLID, 1, text);
-        HGDIOBJ old = SelectObject(dc, pen);
-        int d = MulDiv(3, static_cast<int>(dpi_), 96);
-        MoveToEx(dc, cx - d, cy - d, nullptr);
-        LineTo(dc, cx + d + 1, cy + d + 1);
-        MoveToEx(dc, cx + d, cy - d, nullptr);
-        LineTo(dc, cx - d - 1, cy + d + 1);
-        SelectObject(dc, old);
-        DeleteObject(pen);
-    }
-    DrawTextW(dc, L"+", 1, &plusRect_, DT_SINGLELINE | DT_CENTER | DT_VCENTER);
-    DrawTextW(dc, L"\x2304", 1, &overflowRect_, DT_SINGLELINE | DT_CENTER | DT_VCENTER);
-    BitBlt(target, 0, 0, r.right, r.bottom, dc, 0, 0, SRCCOPY);
-    SelectObject(dc, oldFont);
-    SelectObject(dc, prior);
-    DeleteObject(bitmap);
-    DeleteDC(dc);
-    EndPaint(strip_, &ps);
+    const HWND window=strip_;
+    PAINTSTRUCT paint{};
+    BeginPaint(window,&paint);
+    const bool success=Render();
+    EndPaint(window,&paint);
+    if(!success)HeaderFailed();
 }
 void Controller::Remember()
 {
     if (tabs_.empty() || active_ >= tabs_.size() || pending_)
         return;
-    auto s = Capture(browser_.Get());
-    auto &t = tabs_[active_];
+    const auto id=tabs_[active_].id;
+    ComPtr<IShellBrowser> browser=browser_;
+    auto s = Capture(browser.Get());
+    const int index=Index(id);
+    if(index<0||pending_)return;
+    auto &t = tabs_[index];
     if (!t.history.empty() && Equal(s.folder, t.history[t.position].folder))
     {
         s.label=t.history[t.position].label;
@@ -1593,25 +1601,32 @@ bool Controller::Navigate(ULONGLONG id, size_t position, bool changeTab)
 {
     if (pending_ || !browser_)
         return false;
-    auto found = std::find_if(tabs_.begin(), tabs_.end(), [&](auto &t) { return t.id == id; });
-    if (found == tabs_.end() || position >= found->history.size())
+    int index=Index(id);
+    if (index<0 || position >= tabs_[index].history.size())
         return false;
     Remember();
+    index=Index(id);
+    if(!enabled_||!browser_||pending_||index<0||position>=tabs_[index].history.size())return false;
     Pending pending;
     pending.id = id;
     pending.position = position;
     pending.changeTab = changeTab;
-    pending.expected = found->history[position].folder;
+    pending.expected = tabs_[index].history[position].folder;
     pending.start = GetTickCount64();
     pending_ = std::move(pending);
-    HRESULT hr = browser_->BrowseObject(pending_->expected.p,
+    if(strip_)InvalidateRect(strip_,nullptr,FALSE);
+    const Pidl destination=pending_->expected;
+    ComPtr<IShellBrowser> browser=browser_;
+    HRESULT hr = browser->BrowseObject(destination.p,
                                         SBSP_SAMEBROWSER | SBSP_ABSOLUTE | SBSP_CREATENOHISTORY | SBSP_PLAYNOSOUND);
     if (FAILED(hr))
     {
-        pending_.reset();
+        if(pending_&&pending_->id==id)pending_.reset();
+        if(strip_)InvalidateRect(strip_,nullptr,FALSE);
         patch::Log(L"ExplorerTabs", L"Shell navigation rejected: " + std::to_wstring(hr));
         return false;
     }
+    if(!enabled_||!frame_)return false;
     SetTimer(frame_, MaintenanceTimer, 100, nullptr);
     PostMessageW(frame_, SyncMessage, 0, 0);
     return true;
@@ -1628,8 +1643,9 @@ void Controller::Synchronize()
 {
     if (tearingDown_ || !browser_)
         return;
-    auto s = Capture(browser_.Get());
-    if (!s.folder)
+    const HWND frame=frame_;ComPtr<IShellBrowser> browser=browser_;
+    auto s = Capture(browser.Get());
+    if (!s.folder||tearingDown_||!frame_||frame_!=frame||browser_.Get()!=browser.Get())
         return;
     if (tabs_.empty())
     {
@@ -1681,35 +1697,46 @@ void Controller::NewTab(const Pidl *folder)
 {
     if (tabs_.size() >= MaxTabs || pending_ || tabs_.empty())
         return;
+    const Pidl requested=folder?*folder:Pidl{};
     Remember();
+    if(!enabled_||tabs_.empty()||pending_)return;
     Tab t;
     ViewState state;
-    state.folder = folder && *folder ? *folder : tabs_[active_].history[tabs_[active_].position].folder;
+    state.folder = requested ? requested : tabs_[active_].history[tabs_[active_].position].folder;
     t.title = CachedName(state);
     t.history.push_back(std::move(state));
     ULONGLONG id = t.id;
     tabs_.push_back(std::move(t));
-    if (!Navigate(id, 0, true))
-        tabs_.pop_back();
+    if (!Navigate(id, 0, true)) {const int index=Index(id);if(index>=0)tabs_.erase(tabs_.begin()+index);}
     TabChanged();
 }
-void Controller::Close(size_t index)
+void Controller::Close(size_t index,const std::vector<BYTE>* expected)
 {
     if (index >= tabs_.size() || pending_)
         return;
+    if(expected&&Serialize(tabs_[index],frame_)!=*expected)return;
     if (tabs_.size() == 1)
     {
         if (frame_)
             PostMessageW(frame_, WM_SYSCOMMAND, SC_CLOSE, 0);
         return;
     }
+    const auto id=tabs_[index].id;
     Remember();
+    int current=Index(id);
+    if(!enabled_||current<0||pending_)return;
+    if(expected&&Serialize(tabs_[current],frame_)!=*expected)return;
+    index=static_cast<size_t>(current);
     if (index == active_)
     {
         size_t target = index + 1 < tabs_.size() ? index + 1 : index - 1;
         if (!Activate(target))
             return;
     }
+    current=Index(id);
+    if(!enabled_||current<0)return;
+    if(expected&&Serialize(tabs_[current],frame_)!=*expected)return;
+    index=static_cast<size_t>(current);
     closed_.push_back(tabs_[index]);
     if (closed_.size() > 32)
         closed_.erase(closed_.begin());
@@ -1732,8 +1759,7 @@ void Controller::Reopen()
     tabs_.push_back(std::move(t));
     if (!Navigate(id, position, true))
     {
-        closed_.push_back(std::move(tabs_.back()));
-        tabs_.pop_back();
+        const int index=Index(id);if(index>=0){closed_.push_back(std::move(tabs_[index]));tabs_.erase(tabs_.begin()+index);}
     }
     TabChanged();
 }
@@ -1754,7 +1780,8 @@ void Controller::TabChanged()
     if (enabled_ && strip_)
     {
         Layout();
-        NotifyWinEvent(EVENT_OBJECT_SELECTION, strip_, OBJID_CLIENT, static_cast<LONG>(active_ + 1));
+        if(!TargetChild(focusedTarget_)&&active_<tabs_.size())focusedTarget_={header::TargetKind::Tab,tabs_[active_].id};
+        NotifyWinEvent(EVENT_OBJECT_SELECTION, strip_, OBJID_CLIENT,active_<tabs_.size()?TargetChild({header::TargetKind::Tab,tabs_[active_].id}):CHILDID_SELF);
         NotifyWinEvent(EVENT_OBJECT_REORDER, strip_, OBJID_CLIENT, CHILDID_SELF);
     }
     UpdateNavigationButtons();
@@ -1787,14 +1814,15 @@ void Controller::AcceptMetadata(ULONGLONG ticket)
             if(!result->name.empty()){tab->title=result->name.substr(0,256);tab->history[tab->position].label=tab->title;}
             tab->icon=std::move(result->icon);
             if(strip_)InvalidateRect(strip_,nullptr,FALSE);
-            NotifyWinEvent(EVENT_OBJECT_NAMECHANGE,strip_,OBJID_CLIENT,static_cast<LONG>((tab-tabs_.begin())+1));
+            NotifyWinEvent(EVENT_OBJECT_NAMECHANGE,strip_,OBJID_CLIENT,TargetChild({header::TargetKind::Tab,tab->id}));
+            NotifyWinEvent(EVENT_OBJECT_NAMECHANGE,strip_,OBJID_CLIENT,TargetChild({header::TargetKind::Close,tab->id}));
         }
     }
     RefreshMetadata();
 }
 void Controller::SaveSession()
 {
-    if (tabs_.empty())
+    if (!hasUsableSession_ || tabs_.empty())
         return;
     auto encode = [&](const std::vector<Tab> &tabs) {
         Writer writer;
@@ -1833,6 +1861,58 @@ void Controller::SaveSession()
         RegSetValueExW(key, L"LastSession", 0, REG_BINARY, w.bytes.data(), static_cast<DWORD>(w.bytes.size()));
         RegCloseKey(key);
     }
+}
+std::wstring WindowSessionName(HWND frame)
+{
+    return L"Window."+std::to_wstring(GetCurrentProcessId())+L"."+std::to_wstring(reinterpret_cast<ULONG_PTR>(frame));
+}
+ULONGLONG ProcessBirth()
+{
+    FILETIME created{},exited{},kernel{},user{};if(!GetProcessTimes(GetCurrentProcess(),&created,&exited,&kernel,&user))return 0;
+    ULARGE_INTEGER value{};value.LowPart=created.dwLowDateTime;value.HighPart=created.dwHighDateTime;return value.QuadPart;
+}
+bool Controller::SaveWindowSession()
+{
+    if(!frame_||closingFrame_||tabs_.empty()||ownerThread_!=GetCurrentThreadId())return false;
+    if(pending_){Synchronize();if(pending_)return false;}
+    const HWND window=frame_;Remember();if(frame_!=window||tabs_.empty()||active_>=tabs_.size())return false;
+    const auto nonce=static_cast<ULONG_PTR>(GetTickCount64()^reinterpret_cast<ULONG_PTR>(this));
+    Writer writer;writer.number(PacketMagic);writer.number(DWORD{4});writer.number(ProcessBirth());writer.number(static_cast<ULONGLONG>(reinterpret_cast<ULONG_PTR>(frame_)));writer.number(static_cast<ULONGLONG>(nonce));
+    writer.number(static_cast<DWORD>(tabs_.size()));writer.number(static_cast<DWORD>(active_));
+    for(const auto& tab:tabs_)writer.tab(tab);if(!writer.ok)return false;
+    HKEY key{};if(RegCreateKeyExW(HKEY_CURRENT_USER,SessionKey,0,nullptr,0,KEY_SET_VALUE,nullptr,&key,nullptr)!=ERROR_SUCCESS)return false;
+    const auto name=WindowSessionName(frame_);
+    const bool saved=RegSetValueExW(key,name.c_str(),0,REG_BINARY,writer.bytes.data(),static_cast<DWORD>(writer.bytes.size()))==ERROR_SUCCESS;
+    RegCloseKey(key);return saved&&SetPropW(frame_,WindowSessionProperty,reinterpret_cast<HANDLE>(nonce));
+}
+void Controller::RemoveWindowSession()
+{
+    if(!frame_)return;HKEY key{};
+    if(RegOpenKeyExW(HKEY_CURRENT_USER,SessionKey,0,KEY_SET_VALUE,&key)==ERROR_SUCCESS){RegDeleteValueW(key,WindowSessionName(frame_).c_str());RegCloseKey(key);}
+    RemovePropW(frame_,WindowSessionProperty);
+}
+bool Controller::LoadWindowSession()
+{
+    const auto nonce=reinterpret_cast<ULONG_PTR>(GetPropW(frame_,WindowSessionProperty));if(!nonce)return false;
+    const auto name=WindowSessionName(frame_);DWORD size{};
+    if(RegGetValueW(HKEY_CURRENT_USER,SessionKey,name.c_str(),RRF_RT_REG_BINARY,nullptr,nullptr,&size)!=ERROR_SUCCESS||size>MaxPacket||size<40)return false;
+    std::vector<BYTE> bytes(size);if(RegGetValueW(HKEY_CURRENT_USER,SessionKey,name.c_str(),RRF_RT_REG_BINARY,nullptr,bytes.data(),&size)!=ERROR_SUCCESS)return false;
+    Reader reader{bytes.data(),size};if(reader.number<DWORD>()!=PacketMagic||reader.number<DWORD>()!=4||reader.number<ULONGLONG>()!=ProcessBirth()||reader.number<ULONGLONG>()!=reinterpret_cast<ULONG_PTR>(frame_)||reader.number<ULONGLONG>()!=nonce)return false;
+    const auto count=reader.number<DWORD>(),active=reader.number<DWORD>();if(!count||count>MaxTabs||active>=count)return false;
+    std::vector<Tab> loaded;for(DWORD i=0;i<count&&reader.ok;++i)loaded.push_back(reader.tab());if(!reader.ok||reader.left||loaded.size()!=count)return false;
+    // Keep the snapshot until its actual current location is ready. This also
+    // avoids replacing a valid old session merely because a provider is late.
+    const HWND window=frame_;ComPtr<IShellBrowser> browser=browser_;
+    auto current=Capture(browser.Get());
+    if(!enabled_||tearingDown_||frame_!=window||browser_.Get()!=browser.Get()||reinterpret_cast<ULONG_PTR>(GetPropW(window,WindowSessionProperty))!=nonce)return true;
+    if(!current.folder){SetTimer(frame_,MaintenanceTimer,100,nullptr);return true;}
+    auto& selected=loaded[active];
+    if(!Equal(current.folder,selected.history[selected.position].folder)) {
+        selected.history.erase(selected.history.begin()+static_cast<ptrdiff_t>(selected.position+1),selected.history.end());
+        selected.history.push_back(std::move(current));selected.position=selected.history.size()-1;
+    }
+    tabs_=std::move(loaded);active_=active;RemoveWindowSession();
+    TabChanged();return true;
 }
 void Controller::LoadSession()
 {
@@ -1919,9 +1999,9 @@ void Controller::UpdateNavigationButtons()
 }
 void Controller::HistoryMenu(bool back, POINT screen)
 {
-    if (tabs_.empty() || pending_)
+    if (!Ready()||tabs_.empty() || pending_)
         return;
-    auto &t = tabs_[active_];
+    const Tab t = tabs_[active_];
     HMENU menu = CreatePopupMenu();
     std::vector<size_t> entries;
     if (back)
@@ -1935,40 +2015,48 @@ void Controller::HistoryMenu(bool back, POINT screen)
             entries.push_back(i);
     }
     for (size_t i = 0; i < entries.size(); i++)
-        AppendMenuW(menu, MF_STRING, 100 + static_cast<UINT_PTR>(i), CachedName(t.history[entries[i]]).c_str());
+    {auto label=CachedName(t.history[entries[i]]);for(size_t at=0;(at=label.find(L'&',at))!=std::wstring::npos;at+=2)label.insert(at,1,L'&');
+        AppendMenuW(menu, MF_STRING, 100 + static_cast<UINT_PTR>(i), label.c_str());}
+    ++menuDepth_;
     UINT selected = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON, screen.x, screen.y, 0, frame_, nullptr);
+    --menuDepth_;
     DestroyMenu(menu);
-    if (selected >= 100 && selected - 100 < entries.size())
-        Navigate(t.id, entries[selected - 100], false);
+    const int index=Index(t.id);
+    if (!Ready()||pending_||index<0||selected<100||selected-100>=entries.size())return;
+    const auto& destination=t.history[entries[selected-100]].folder;
+    // A position alone is not a history destination after a nested navigation.
+    const auto& current=tabs_[index];
+    if(current.history.size()!=t.history.size())return;
+    for(size_t i=0;i<t.history.size();++i)if(!Equal(current.history[i].folder,t.history[i].folder))return;
+    if(Equal(current.history[entries[selected-100]].folder,destination))Navigate(t.id,entries[selected-100],false);
 }
 int Controller::Hit(POINT point) const
 {
-    for (size_t i = 0; i < tabRects_.size(); i++)
-        if (PtInRect(&tabRects_[i], point))
-            return static_cast<int>(i);
-    if (PtInRect(&plusRect_, point))
-        return -2;
-    if (PtInRect(&overflowRect_, point))
-        return -3;
+    if(!rendererReady_||!header::IsCurrent(frame_,layout_.allocation))return -1;
+    const auto target=layout_.Hit(point);
+    if(target.kind==header::TargetKind::Tab||target.kind==header::TargetKind::Close)
+        for(size_t i=0;i<tabs_.size();++i)if(tabs_[i].id==target.tab)return static_cast<int>(i);
+    if(target.kind==header::TargetKind::NewTab)return -2;
+    if(target.kind==header::TargetKind::Overflow)return -3;
     return -1;
-}
-bool Controller::HitClose(int i, POINT p) const
-{
-    if (i < 0 || static_cast<size_t>(i) >= tabRects_.size())
-        return false;
-    RECT r = tabRects_[i];
-    r.left = r.right - MulDiv(30, static_cast<int>(dpi_), 96);
-    return PtInRect(&r, p) != FALSE;
 }
 void Controller::Menu(int hit, POINT point)
 {
+    if(!Ready()||pending_)return;
+    const auto owner=layout_.allocation.owner;
+    const auto id=hit>=0&&static_cast<size_t>(hit)<tabs_.size()?tabs_[hit].id:0;
+    std::vector<ULONGLONG> identities;
     HMENU menu = CreatePopupMenu();
     constexpr UINT New = 1, CloseTab = 2, ReopenTab = 3, Duplicate = 4, DetachTabCommand = 5, Options = 6;
     if (hit == -3)
     {
         for (size_t i = 0; i < tabs_.size(); i++)
+        {
+            identities.push_back(tabs_[i].id);
+            auto label=tabs_[i].title;for(size_t at=0;(at=label.find(L'&',at))!=std::wstring::npos;at+=2)label.insert(at,1,L'&');
             AppendMenuW(menu, MF_STRING | (i == active_ ? MF_CHECKED : 0), 100 + static_cast<UINT_PTR>(i),
-                        tabs_[i].title.c_str());
+                        label.c_str());
+        }
         AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
     }
     AppendMenuW(menu, MF_STRING, New, L"New tab\tCtrl+T");
@@ -1981,12 +2069,16 @@ void Controller::Menu(int hit, POINT point)
         AppendMenuW(menu, MF_STRING, CloseTab, L"Close tab\tCtrl+W");
     }
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
-    AppendMenuW(menu, MF_STRING, Options, L"Windows 10 patch options...");
+    AppendMenuW(menu, MF_STRING, Options, L"Options...");
+    ++menuDepth_;
     UINT selected = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON, point.x, point.y, 0, frame_, nullptr);
+    --menuDepth_;
     DestroyMenu(menu);
-    if (selected >= 100 && selected - 100 < tabs_.size())
+    if(!Ready()||pending_||layout_.allocation.owner!=owner)return;
+    hit=Index(id);
+    if (selected >= 100 && selected - 100 < identities.size())
     {
-        Activate(selected - 100);
+        const int target=Index(identities[selected-100]);if(target>=0)Activate(target);
         return;
     }
     if (selected == New)
@@ -1997,45 +2089,93 @@ void Controller::Menu(int hit, POINT point)
         Reopen();
     else if (selected == Duplicate && hit >= 0)
     {
-        Pidl id = tabs_[hit].history[tabs_[hit].position].folder;
-        NewTab(&id);
+        Pidl folder = tabs_[hit].history[tabs_[hit].position].folder;
+        NewTab(&folder);
     }
     else if (selected == DetachTabCommand && hit >= 0)
         DetachTab(hit);
     else if (selected == Options)
         patch::OpenOptions(frame_);
 }
+void Controller::CancelPointer()
+{
+    pressedTarget_={};pressedButton_=0;
+    if(strip_&&GetCapture()==strip_)ReleaseCapture();
+    if(strip_)InvalidateRect(strip_,nullptr,FALSE);
+}
+void Controller::SystemMenu(bool install)
+{
+    if(!install) {
+        if(systemMenu_&&IsMenu(systemMenu_))for(UINT id:{focusMenuId_,focusMenuId_+1}) {
+            MENUITEMINFOW item{sizeof(item)};item.fMask=MIIM_DATA;
+            if(GetMenuItemInfoW(systemMenu_,id,FALSE,&item)&&item.dwItemData==reinterpret_cast<ULONG_PTR>(this))DeleteMenu(systemMenu_,id,MF_BYCOMMAND);
+        }
+        systemMenu_=nullptr;focusMenuId_=0;return;
+    }
+    systemMenu_=GetSystemMenu(frame_,FALSE);if(!systemMenu_)return;
+    for(UINT id=0x1ED0;id<0xE000;id+=16)if(GetMenuState(systemMenu_,id,MF_BYCOMMAND)==static_cast<UINT>(-1)&&GetMenuState(systemMenu_,id+1,MF_BYCOMMAND)==static_cast<UINT>(-1)){focusMenuId_=id;break;}
+    if(!focusMenuId_){systemMenu_=nullptr;return;}
+    MENUITEMINFOW item{sizeof(item)};item.fMask=MIIM_ID|MIIM_FTYPE|MIIM_DATA;item.fType=MFT_SEPARATOR;item.wID=focusMenuId_+1;item.dwItemData=reinterpret_cast<ULONG_PTR>(this);
+    InsertMenuItemW(systemMenu_,GetMenuItemCount(systemMenu_),TRUE,&item);
+    item.fMask=MIIM_ID|MIIM_STRING|MIIM_DATA;item.wID=focusMenuId_;item.dwTypeData=const_cast<wchar_t*>(L"Focus folder &tabs");
+    InsertMenuItemW(systemMenu_,GetMenuItemCount(systemMenu_),TRUE,&item);
+}
+void Controller::FocusTarget(header::TargetId target)
+{
+    if(!Ready()||!TargetChild(target))return;
+    focusedTarget_=target;
+    SetFocus(strip_);
+    NotifyWinEvent(EVENT_OBJECT_FOCUS,strip_,OBJID_CLIENT,TargetChild(target));
+    InvalidateRect(strip_,nullptr,FALSE);
+}
+POINT Controller::MenuAnchor(header::TargetId target) const
+{
+    RECT bounds{};ChildRect(TargetChild(target),bounds);return {bounds.left,bounds.bottom};
+}
+void Controller::InvokeTarget(header::TargetId target)
+{
+    if(!Ready()||pending_)return;
+    int index=Index(target.tab);
+    if(target.kind==header::TargetKind::Tab&&index>=0)Activate(index);
+    else if(target.kind==header::TargetKind::Close&&index>=0)Close(index);
+    else if(target.kind==header::TargetKind::NewTab)NewTab();
+    else if(target.kind==header::TargetKind::Overflow)Menu(-3,MenuAnchor(target));
+}
 void Controller::Mouse(UINT message, WPARAM, LPARAM data)
 {
+    if(!Ready()){CancelPointer();return;}
     POINT point{GET_X_LPARAM(data), GET_Y_LPARAM(data)};
     int hit = Hit(point);
     if (message == WM_MOUSEMOVE)
     {
-        if (hot_ != hit)
+        const auto target=layout_.Hit(point);
+        if (hotTarget_!=target)
         {
-            hot_ = hit;
+            hotTarget_=target;
             InvalidateRect(strip_, nullptr, FALSE);
         }
         TRACKMOUSEEVENT t{sizeof(t), TME_LEAVE, strip_, 0};
         TrackMouseEvent(&t);
-        if (pressed_ >= 0 && !pressedClose_ && (GetKeyState(VK_LBUTTON) & 0x8000) && !inDrag_)
+        if (pressedButton_==WM_LBUTTONDOWN&&pressedTarget_.kind==header::TargetKind::Tab&& (GetKeyState(VK_LBUTTON) & 0x8000) && !inDrag_)
         {
             if (abs(point.x - dragStart_.x) >= GetSystemMetrics(SM_CXDRAG) ||
                 abs(point.y - dragStart_.y) >= GetSystemMetrics(SM_CYDRAG))
             {
-                int source = pressed_;
-                pressed_ = -1;
-                ReleaseCapture();
-                StartDrag(source);
+                const auto source=pressedTarget_.tab;
+                CancelPointer();
+                const int index=Index(source);if(index>=0)StartDrag(index);
             }
         }
         return;
     }
-    if (message == WM_LBUTTONDOWN)
+    if (message == WM_LBUTTONDOWN||message==WM_MBUTTONDOWN)
     {
-        SetFocus(strip_);
-        pressed_ = hit;
-        pressedClose_ = HitClose(hit, point);
+        CancelPointer();
+        if(pending_)return;
+        FocusTarget(layout_.Hit(point));
+        pressedButton_=message;
+        pressedTarget_=layout_.Hit(point);hotTarget_=pressedTarget_;
+        InvalidateRect(strip_,nullptr,FALSE);
         dragStart_ = point;
         SetCapture(strip_);
         if (hit == -1)
@@ -2049,30 +2189,21 @@ void Controller::Mouse(UINT message, WPARAM, LPARAM data)
     }
     if (message == WM_LBUTTONUP)
     {
-        ReleaseCapture();
-        int was = pressed_;
-        pressed_ = -1;
-        if (was != hit)
-            return;
-        if (hit >= 0)
-        {
-            if (pressedClose_ && HitClose(hit, point))
-                Close(hit);
-            else
-                Activate(hit);
-        }
-        else if (hit == -2)
-            NewTab();
-        else if (hit == -3)
-        {
-            ClientToScreen(strip_, &point);
-            Menu(-3, point);
-        }
+        const auto was=pressedTarget_;
+        const bool valid=pressedButton_==WM_LBUTTONDOWN&&GetCapture()==strip_&&was==layout_.Hit(point);
+        // Capture-change cleanup can run synchronously during ReleaseCapture.
+        // Preserve the intended ordinary up action before releasing it.
+        CancelPointer();
+        if(valid)InvokeTarget(was);
         return;
     }
-    if (message == WM_MBUTTONUP && hit >= 0)
+    if (message == WM_MBUTTONUP)
     {
-        Close(hit);
+        const auto was=pressedTarget_;
+        const auto now=layout_.Hit(point);
+        const bool valid=pressedButton_==WM_MBUTTONDOWN&&GetCapture()==strip_&&was.tab&&was.tab==now.tab&&was==now;
+        CancelPointer();
+        if(valid)InvokeTarget({header::TargetKind::Close,was.tab});
         return;
     }
     if (message == WM_RBUTTONUP)
@@ -2094,8 +2225,17 @@ LRESULT CALLBACK Controller::StripProc(HWND h, UINT m, WPARAM w, LPARAM l)
     }
     if (!self)
         return DefWindowProcW(h, m, w, l);
+    self->AddRef();
+    struct Reference {Controller* owner;~Reference(){owner->Release();}} reference{self};
     switch (m)
     {
+    case WM_NCHITTEST:
+    {
+        POINT point{GET_X_LPARAM(l),GET_Y_LPARAM(l)};
+        ScreenToClient(h,&point);
+        if(self->Hit(point)==-1)return HTTRANSPARENT;
+        break;
+    }
     case WM_PAINT:
         self->Paint();
         return 0;
@@ -2104,43 +2244,73 @@ LRESULT CALLBACK Controller::StripProc(HWND h, UINT m, WPARAM w, LPARAM l)
     case WM_MOUSEMOVE:
     case WM_LBUTTONDOWN:
     case WM_LBUTTONUP:
+    case WM_MBUTTONDOWN:
     case WM_MBUTTONUP:
     case WM_RBUTTONUP:
     case WM_LBUTTONDBLCLK:
         self->Mouse(m, w, l);
         return 0;
     case WM_MOUSELEAVE:
-        self->hot_ = -1;
+        self->hotTarget_={};
         InvalidateRect(h, nullptr, FALSE);
         return 0;
+    case WM_CAPTURECHANGED:
+    case WM_CANCELMODE:
+        self->CancelPointer();
+        break;
     case WM_GETOBJECT:
         if (static_cast<LONG>(l) == OBJID_CLIENT)
             return LresultFromObject(IID_IAccessible, w, static_cast<IAccessible *>(self));
         break;
     case WM_SETFOCUS:
-        NotifyWinEvent(EVENT_OBJECT_FOCUS, h, OBJID_CLIENT, static_cast<LONG>(self->active_ + 1));
+        if(!self->TargetChild(self->focusedTarget_)&&!self->tabs_.empty())self->focusedTarget_={header::TargetKind::Tab,self->tabs_[self->active_].id};
+        NotifyWinEvent(EVENT_OBJECT_FOCUS, h, OBJID_CLIENT,self->TargetChild(self->focusedTarget_));
+        InvalidateRect(h,nullptr,FALSE);
         break;
+    case WM_KILLFOCUS:
+        InvalidateRect(h,nullptr,FALSE);
+        break;
+    case WM_GETDLGCODE:
+    {
+        const auto* key=reinterpret_cast<MSG*>(l);
+        return DLGC_WANTARROWS|((key&&(key->wParam==VK_SPACE||key->wParam==VK_RETURN||key->wParam==VK_APPS))?DLGC_WANTMESSAGE:0);
+    }
+    case WM_CONTEXTMENU:
+    {
+        const auto target=self->focusedTarget_;
+        POINT point{GET_X_LPARAM(l),GET_Y_LPARAM(l)};
+        if(point.x==-1&&point.y==-1)point=self->MenuAnchor(target);
+        const int index=self->Index(target.tab);
+        self->Menu(target.kind==header::TargetKind::Overflow?-3:index,point);
+        return 0;
+    }
     case WM_KEYDOWN:
-        if (w == VK_LEFT && self->active_ > 0)
+        if (w == VK_LEFT || w==VK_RIGHT)
         {
-            self->Activate(self->active_ - 1);
+            LONG child=self->TargetChild(self->focusedTarget_);
+            if(self->focusedTarget_.kind==header::TargetKind::Tab) {
+                int index=self->Index(self->focusedTarget_.tab)+(w==VK_RIGHT?1:-1);
+                if(index>=0&&static_cast<size_t>(index)<self->tabs_.size()) {
+                    auto target=header::TargetId{header::TargetKind::Tab,self->tabs_[index].id};
+                    self->FocusTarget(target);self->InvokeTarget(target);
+                }
+            } else {
+                child+=w==VK_RIGHT?1:-1;
+                auto target=self->ChildTarget(child);if(target.kind!=header::TargetKind::None)self->FocusTarget(target);
+            }
             return 0;
         }
-        if (w == VK_RIGHT && self->active_ + 1 < self->tabs_.size())
-        {
-            self->Activate(self->active_ + 1);
-            return 0;
-        }
+        if(w==VK_SPACE||w==VK_RETURN){self->InvokeTarget(self->focusedTarget_);return 0;}
+        if(w==VK_ESCAPE){self->CancelPointer();return 0;}
         if (w == VK_DELETE)
         {
-            self->Close(self->active_);
+            const int index=self->Index(self->focusedTarget_.tab);if(index>=0)self->Close(index);
             return 0;
         }
         if (w == VK_APPS || (w == VK_F10 && (GetKeyState(VK_SHIFT) & 0x8000)))
         {
-            POINT p{};
-            GetCursorPos(&p);
-            self->Menu(static_cast<int>(self->active_), p);
+            const auto target=self->focusedTarget_;
+            self->Menu(target.kind==header::TargetKind::Overflow?-3:self->Index(target.tab),self->MenuAnchor(target));
             return 0;
         }
         break;
@@ -2156,11 +2326,30 @@ LRESULT CALLBACK Controller::FrameProc(HWND h, UINT m, WPARAM w, LPARAM l, UINT_
     self->AddRef();
     LRESULT result = 0;
     bool handled = false;
-    if (m == patch::mvp::DetachMessage() && self->selfHosted_)
+    if(m==WM_NCHITTEST) {
+        // Explorer and DWM get first refusal for every caption button, border
+        // and native region. Only our current, presented targets become client.
+        result=DefSubclassProc(h,m,w,l);
+        if(result==HTCAPTION&&self->strip_&&self->rendererReady_&&IsWindowVisible(self->strip_)) {
+            POINT point{GET_X_LPARAM(l),GET_Y_LPARAM(l)};
+            ScreenToClient(self->strip_,&point);
+            if(self->Hit(point)!=-1)result=HTCLIENT;
+        }
+        handled=true;
+    }
+    else if (m == patch::mvp::DetachMessage() && self->selfHosted_)
     {
-        self->selfHosted_ = false;
+        const auto priorSnapshot=GetPropW(h,WindowSessionProperty);
+        const bool saved=self->SaveWindowSession();
+        const auto request=patch::mvp::DetachRequest(w);
+        if(request&&reinterpret_cast<ULONG_PTR>(GetPropW(reinterpret_cast<HWND>(l),patch::mvp::StopRequest))!=request){
+            if(saved&&!priorSnapshot&&self->frame_==h&&self->selfHosted_)self->RemoveWindowSession();
+            self->Release();return 0;
+        }
+        if(patch::mvp::PreserveSession(w)&&!saved){self->Release();return 0;}
+        const bool owned=std::exchange(self->selfHosted_,false);
         self->Detach();
-        self->Release();
+        if(owned)self->Release();
         handled = true;
         result = 1;
     }
@@ -2169,11 +2358,16 @@ LRESULT CALLBACK Controller::FrameProc(HWND h, UINT m, WPARAM w, LPARAM l, UINT_
         self->Enable((patch::LoadConfig().flags & patch::ExplorerTabs) != 0);
         handled = true;
     }
+    else if(m==WM_SYSCOMMAND&&self->focusMenuId_&&(w&0xFFF0)==self->focusMenuId_) {
+        if(self->Ready()&&!self->tabs_.empty())self->FocusTarget({header::TargetKind::Tab,self->tabs_[self->active_].id});
+        handled=true;
+    }
     else if (m == SyncMessage)
     {
         self->Synchronize();
         handled = true;
     }
+    else if(m==header::ChangedMessage()) {self->Layout();handled=true;}
     else if (m == IconMessage)
     {
         if(static_cast<ULONGLONG>(l)==self->metadataCookie_)self->AcceptMetadata(static_cast<ULONGLONG>(w));
@@ -2183,8 +2377,9 @@ LRESULT CALLBACK Controller::FrameProc(HWND h, UINT m, WPARAM w, LPARAM l, UINT_
     {
         if (self->restoreState_)
         {
-            Restore(self->browser_.Get(), *self->restoreState_);
-            self->restoreTries_++;
+            const ViewState state=*self->restoreState_;ComPtr<IShellBrowser> browser=self->browser_;
+            Restore(browser.Get(),state);
+            if(self->restoreState_&&self->browser_.Get()==browser.Get())self->restoreTries_++;
         }
         handled = true;
     }
@@ -2217,17 +2412,26 @@ LRESULT CALLBACK Controller::FrameProc(HWND h, UINT m, WPARAM w, LPARAM l, UINT_
     {
         if (m == WM_SIZE || m == WM_WINDOWPOSCHANGED || m == WM_DPICHANGED)
         {
+            header::Invalidate(h);
             result = DefSubclassProc(h, m, w, l);
-            self->Layout();
+            self->Layout(true);
             handled = true;
         }
         else if (m == WM_THEMECHANGED || m == WM_SETTINGCHANGE || m == WM_SYSCOLORCHANGE)
         {
+            header::Invalidate(h);
             result = DefSubclassProc(h, m, w, l);
-            self->dark_ = Dark();
-            self->RebuildFont();
+            self->RefreshAppearance();
             self->Layout();
             handled = true;
+        }
+        else if(m==WM_ACTIVATE||m==WM_NCACTIVATE) {
+            result=DefSubclassProc(h,m,w,l);
+            if(m==WM_ACTIVATE&&LOWORD(w)==WA_INACTIVE) {
+                self->hotTarget_={};self->CancelPointer();
+            }
+            if(self->strip_)InvalidateRect(self->strip_,nullptr,FALSE);
+            handled=true;
         }
         else if (m == WM_CLOSE)
         {
@@ -2236,6 +2440,8 @@ LRESULT CALLBACK Controller::FrameProc(HWND h, UINT m, WPARAM w, LPARAM l, UINT_
         }
         else if (m == WM_NCDESTROY)
         {
+            self->RemoveWindowSession();
+            self->closingFrame_=true;
             bool owned = std::exchange(self->selfHosted_, false);
             self->Detach();
             if (owned) self->Release();
@@ -2249,6 +2455,8 @@ LRESULT CALLBACK Controller::FrameProc(HWND h, UINT m, WPARAM w, LPARAM l, UINT_
 LRESULT CALLBACK Controller::TravelProc(HWND h, UINT m, WPARAM w, LPARAM l, UINT_PTR, DWORD_PTR p)
 {
     auto *self = reinterpret_cast<Controller *>(p);
+    self->AddRef();
+    struct Reference {Controller* owner;~Reference(){owner->Release();}} reference{self};
     if (self->enabled_)
     {
         if (m == WM_COMMAND)
@@ -2268,8 +2476,8 @@ LRESULT CALLBACK Controller::TravelProc(HWND h, UINT m, WPARAM w, LPARAM l, UINT
                 auto *drop = reinterpret_cast<NMTOOLBARW *>(l);
                 if (drop->iItem == self->backCommand_ || drop->iItem == self->forwardCommand_)
                 {
-                    POINT point{};
-                    GetCursorPos(&point);
+                    POINT point{drop->rcButton.left,drop->rcButton.bottom};
+                    ClientToScreen(hdr->hwndFrom,&point);
                     self->HistoryMenu(drop->iItem == self->backCommand_, point);
                     return TBDDRET_DEFAULT;
                 }
@@ -2278,8 +2486,12 @@ LRESULT CALLBACK Controller::TravelProc(HWND h, UINT m, WPARAM w, LPARAM l, UINT
         if (m == WM_CONTEXTMENU)
         {
             POINT point{GET_X_LPARAM(l), GET_Y_LPARAM(l)};
-            POINT local = point;
             HWND toolbar = FindWindowExW(h, nullptr, TOOLBARCLASSNAMEW, nullptr);
+            if(point.x==-1&&point.y==-1&&toolbar) {
+                const auto hot=SendMessageW(toolbar,TB_GETHOTITEM,0,0);RECT bounds{};
+                if(hot>=0&&SendMessageW(toolbar,TB_GETITEMRECT,hot,reinterpret_cast<LPARAM>(&bounds))) {point={bounds.left,bounds.bottom};ClientToScreen(toolbar,&point);}
+            }
+            POINT local = point;
             ScreenToClient(toolbar, &local);
             LRESULT index = SendMessageW(toolbar, TB_HITTEST, 0, reinterpret_cast<LPARAM>(&local));
             if (index == 0 || index == 1)
@@ -2297,15 +2509,19 @@ LRESULT CALLBACK Controller::KeyProc(int code, WPARAM remove, LPARAM data)
     {
         auto *message = reinterpret_cast<MSG *>(data);
         HWND frame = GetAncestor(message->hwnd, GA_ROOT);
-        auto *self = static_cast<Controller *>(GetPropW(frame, ControllerProperty));
+        Controller* self{};
+        {std::lock_guard lock(controllersMutex);const auto found=controllers.find(frame);if(found!=controllers.end())self=found->second;}
         if (self && self->enabled_)
         {
+            self->AddRef();
+            struct Reference {Controller* owner;~Reference(){owner->Release();}} reference{self};
             bool eat = false;
             if (message->message == WM_KEYDOWN || message->message == WM_SYSKEYDOWN)
             {
                 bool ctrl = (GetKeyState(VK_CONTROL) & 0x8000) != 0, shift = (GetKeyState(VK_SHIFT) & 0x8000) != 0,
                      alt = (GetKeyState(VK_MENU) & 0x8000) != 0;
                 UINT key = static_cast<UINT>(message->wParam);
+                if(key==VK_ESCAPE)self->CancelPointer();
                 bool repeated = (message->lParam & (1ll << 30)) != 0;
                 if (ctrl && !alt && key == 'T')
                 {
@@ -2344,9 +2560,15 @@ LRESULT CALLBACK Controller::KeyProc(int code, WPARAM remove, LPARAM data)
                 }
                 else if (!ctrl && !alt && !shift && key == VK_BACK)
                 {
-                    wchar_t name[64]{};
-                    GetClassNameW(GetFocus(), name, 64);
-                    if (_wcsicmp(name, L"Edit") != 0)
+                    // Explorer editors share DirectUI hosts. Ask the actual
+                    // folder view for its focus path rather than guessing an
+                    // editor class name or taking over the whole frame.
+                    ComPtr<IShellView> view;HWND viewWindow{};HWND focus=GetFocus();
+                    if(self->browser_&&SUCCEEDED(self->browser_->QueryActiveShellView(&view)))view->GetWindow(&viewWindow);
+                    GUITHREADINFO info{sizeof(info)};GetGUIThreadInfo(self->ownerThread_,&info);
+                    wchar_t name[64]{};GetClassNameW(focus,name,64);
+                    const bool editor=info.hwndCaret||!_wcsicmp(name,L"Edit")||!_wcsnicmp(name,L"RichEdit",8);
+                    if (viewWindow&&(focus==viewWindow||IsChild(viewWindow,focus))&&!editor)
                     {
                         if (!repeated)
                             self->History(-1);
@@ -2469,16 +2691,6 @@ void Controller::LimitMemory()
         }
     }
 }
-void Controller::SnapshotRoots(std::unordered_set<HWND> &roots)
-{
-    EnumWindows(
-        [](HWND h, LPARAM p) -> BOOL {
-            if (ExplorerRoot(h))
-                reinterpret_cast<std::unordered_set<HWND> *>(p)->insert(h);
-            return TRUE;
-        },
-        reinterpret_cast<LPARAM>(&roots));
-}
 bool Controller::Import(Tab tab, bool replaceInitial)
 {
     if (!enabled_ || pending_ || tab.history.empty() || tabs_.size() >= MaxTabs)
@@ -2487,7 +2699,9 @@ bool Controller::Import(Tab tab, bool replaceInitial)
     tab.sourceFrame = nullptr;
     tab.sourceId = 0;
     tab.sourceProcess = 0;
-    if (replaceInitial && tabs_.size() == 1 && Equal(CurrentFolder(browser_.Get()), tab.history[tab.position].folder))
+    const auto current=replaceInitial?CurrentFolder(browser_.Get()):Pidl{};
+    if(!enabled_||pending_||!frame_)return false;
+    if (replaceInitial && tabs_.size() == 1 && Equal(current, tab.history[tab.position].folder))
     {
         tabs_[0] = std::move(tab);
         active_ = 0;
@@ -2503,7 +2717,7 @@ bool Controller::Import(Tab tab, bool replaceInitial)
     tabs_.push_back(std::move(tab));
     if (!Navigate(id, position, true))
     {
-        tabs_.pop_back();
+        const int index=Index(id);if(index>=0)tabs_.erase(tabs_.begin()+index);
         return false;
     }
     TabChanged();
@@ -2511,33 +2725,37 @@ bool Controller::Import(Tab tab, bool replaceInitial)
 }
 void Controller::DetachTab(size_t index)
 {
-    if (index >= tabs_.size() || pending_ || detached_)
-        return;
-    Remember();
-    Detached d;
-    d.id = tabs_[index].id;
-    d.start = GetTickCount64();
-    d.packet = Serialize(tabs_[index], frame_);
-    if (d.packet.empty())
-        return;
-    SnapshotRoots(d.oldWindows);
-    Pidl folder = tabs_[index].history[tabs_[index].position].folder;
-    detached_ = std::move(d);
-    HRESULT hr = browser_->BrowseObject(folder.p, SBSP_NEWBROWSER | SBSP_ABSOLUTE | SBSP_NOTRANSFERHIST);
-    if (FAILED(hr))
-    {
-        detached_.reset();
-        patch::Log(L"ExplorerTabs", L"Opening the detached Explorer window failed.");
-        return;
-    }
-    SetTimer(frame_, MaintenanceTimer, 100, nullptr);
+    if(index>=tabs_.size()||pending_||detached_||!enabled_)return;
+    const auto source=tabs_[index].id;Remember();
+    const int position=Index(source);if(!enabled_||position<0||pending_)return;
+    Detached request;request.id=source;request.start=GetTickCount64();
+    request.packet=Serialize(tabs_[position],frame_);
+    request.expected=tabs_[position].history[tabs_[position].position].folder;
+    if(request.packet.empty())return;
+    HRESULT hr=CoCreateInstance(CLSID_ShellBrowserWindow,nullptr,CLSCTX_LOCAL_SERVER,IID_PPV_ARGS(&request.created));
+    SHANDLE_PTR handle{};
+    if(SUCCEEDED(hr))hr=request.created->get_HWND(&handle);
+    request.window=reinterpret_cast<HWND>(handle);
+    if(FAILED(hr)||!request.window||request.window==frame_||!ExplorerRoot(request.window)||!enabled_||Index(source)<0){if(request.created&&request.window!=frame_)request.created->Quit();return;}
+    VARIANT destination{},empty{};destination.vt=VT_ARRAY|VT_UI1;
+    destination.parray=SafeArrayCreateVector(VT_UI1,0,ILGetSize(request.expected.p));
+    if(!destination.parray){request.created->Quit();return;}
+    void* bytes{};hr=SafeArrayAccessData(destination.parray,&bytes);
+    if(SUCCEEDED(hr)){memcpy(bytes,request.expected.p,ILGetSize(request.expected.p));SafeArrayUnaccessData(destination.parray);}
+    ComPtr<IWebBrowser2> created=request.created;
+    if(SUCCEEDED(hr))hr=created->Navigate2(&destination,&empty,&empty,&empty,&empty);
+    VariantClear(&destination);
+    if(SUCCEEDED(hr))hr=created->put_Visible(VARIANT_TRUE);
+    if(FAILED(hr)||!enabled_||Index(source)<0){created->Quit();return;}
+    detached_=std::move(request);SetTimer(frame_,MaintenanceTimer,100,nullptr);
 }
 void Controller::StartDrag(size_t index)
 {
     if (index >= tabs_.size() || pending_ || inDrag_)
         return;
+    const ULONGLONG source = tabs_[index].id;
     Remember();
-    ULONGLONG source = tabs_[index].id;
+    const int resolved=Index(source);if(!enabled_||resolved<0||pending_)return;index=static_cast<size_t>(resolved);
     auto packet = Serialize(tabs_[index], frame_);
     if (packet.empty())
         return;
@@ -2575,6 +2793,10 @@ void Controller::StartDrag(size_t index)
 }
 void Controller::Timer()
 {
+    if(headerRetryDeadline_){
+        if(tearingDown_||closingFrame_||!(patch::LoadConfig().flags&patch::ExplorerTabs)||GetTickCount64()>=headerRetryDeadline_)headerRetryDeadline_=0;
+        else Enable(true);
+    }
     if (tabs_.empty() && startupPending_)
         Synchronize();
     if (startupPending_ && GetTickCount64() - startupStart_ >= 10000)
@@ -2592,9 +2814,13 @@ void Controller::Timer()
     }
     if (restoreState_)
     {
-        if (Equal(CurrentFolder(browser_.Get()), restoreState_->folder))
+        const ViewState state=*restoreState_;ComPtr<IShellBrowser> browser=browser_;
+        const bool matches=Equal(CurrentFolder(browser.Get()),state.folder);
+        if(!enabled_||!frame_||browser_.Get()!=browser.Get()||!restoreState_)return;
+        if (matches&&Equal(restoreState_->folder,state.folder))
         {
-            Restore(browser_.Get(), *restoreState_);
+            Restore(browser.Get(),state);
+            if(!enabled_||!frame_||browser_.Get()!=browser.Get()||!restoreState_)return;
             if (++restoreTries_ >= 10)
             {
                 restoreState_.reset();
@@ -2605,61 +2831,50 @@ void Controller::Timer()
         else
             restoreState_.reset();
     }
-    if (detached_)
+    if(detached_)
     {
-        ComPtr<IShellWindows> windows;
-        if (SUCCEEDED(CoCreateInstance(CLSID_ShellWindows, nullptr, CLSCTX_ALL, IID_PPV_ARGS(&windows))))
+        // All borrowed storage is copied before COM or another window can
+        // reenter this owner. Only the automation object's actual HWND accepts.
+        const Detached attempt=*detached_;
+        ComPtr<IServiceProvider> provider;ComPtr<IShellBrowser> targetBrowser;
+        const HWND target=attempt.window;
+        const auto sameRequest=[&]{return enabled_&&detached_&&detached_->id==attempt.id&&
+            detached_->window==attempt.window&&detached_->created.Get()==attempt.created.Get();};
+        if(!pending_&&active_<tabs_.size()&&tabs_[active_].id==attempt.id)Remember();
+        int source=Index(attempt.id);
+        if(sameRequest()&&!pending_&&(source<0||Serialize(tabs_[source],frame_)!=attempt.packet)) {
+            detached_.reset();patch::Log(L"ExplorerTabs",L"The source tab changed while its new window was opening; the source was kept.");
+        }
+        bool ready=sameRequest()&&!pending_&&!attempt.transferred&&IsWindow(target)&&GetPropW(target,patch::TabsActiveProperty)&&
+            SUCCEEDED(attempt.created.As(&provider))&&
+            SUCCEEDED(provider->QueryService(SID_STopLevelBrowser,IID_PPV_ARGS(&targetBrowser)));
+        if(ready&&Equal(CurrentFolder(targetBrowser.Get()),attempt.expected)&&sameRequest()&&!pending_&&
+           (source=Index(attempt.id))>=0&&Serialize(tabs_[source],frame_)==attempt.packet)
         {
-            long count = 0;
-            windows->get_Count(&count);
-            for (long i = 0; i < count && detached_; i++)
-            {
-                VARIANT v{};
-                v.vt = VT_I4;
-                v.lVal = i;
-                ComPtr<IDispatch> dispatch;
-                ComPtr<IWebBrowser2> web;
-                ComPtr<IServiceProvider> provider;
-                ComPtr<IShellBrowser> browser;
-                if (FAILED(windows->Item(v, &dispatch)) || FAILED(dispatch.As(&web)))
-                    continue;
-                SHANDLE_PTR raw{};
-                web->get_HWND(&raw);
-                HWND root = GetAncestor(reinterpret_cast<HWND>(raw), GA_ROOT);
-                if (!root || detached_->oldWindows.contains(root) || !GetPropW(root, patch::TabsActiveProperty) ||
-                    FAILED(dispatch.As(&provider)) ||
-                    FAILED(provider->QueryService(SID_STopLevelBrowser, IID_PPV_ARGS(&browser))))
-                    continue;
-                auto source = std::find_if(tabs_.begin(), tabs_.end(), [&](auto &t) { return t.id == detached_->id; });
-                if (source == tabs_.end())
-                {
-                    detached_.reset();
-                    break;
-                }
-                if (!Equal(CurrentFolder(browser.Get()), source->history[source->position].folder))
-                    continue;
-                COPYDATASTRUCT data{PacketMagic, static_cast<DWORD>(detached_->packet.size()),
-                                    detached_->packet.data()};
-                DWORD_PTR accepted{};
-                if (SendMessageTimeoutW(root, WM_COPYDATA, reinterpret_cast<WPARAM>(frame_),
-                                        reinterpret_cast<LPARAM>(&data), SMTO_ABORTIFHUNG | SMTO_BLOCK, 1000,
-                                        &accepted) &&
-                    accepted)
-                {
-                    size_t index = static_cast<size_t>(source - tabs_.begin());
-                    detached_.reset();
-                    Close(index);
-                    break;
+            COPYDATASTRUCT data{PacketMagic,static_cast<DWORD>(attempt.packet.size()),const_cast<BYTE*>(attempt.packet.data())};
+            DWORD_PTR accepted{};
+            const bool transferred=SendMessageTimeoutW(target,WM_COPYDATA,reinterpret_cast<WPARAM>(frame_),reinterpret_cast<LPARAM>(&data),SMTO_ABORTIFHUNG|SMTO_BLOCK,1000,&accepted)&&accepted;
+            if(transferred&&sameRequest())detached_->transferred=true;
+        }
+        if(sameRequest()&&detached_->transferred&&!pending_) {
+            source=Index(attempt.id);
+            if(source<0)detached_.reset();
+            else if(Serialize(tabs_[source],frame_)!=attempt.packet)detached_.reset();
+            else if(!detached_->closeRequested) {
+                const bool last=tabs_.size()==1;
+                Close(source,&attempt.packet);
+                if(sameRequest()) {
+                    if(Index(attempt.id)<0)detached_.reset();
+                    else if(last)detached_->closeRequested=true;
                 }
             }
         }
-        if (detached_ && GetTickCount64() - detached_->start > 10000)
-        {
-            detached_.reset();
-            patch::Log(L"ExplorerTabs", L"The new window did not accept the detached tab. The original tab was kept.");
+        if(detached_&&GetTickCount64()-detached_->start>10000) {
+            detached_.reset();patch::Log(L"ExplorerTabs",L"The created window did not accept the detached tab. The original tab was kept.");
         }
     }
-    if (!startupPending_ && !pending_ && !restoreState_ && !detached_)
+    if(enabled_&&GetPropW(frame_,WindowSessionProperty))LoadWindowSession();
+    if (!startupPending_ && !pending_ && !restoreState_ && !detached_ && !headerRetryDeadline_&&!GetPropW(frame_,WindowSessionProperty))
         KillTimer(frame_, MaintenanceTimer);
 }
 void Controller::BindFolderDrop()
@@ -2852,6 +3067,22 @@ HRESULT Controller::Drop(IDataObject *object, DWORD keys, POINTL point, DWORD *e
     DragLeave();
     return S_OK;
 }
+header::TargetId Controller::ChildTarget(LONG child) const
+{
+    if(child<=0)return {};
+    if(child<=static_cast<LONG>(tabs_.size()*2)){const auto& tab=tabs_[(child-1)/2];return {child%2?header::TargetKind::Tab:header::TargetKind::Close,tab.id};}
+    if(child==static_cast<LONG>(tabs_.size()*2+1))return {header::TargetKind::NewTab,0};
+    if(child==static_cast<LONG>(tabs_.size()*2+2))return {header::TargetKind::Overflow,0};
+    return {};
+}
+LONG Controller::TargetChild(header::TargetId target) const
+{
+    if(target.kind==header::TargetKind::NewTab)return static_cast<LONG>(tabs_.size()*2+1);
+    if(target.kind==header::TargetKind::Overflow)return static_cast<LONG>(tabs_.size()*2+2);
+    const int index=Index(target.tab);
+    if(index<0)return 0;
+    return target.kind==header::TargetKind::Tab?index*2+1:target.kind==header::TargetKind::Close?index*2+2:0;
+}
 HRESULT Controller::ChildName(LONG child, BSTR *out)
 {
     if (!out)
@@ -2860,11 +3091,11 @@ HRESULT Controller::ChildName(LONG child, BSTR *out)
     std::wstring name;
     if (child == 0)
         name = L"File Explorer tabs";
-    else if (child > 0 && static_cast<size_t>(child) <= tabs_.size())
-        name = tabs_[child - 1].title;
-    else if (child == static_cast<LONG>(tabs_.size() + 1))
+    else if (child > 0 && static_cast<size_t>(child) <= tabs_.size()*2)
+        name = (child%2?L"":L"Close ")+tabs_[(child-1)/2].title;
+    else if (child == static_cast<LONG>(tabs_.size()*2 + 1))
         name = L"New tab";
-    else if (child == static_cast<LONG>(tabs_.size() + 2))
+    else if (child == static_cast<LONG>(tabs_.size()*2 + 2))
         name = L"All tabs and options";
     else
         return E_INVALIDARG;
@@ -2873,16 +3104,19 @@ HRESULT Controller::ChildName(LONG child, BSTR *out)
 }
 bool Controller::ChildRect(LONG child, RECT &out) const
 {
-    if (!strip_)
+    if(!strip_||!rendererReady_||!header::IsCurrent(frame_,layout_.allocation))
         return false;
     if (child == 0)
-        GetClientRect(strip_, &out);
-    else if (child > 0 && static_cast<size_t>(child) <= tabRects_.size())
-        out = tabRects_[child - 1];
-    else if (child == static_cast<LONG>(tabs_.size() + 1))
-        out = plusRect_;
-    else if (child == static_cast<LONG>(tabs_.size() + 2))
-        out = overflowRect_;
+        out=layout_.viewport;
+    else if(child>0&&static_cast<size_t>(child)<=tabs_.size()*2){
+        const auto* tab=layout_.Find(tabs_[(child-1)/2].id);
+        if(!tab)return false;
+        out=child%2?tab->body:tab->close;
+    }
+    else if (child == static_cast<LONG>(tabs_.size()*2 + 1))
+        out=layout_.newTab;
+    else if (child == static_cast<LONG>(tabs_.size()*2 + 2))
+        out=layout_.overflow;
     else
         return false;
     MapWindowPoints(strip_, nullptr, reinterpret_cast<POINT *>(&out), 2);
@@ -2893,20 +3127,25 @@ HRESULT Controller::get_accState(VARIANT v, VARIANT *out)
     if (!out)
         return E_POINTER;
     VariantInit(out);
+    if(!ValidChild(v))return E_INVALIDARG;
     out->vt = VT_I4;
     out->lVal = STATE_SYSTEM_FOCUSABLE;
-    LONG child = v.vt == VT_I4 ? v.lVal : 0;
-    if (child > 0 && static_cast<size_t>(child) <= tabs_.size())
+    const LONG child=v.lVal;const auto target=ChildTarget(child);
+    if (target.kind==header::TargetKind::Tab)
     {
         out->lVal |= STATE_SYSTEM_SELECTABLE;
-        if (static_cast<size_t>(child - 1) == active_)
+        if (Index(target.tab)==static_cast<int>(active_))
             out->lVal |= STATE_SYSTEM_SELECTED;
-        if (static_cast<size_t>(child - 1) >= tabRects_.size() || IsRectEmpty(&tabRects_[child - 1]))
+        const auto* tab=layout_.Find(target.tab);
+        if(!tab||!tab->Visible()||!header::IsCurrent(frame_,layout_.allocation))
             out->lVal |= STATE_SYSTEM_OFFSCREEN;
     }
     if (!enabled_ || !strip_)
         out->lVal |= STATE_SYSTEM_INVISIBLE;
-    if (GetFocus() == strip_ && static_cast<size_t>(std::max(0L, child - 1)) == active_)
+    RECT bounds{};if(child&&(!ChildRect(child,bounds)||IsRectEmpty(&bounds)))out->lVal|=STATE_SYSTEM_OFFSCREEN;
+    if(!Ready()||pending_||(target.kind==header::TargetKind::NewTab&&tabs_.size()>=MaxTabs))out->lVal|=STATE_SYSTEM_UNAVAILABLE;
+    if(pending_)out->lVal|=STATE_SYSTEM_BUSY;
+    if (GetFocus() == strip_ && (child==0||target==focusedTarget_))
         out->lVal |= STATE_SYSTEM_FOCUSED;
     return S_OK;
 }
@@ -2914,9 +3153,8 @@ HRESULT Controller::accLocation(long *x, long *y, long *w, long *h, VARIANT v)
 {
     if (!x || !y || !w || !h)
         return E_POINTER;
-    RECT r{};
-    if (!ChildRect(v.vt == VT_I4 ? v.lVal : 0, r))
-        return E_INVALIDARG;
+    *x=*y=*w=*h=0;if(!ValidChild(v))return E_INVALIDARG;
+    RECT r{};if(!ChildRect(v.lVal,r))return S_FALSE;
     *x = r.left;
     *y = r.top;
     *w = r.right - r.left;
@@ -2928,15 +3166,16 @@ HRESULT Controller::accNavigate(long direction, VARIANT from, VARIANT *out)
     if (!out)
         return E_POINTER;
     VariantInit(out);
-    LONG child = from.vt == VT_I4 ? from.lVal : 0;
-    LONG count = static_cast<LONG>(tabs_.size() + 2), next = 0;
-    if (direction == NAVDIR_FIRSTCHILD)
+    if(!ValidChild(from))return E_INVALIDARG;
+    LONG child = from.lVal;
+    LONG count = static_cast<LONG>(tabs_.size()*2 + 2), next = 0;
+    if (direction == NAVDIR_FIRSTCHILD&&child==0)
         next = 1;
-    else if (direction == NAVDIR_LASTCHILD)
+    else if (direction == NAVDIR_LASTCHILD&&child==0)
         next = count;
-    else if (direction == NAVDIR_NEXT || direction == NAVDIR_RIGHT)
+    else if (child>0&&(direction == NAVDIR_NEXT || direction == NAVDIR_RIGHT))
         next = child + 1;
-    else if (direction == NAVDIR_PREVIOUS || direction == NAVDIR_LEFT)
+    else if (child>0&&(direction == NAVDIR_PREVIOUS || direction == NAVDIR_LEFT))
         next = child - 1;
     if (next < 1 || next > count)
         return S_FALSE;
@@ -2954,33 +3193,31 @@ HRESULT Controller::accHitTest(long x, long y, VARIANT *out)
     if (!strip_ || !GetWindowRect(strip_, &r) || !PtInRect(&r, p))
         return S_FALSE;
     ScreenToClient(strip_, &p);
-    int hit = Hit(p);
     out->vt = VT_I4;
-    out->lVal = hit >= 0    ? hit + 1
-                : hit == -2 ? static_cast<LONG>(tabs_.size() + 1)
-                : hit == -3 ? static_cast<LONG>(tabs_.size() + 2)
-                            : CHILDID_SELF;
+    out->lVal=Ready()?TargetChild(layout_.Hit(p)):CHILDID_SELF;
     return S_OK;
 }
 HRESULT Controller::accDoDefaultAction(VARIANT v)
 {
-    if (v.vt != VT_I4 || !enabled_)
+    if (!ValidChild(v)||!v.lVal)
         return E_INVALIDARG;
-    if (v.lVal > 0 && static_cast<size_t>(v.lVal) <= tabs_.size())
-        return Activate(v.lVal - 1) ? S_OK : S_FALSE;
-    if (v.lVal == static_cast<LONG>(tabs_.size() + 1))
-    {
-        NewTab();
-        return S_OK;
-    }
-    if (v.lVal == static_cast<LONG>(tabs_.size() + 2))
-    {
-        POINT p{};
-        GetCursorPos(&p);
-        Menu(-3, p);
-        return S_OK;
-    }
-    return E_INVALIDARG;
+    if(!Ready()||pending_)return S_FALSE;
+    const auto target=ChildTarget(v.lVal);
+    if(target.kind==header::TargetKind::NewTab&&tabs_.size()>=MaxTabs)return S_FALSE;
+    InvokeTarget(target);return S_OK;
+}
+HRESULT Controller::accSelect(long flags,VARIANT child)
+{
+    if(!ValidChild(child))return E_INVALIDARG;
+    if(!flags)return S_OK;
+    if(!child.lVal){if(flags!=SELFLAG_TAKEFOCUS)return E_INVALIDARG;if(!Ready())return S_FALSE;SetFocus(strip_);return S_OK;}
+    const auto target=ChildTarget(child.lVal);
+    if(flags&~(SELFLAG_TAKEFOCUS|SELFLAG_TAKESELECTION))return E_INVALIDARG;
+    if((flags&SELFLAG_TAKESELECTION)&&target.kind!=header::TargetKind::Tab)return E_INVALIDARG;
+    if(!Ready()||pending_)return S_FALSE;
+    if(flags&SELFLAG_TAKEFOCUS)FocusTarget(target);
+    if(flags&SELFLAG_TAKESELECTION)return Activate(Index(target.tab))?S_OK:S_FALSE;
+    return S_OK;
 }
 
 bool WriteReport(const wchar_t *path, const std::string &text)

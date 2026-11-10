@@ -21,7 +21,7 @@ END
 STYLE DS_SETFONT | DS_CONTROL | WS_CHILD
 FONT 9,"Segoe UI"
 BEGIN
- LTEXT "Tabs sit in Explorer's title bar, above the address bar.",-1,12,12,302,14
+ LTEXT "Tabs share the native caption. Narrow windows get an extra row above the address bar.",-1,12,12,302,23
  LTEXT "Turning tabs off keeps the current folder open and saves the tab session for when you turn tabs back on.",-1,12,37,302,29
  GROUPBOX "Tab shortcuts",-1,10,78,310,107
  LTEXT "New tab\tCtrl + T\nClose tab\tCtrl + W\nReopen closed tab\tCtrl + Shift + T\nNext / previous\tCtrl + Tab / Ctrl + Shift + Tab\nSelect a tab\tCtrl + 1 through 9",-1,20,94,292,78
@@ -46,7 +46,7 @@ BEGIN
  LTEXT "Down",-1,174,84,44,12
  COMBOBOX 1213,218,81,90,145,CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP
  GROUPBOX "Snap behavior",-1,10,112,310,96
- LTEXT "Left / right: select the left / right half.\nUp / down: select a top / bottom corner on the selected side.\nUp / down while floating: leave the window as it is.\nRepeating a gesture keeps the window in its chosen position.",-1,20,128,292,66
+ LTEXT "Left / right: choose a side; Up / down: choose its corner.\nUp again at a top corner maximizes; Down restores it.\nFloating Up / down and repeated bottom Down keep its position.\nDrag Windows' shared divider to remember this display's split.",-1,20,128,292,66
 END
 
 204 DIALOGEX 0,0,330,218

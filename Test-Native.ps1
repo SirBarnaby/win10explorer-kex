@@ -1,10 +1,12 @@
 [CmdletBinding()]
 param([string]$BinaryDirectory=(Join-Path $PSScriptRoot 'build-native-verified\Release'))
 $ErrorActionPreference='Stop'
+$BinaryDirectory=(Resolve-Path -LiteralPath $BinaryDirectory).ProviderPath
 $evidence=Join-Path $PSScriptRoot 'evidence\native-v2'
 New-Item -ItemType Directory -Path $evidence -Force | Out-Null
 $cases=@(
  @{Exe='NativeSnap.exe';Args=@('--self-test',(Join-Path $evidence 'snap.json'))},
+ @{Exe='SnapLayoutTests.exe';Args=@((Join-Path $evidence 'split-layout.json'))},
  @{Exe='Win10PatchOptions.exe';Args=@('--self-test',(Join-Path $evidence 'config.json'))},
  @{Exe='NativePatchSetup.exe';Args=@('--self-test',(Join-Path $evidence 'migration.json'))},
  @{Exe='NativePatchModelTests.exe';Args=@((Join-Path $BinaryDirectory 'ExplorerTabs.dll'),(Join-Path $evidence 'explorer-model.json'))},
