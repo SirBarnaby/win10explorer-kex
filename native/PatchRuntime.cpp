@@ -29,7 +29,7 @@ bool Read(HKEY root,const wchar_t* path,Config& c) {
 }
 bool ValidateConfig(const Config& c,std::wstring& error) {
     if(c.size!=sizeof(Config)||c.version!=2){error=L"The settings format is not supported.";return false;}
-    if(c.flags&~DWORD(ExplorerTabs|TouchpadGestures|KeyboardShortcuts|RestoreTabs)){error=L"The settings contain unknown features.";return false;}
+    if(c.flags&~DWORD(ExplorerTabs|TouchpadGestures|KeyboardShortcuts|RestoreTabs|NoTabAnimations)){error=L"The settings contain unknown features.";return false;}
     if(std::any_of(c.reserved.begin(),c.reserved.end(),[](DWORD n){return n!=0;})){error=L"The settings contain unknown fields.";return false;}
     if(!c.keyboardModifiers||(c.keyboardModifiers&~DWORD(MOD_CONTROL|MOD_ALT|MOD_SHIFT|MOD_WIN))){error=L"Choose a valid keyboard modifier combination.";return false;}
     if(c.keyboardModifiers==MOD_WIN){error=L"The built-in Windows + Arrow shortcuts are preserved. Add Ctrl, Alt or Shift.";return false;}
@@ -146,7 +146,7 @@ bool ApplyConfig(const Config& c,GestureStatus& status,std::wstring& error) {
 int RunConfigSelfTests(const std::wstring& reportPath) {
     unsigned passed=0,total=0;auto test=[&](bool ok){total++;if(ok)passed++;};std::wstring e;Config c;
     test(ValidateConfig(c,e));c.version=99;test(!ValidateConfig(c,e));c=Config{};c.flags|=0x80000000;test(!ValidateConfig(c,e));c=Config{};c.reserved[3]=1;test(!ValidateConfig(c,e));c=Config{};c.keyboardModifiers=MOD_WIN;test(!ValidateConfig(c,e));c=Config{};c.keyboardKeys[1]=c.keyboardKeys[0];test(!ValidateConfig(c,e));c=Config{};c.keyboardKeys[0]=VK_F13;test(!ValidateConfig(c,e));c=Config{};c.keyboardModifiers=MOD_CONTROL|MOD_ALT;test(ValidateConfig(c,e));
-    for(DWORD featureFlags=0;featureFlags<16;featureFlags++){Config combination;combination.flags=featureFlags;test(ValidateConfig(combination,e));}
+    for(DWORD featureFlags=0;featureFlags<32;featureFlags++){Config combination;combination.flags=featureFlags;test(ValidateConfig(combination,e));}
     std::wstring isolated=L"Software\\Win10NativePatch\\IsolatedTest-"+std::to_wstring(GetCurrentProcessId());Config roundtrip;
     bool stored=Store(HKEY_CURRENT_USER,isolated.c_str(),c);DWORD storeError=GetLastError();bool read=Read(HKEY_CURRENT_USER,isolated.c_str(),roundtrip),equal=!std::memcmp(&c,&roundtrip,sizeof(c));
     test(stored&&read&&equal);RegDeleteTreeW(HKEY_CURRENT_USER,isolated.c_str());

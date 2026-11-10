@@ -546,6 +546,9 @@ struct TabHeaderRenderer::Impl {
         const auto& layout = state.layout;
         const int width = layout.tabWidth, height = layout.viewport.bottom;
         const bool dragged = tab.id == state.dragTab;
+        // A dropped tab glides into its slot on the reorder curve (when
+        // motion is on at all: an instant timing stays instant).
+        if (slot.dragged && !dragged && timing.milliseconds > 0) timing = {motion::ReorderMs, motion::Photon};
         HRESULT hr = S_OK;
         if (dragged != slot.dragged) {
             if (FAILED(hr = (slot.dragged ? dragLayer : tabsLayer)->RemoveVisual(slot.visual.Get())) ||
@@ -682,7 +685,9 @@ struct TabHeaderRenderer::Impl {
         }
         if (!hasPainted || scroll.to != -layout.scroll) {
             // Scrolling and scroll-into-view glide (Firefox: 150 ms ease-out).
-            const motion::Timing glide = animate ? motion::Timing{motion::SettleMs, motion::EaseOut} : Instant;
+            // Under a dragged tab the row follows the pointer directly, or the
+            // tab would drift against the content it is being dropped into.
+            const motion::Timing glide = animate && !state.dragTab ? motion::Timing{motion::SettleMs, motion::EaseOut} : Instant;
             if (FAILED(hr = Move(scroll, -static_cast<double>(layout.scroll), glide, now, [&](float v) { return scroller->SetOffsetX(v); },
                                  [&](IDCompositionAnimation* a) { return scroller->SetOffsetX(a); })))
                 return hr;

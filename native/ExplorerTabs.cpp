@@ -50,7 +50,8 @@ constexpr wchar_t ControllerProperty[] = L"Win10NativePatch.ExplorerController.v
 constexpr wchar_t ProofProperty[] = L"Win10NativePatch.IsolatedProof.v2";
 constexpr wchar_t SessionKey[] = L"Software\\Win10NativePatch\\v2\\ExplorerTabs";
 constexpr wchar_t WindowSessionProperty[]=L"Win10NativePatch.WindowSession.v1";
-constexpr UINT_PTR MaintenanceTimer = 0x57545032, SessionTimer = 0x57545033, ScrollTimer = 0x57545034;
+constexpr UINT_PTR MaintenanceTimer = 0x57545032, SessionTimer = 0x57545033, ScrollTimer = 0x57545034,
+    MotionTimer = 0x57545035;
 constexpr UINT SyncMessage = WM_APP + 0x482;
 constexpr UINT RestoreMessage = WM_APP + 0x483;
 constexpr UINT IconMessage = WM_APP + 0x484;
@@ -1089,6 +1090,15 @@ class Controller final : public IObjectWithSite, public IAccessible, public IDro
     HMENU systemMenu_{};
     UINT focusMenuId_{};
     POINT dragStart_{};
+    // Local reorder (Firefox): the pressed tab follows the pointer inside the
+    // strip while the others slide aside; leaving the strip vertically hands
+    // the tab to OLE drag and drop. dragOrigin_ restores the order on cancel.
+    bool reordering_ = false, motion_ = true;
+    ULONGLONG dragTab_{};
+    size_t dragOrigin_{};
+    int dragX_{}, dragGrab_{};
+    POINT dragPointer_{};
+    bool dragScrolling_ = false;
     int backCommand_ = -1, forwardCommand_ = -1;
     std::vector<Tab> tabs_, closed_;
     size_t active_{}; // The tab the Shell view shows (committed).
@@ -1151,6 +1161,13 @@ class Controller final : public IObjectWithSite, public IAccessible, public IDro
     void MoveTab(int);
     void ScrollBy(int pixels);
     void ScrollRepeat(bool first);
+    void Shift(size_t from, size_t to);
+    void RefreshMotion();
+    bool InReorderBand(POINT) const;
+    void BeginReorder(POINT);
+    void Reorder(POINT);
+    void EndReorder(bool commit);
+    void ReorderScroll();
     void RefreshHot();
     void Tooltip(header::TargetId target);
     std::wstring TooltipText(header::TargetId target) const;
@@ -1689,6 +1706,9 @@ void Controller::Enable(bool value)
     {
         // Publish cancellation before any Shell/COM cleanup can reenter us.
         enabled_=false;
+        // A tab dragged when the header goes away returns to its place, so
+        // the flushed session keeps the order the user last confirmed.
+        if(reordering_)EndReorder(false);
         SystemMenu(false);
         if(menuDepth_)EndMenu();
         rendererReady_=false;
@@ -1743,6 +1763,7 @@ void Controller::Enable(bool value)
 void Controller::RefreshAppearance()
 {
     renderer_.ThemeChanged();
+    RefreshMotion();
     if (!folderIcon_)
     {
         SHSTOCKICONINFO info{sizeof(info)};
@@ -1811,6 +1832,10 @@ void Controller::Layout(bool transient)
     const auto shown=DisplayedId();
     // A newly shown tab scrolls into view; otherwise the user's scroll stays.
     auto next=header::BuildLayout(allocation,identities,shown,{scroll_,lockedWidth_,shown!=revealedId_});
+    // When the row starts to overflow (a narrower window, more tabs), the shown
+    // tab is scrolled into view, as Firefox does on its overflow event.
+    if(next.overflowing&&!layout_.overflowing&&shown==revealedId_&&!reordering_)
+        next=header::BuildLayout(allocation,identities,shown,{scroll_,lockedWidth_,true});
     revealedId_=shown;scroll_=next.scroll;
     const RECT area=allocation.bounds;
     // Moving the frame reflows with identical bounds; the child moves with it.
@@ -1855,6 +1880,10 @@ bool Controller::Render()
     visual.busyTab=busyShown_?DisplayedId():0;
     visual.canCreate=tabs_.size()<MaxTabs;
     visual.hot=hotTarget_;visual.pressed=pressedTarget_;visual.focus=focusedTarget_;
+    BOOL systemMotion=TRUE;
+    if(!SystemParametersInfoW(SPI_GETCLIENTAREAANIMATION,0,&systemMotion,0))systemMotion=TRUE;
+    visual.animate=motion_&&systemMotion;
+    if(reordering_){visual.dragTab=dragTab_;visual.dragX=dragX_;}
     // Keep metadata-owned HICONs alive across graphics/COM calls and use one
     // copied model/layout for the complete draw.
     std::vector<std::shared_ptr<Icon>> heldIcons;
@@ -1870,6 +1899,12 @@ bool Controller::Render()
         if(strip_==window)ShowWindow(window,SW_HIDE);
         patch::Log(L"ExplorerTabs",L"Owned header composition failed: "+std::to_wstring(result));
         return false;
+    }
+    // Paint once more when the compositor's animations end so closed tabs
+    // and surfaces scrolled out of view are released.
+    if(const unsigned pending=renderer_.PendingMs()){
+        if(result==S_OK)timing::Mark("motion", pending, epoch);
+        SetTimer(window,MotionTimer,pending+16,nullptr);
     }
     rendererReady_=enabled_&&strip_==window&&frame_==frame&&epoch==renderEpoch_&&
         layout_.allocation.owner==visual.layout.allocation.owner&&
@@ -1957,6 +1992,8 @@ bool Controller::Activate(size_t index)
     switch(switching_.Request(id,CommittedId(),pending_?pending_->id:0))
     {
     case tabs::RequestAction::None:
+        // Choosing the shown tab again brings it fully into view.
+        revealedId_=0;
         Layout();
         return true;
     case tabs::RequestAction::Wait:
@@ -2561,6 +2598,11 @@ void Controller::Menu(int hit, POINT point)
 }
 void Controller::CancelPointer()
 {
+    // Escape, a lost capture or a disabled header put a dragged tab back.
+    if(reordering_){
+        timing::Mark("reordercancel",(Ready()?1:0)|(strip_&&GetCapture()==strip_?2:0)|(rendererReady_?4:0),static_cast<ULONGLONG>(dragPointer_.x));
+        EndReorder(false);
+    }
     pressedTarget_={};pressedButton_=0;
     if(strip_)KillTimer(strip_,ScrollTimer);
     if(strip_&&GetCapture()==strip_)ReleaseCapture();
@@ -2612,9 +2654,104 @@ void Controller::ScrollBy(int pixels)
     const int next=std::clamp(scroll_+pixels,0,layout_.maxScroll);
     if(next==scroll_)return;
     scroll_=next;revealedId_=DisplayedId();
-    Layout();
-    RefreshHot();
+    // A dragged tab stays under the pointer while the row scrolls beneath it.
+    if(reordering_)Reorder(dragPointer_);
+    else{Layout();RefreshHot();}
     RefreshMetadata();
+}
+void Controller::Shift(size_t from,size_t to)
+{
+    // Moves one tab, keeping the others in order and the shown tab committed
+    // by identity.
+    if(from>=tabs_.size()||to>=tabs_.size()||from==to)return;
+    const ULONGLONG committed=CommittedId();
+    const auto begin=tabs_.begin()+static_cast<std::ptrdiff_t>(std::min(from,to));
+    const auto end=tabs_.begin()+static_cast<std::ptrdiff_t>(std::max(from,to))+1;
+    if(from<to)std::rotate(begin,begin+1,end);
+    else std::rotate(begin,end-1,end);
+    if(const int index=Index(committed);index>=0)active_=static_cast<size_t>(index);
+}
+void Controller::RefreshMotion()
+{
+    // The Options "Animate tabs" switch. Windows' own "Animate controls and
+    // elements inside windows" is read at each paint: its change broadcast
+    // does not reliably reach every frame.
+    motion_=!(patch::LoadConfig().flags&patch::NoTabAnimations);
+}
+void Controller::BeginReorder(POINT point)
+{
+    const auto* geometry=layout_.Find(pressedTarget_.tab);
+    const int index=Index(pressedTarget_.tab);
+    if(!geometry||index<0)return;
+    reordering_=true;
+    dragTab_=pressedTarget_.tab;
+    dragOrigin_=static_cast<size_t>(index);
+    // Where inside the tab it was grabbed, so it does not jump to the pointer.
+    dragGrab_=dragStart_.x-layout_.tabViewport.left+scroll_-geometry->x;
+    hotTarget_={};
+    Tooltip({});
+    Reorder(point);
+}
+bool Controller::InReorderBand(POINT point) const
+{
+    // The strip plus half its height on every side, so a slightly unsteady
+    // hand keeps reordering while a deliberate pull leaves the strip.
+    RECT band{};GetClientRect(strip_,&band);
+    const int margin=(band.bottom-band.top)/2;
+    InflateRect(&band,margin,margin);
+    return PtInRect(&band,point)!=FALSE;
+}
+void Controller::Reorder(POINT point)
+{
+    if(!reordering_||!strip_)return;
+    if(!InReorderBand(point)) {
+        // Leaving the strip: the others settle back and the tab continues as
+        // an ordinary Shell drag (another window's strip, or a new window).
+        const auto source=dragTab_;
+        CancelPointer();
+        if(const int index=Index(source);index>=0)StartDrag(static_cast<size_t>(index));
+        return;
+    }
+    dragPointer_=point;
+    const int width=std::max(1,layout_.tabWidth),last=static_cast<int>(tabs_.size()-1);
+    dragX_=std::clamp(static_cast<int>(point.x-layout_.tabViewport.left)+scroll_-dragGrab_,0,last*width);
+    // The tab takes the place its centre is over; the others slide aside.
+    const int target=std::clamp((dragX_+width/2)/width,0,last),from=Index(dragTab_);
+    const bool move=from>=0&&from!=target;
+    if(move)Shift(static_cast<size_t>(from),static_cast<size_t>(target));
+    // A new order or scroll position needs a layout; otherwise only the
+    // dragged tab moves.
+    if(move||scroll_!=layout_.scroll)Layout();
+    else if(!Render())HeaderFailed();
+    if(!reordering_)return;
+    // Near either end of an overflowing row, the row scrolls under the tab.
+    const int edge=MulDiv(header::ControlDip,static_cast<int>(dpi_),96);
+    const bool nearEdge=layout_.overflowing&&(point.x<layout_.tabViewport.left+edge||point.x>=layout_.tabViewport.right-edge);
+    if(nearEdge&&!dragScrolling_&&strip_){dragScrolling_=true;SetTimer(strip_,ScrollTimer,16,nullptr);}
+}
+void Controller::ReorderScroll()
+{
+    const int edge=MulDiv(header::ControlDip,static_cast<int>(dpi_),96),step=MulDiv(8,static_cast<int>(dpi_),96);
+    int delta=0;
+    if(reordering_&&layout_.overflowing) {
+        if(dragPointer_.x<layout_.tabViewport.left+edge)delta=-step;
+        else if(dragPointer_.x>=layout_.tabViewport.right-edge)delta=step;
+    }
+    if(!delta){dragScrolling_=false;if(strip_)KillTimer(strip_,ScrollTimer);return;}
+    ScrollBy(delta);
+}
+void Controller::EndReorder(bool commit)
+{
+    if(!reordering_)return;
+    reordering_=false;dragScrolling_=false;
+    if(strip_)KillTimer(strip_,ScrollTimer);
+    const int at=Index(std::exchange(dragTab_,0));
+    const bool moved=at>=0&&static_cast<size_t>(at)!=dragOrigin_;
+    if(moved&&!commit&&dragOrigin_<tabs_.size())Shift(static_cast<size_t>(at),dragOrigin_);
+    if(!enabled_||tearingDown_||!strip_)return;
+    // The released tab glides into its slot on the reorder curve.
+    if(moved&&commit)TabChanged();
+    else Layout();
 }
 void Controller::ScrollRepeat(bool first)
 {
@@ -2697,6 +2834,7 @@ void Controller::Mouse(UINT message, WPARAM, LPARAM data)
     int hit = Hit(point);
     if (message == WM_MOUSEMOVE)
     {
+        if(reordering_){Reorder(point);return;}
         const auto target=layout_.Hit(point);
         if (hotTarget_!=target)
         {
@@ -2711,9 +2849,14 @@ void Controller::Mouse(UINT message, WPARAM, LPARAM data)
             if (abs(point.x - dragStart_.x) >= GetSystemMetrics(SM_CXDRAG) ||
                 abs(point.y - dragStart_.y) >= GetSystemMetrics(SM_CYDRAG))
             {
-                const auto source=pressedTarget_.tab;
-                CancelPointer();
-                const int index=Index(source);if(index>=0)StartDrag(index);
+                // Within the strip a drag reorders in place; a tab pulled
+                // straight out (or the only tab) starts the Shell drag.
+                if(tabs_.size()>1&&InReorderBand(point))BeginReorder(point);
+                else {
+                    const auto source=pressedTarget_.tab;
+                    CancelPointer();
+                    const int index=Index(source);if(index>=0)StartDrag(index);
+                }
             }
         }
         return;
@@ -2739,6 +2882,14 @@ void Controller::Mouse(UINT message, WPARAM, LPARAM data)
     }
     if (message == WM_LBUTTONUP)
     {
+        if(reordering_) {
+            // Dropping keeps the new order and shows the dragged tab.
+            const ULONGLONG dropped=dragTab_;
+            EndReorder(true);
+            CancelPointer();
+            if(const int index=Index(dropped);index>=0)Activate(static_cast<size_t>(index));
+            return;
+        }
         const auto was=pressedTarget_;
         const bool valid=pressedButton_==WM_LBUTTONDOWN&&GetCapture()==strip_&&was==layout_.Hit(point);
         // Capture-change cleanup can run synchronously during ReleaseCapture.
@@ -2823,7 +2974,8 @@ LRESULT CALLBACK Controller::StripProc(HWND h, UINT m, WPARAM w, LPARAM l)
         }
         break;
     case WM_TIMER:
-        if(w==ScrollTimer){self->ScrollRepeat(false);return 0;}
+        if(w==ScrollTimer){if(self->reordering_)self->ReorderScroll();else self->ScrollRepeat(false);return 0;}
+        if(w==MotionTimer){KillTimer(h,MotionTimer);if(!self->Render())self->HeaderFailed();return 0;}
         break;
     case WM_NOTIFY:
     {
@@ -2937,6 +3089,7 @@ LRESULT CALLBACK Controller::FrameProc(HWND h, UINT m, WPARAM w, LPARAM l, UINT_
     }
     else if (m == patch::SettingsChangedMessage())
     {
+        self->RefreshMotion();
         self->Enable((patch::LoadConfig().flags & patch::ExplorerTabs) != 0);
         handled = true;
     }
@@ -3145,9 +3298,7 @@ void Controller::MoveTab(int direction)
     if(from>=tabs_.size())return;
     const size_t to=direction<0?from-1:from+1;
     if((direction<0&&from==0)||to>=tabs_.size())return;
-    const ULONGLONG committed=CommittedId();
-    std::swap(tabs_[from],tabs_[to]);
-    if(const int index=Index(committed);index>=0)active_=static_cast<size_t>(index);
+    Shift(from,to);
     TabChanged();
 }
 LRESULT CALLBACK Controller::KeyProc(int code, WPARAM remove, LPARAM data)
@@ -3372,8 +3523,9 @@ void Controller::StartDrag(size_t index)
     DWORD effect = 0;
     if (data && sourceObject)
     {
-        DoDragDrop(data.Get(), sourceObject.Get(), DROPEFFECT_MOVE | DROPEFFECT_COPY, &effect);
+        const HRESULT dropped=DoDragDrop(data.Get(), sourceObject.Get(), DROPEFFECT_MOVE | DROPEFFECT_COPY, &effect);
         inDrag_ = false;
+        timing::Mark("dragdrop", effect, (dropped==DRAGDROP_S_DROP?1:0)|(sourceObject->released?2:0)|(sourceObject->escaped?4:0));
         auto i = std::find_if(tabs_.begin(), tabs_.end(), [&](auto &t) { return t.id == source; });
         if (i != tabs_.end() && frame_ && enabled_)
         {
@@ -3385,6 +3537,7 @@ void Controller::StartDrag(size_t index)
                 POINT point{};
                 GetCursorPos(&point);
                 HWND target = GetAncestor(WindowFromPoint(point), GA_ROOT);
+                timing::Mark("dragout", target == frame_ ? 1 : 0, (pending_ ? 1 : 0) | (detached_ ? 2 : 0));
                 if (target != frame_)
                     DetachTab(position);
             }
@@ -3492,6 +3645,7 @@ HRESULT Controller::DragEnter(IDataObject *object, DWORD keys, POINTL point, DWO
     dropObject_ = object;
     FORMATETC f{static_cast<CLIPFORMAT>(TabFormat()), nullptr, DVASPECT_CONTENT, -1, TYMED_HGLOBAL};
     dropPrivate_ = object && SUCCEEDED(object->QueryGetData(&f));
+    timing::Mark("dragenter", dropPrivate_ ? 1 : 0, *effect);
     hoverDrop_ = -1;
     hoverStart_ = GetTickCount64();
     BindFolderDrop();
@@ -3608,6 +3762,7 @@ HRESULT Controller::Drop(IDataObject *object, DWORD keys, POINTL point, DWORD *e
                 else if (Import(std::move(*tab), false))
                     *effect = allowed & DROPEFFECT_MOVE;
             }
+            timing::Mark("droptab", *effect, (tab ? 1 : 0) | (pending_ ? 2 : 0) | (enabled_ ? 4 : 0));
         }
         ReleaseStgMedium(&medium);
         DragLeave();

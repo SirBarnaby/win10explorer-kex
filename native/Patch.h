@@ -18,7 +18,9 @@ inline constexpr wchar_t SettingsKey[] = L"Software\\Win10NativePatch\\v2";
 inline constexpr wchar_t SnapWindowClass[] = L"Win10NativePatch.NativeSnap.v2";
 inline constexpr wchar_t TabsActiveProperty[] = L"Win10NativePatch.TabsActive.v2";
 inline constexpr wchar_t TabsClassId[] = L"{73F7B7DC-C022-4862-A3EA-7BD04EAE73A9}";
-enum Feature : DWORD { ExplorerTabs=1, TouchpadGestures=2, KeyboardShortcuts=4, RestoreTabs=8 };
+enum Feature : DWORD { ExplorerTabs=1, TouchpadGestures=2, KeyboardShortcuts=4, RestoreTabs=8,
+    // Options "Animate tabs" off. Set means off so existing settings keep motion on.
+    NoTabAnimations=16 };
 struct Config {
     DWORD size=sizeof(Config);
     DWORD version=2;

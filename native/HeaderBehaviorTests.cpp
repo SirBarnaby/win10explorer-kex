@@ -7,6 +7,10 @@
 #include <shlobj.h>
 #include <uiautomation.h>
 #include "MvpHostProtocol.h"
+#include "Patch.h"
+#include "TabMotion.h"
+namespace motion=header::motion;
+#include <cstring>
 namespace {
 std::wstring CurrentUrl(HWND f){return HeaderFolderPath(f);}
 ComPtr<IAccessible> Access(HWND frame) {ComPtr<IAccessible> a;auto h=Strip(frame);if(h)AccessibleObjectFromWindow(h,OBJID_CLIENT,IID_PPV_ARGS(&a));return a;}
@@ -93,6 +97,31 @@ bool SelectInView(HWND frame,const std::wstring& name){// shldisp's Folder is re
  const bool found=view&&SUCCEEDED(view->get_Folder(&folder))&&folder&&SUCCEEDED(folder->ParseName(text,&item))&&item;SysFreeString(text);if(!found)return false;
  VARIANT target{};target.vt=VT_DISPATCH;target.pdispVal=item.Get();return SUCCEEDED(view->SelectItem(&target,SVSI_SELECT|SVSI_DESELECTOTHERS|SVSI_FOCUSED|SVSI_ENSUREVISIBLE));}
 std::vector<std::wstring> TabNames(HWND frame){std::vector<std::wstring> names;for(auto& tab:Tabs(frame))names.push_back(tab.name);return names;}std::wstring FocusText(HWND frame){GUITHREADINFO info{sizeof(info)};GetGUIThreadInfo(GetWindowThreadProcessId(frame,nullptr),&info);wchar_t text[4096]{};SendMessageTimeoutW(info.hwndFocus,WM_GETTEXT,4096,reinterpret_cast<LPARAM>(text),SMTO_ABORTIFHUNG,1000,nullptr);if(*text)return text;ComPtr<IUIAutomation> automation;ComPtr<IUIAutomationElement> element;ComPtr<IUIAutomationValuePattern> pattern;if(SUCCEEDED(CoCreateInstance(CLSID_CUIAutomation,nullptr,CLSCTX_INPROC_SERVER,IID_PPV_ARGS(&automation)))&&SUCCEEDED(automation->GetFocusedElement(&element))&&SUCCEEDED(element->GetCurrentPatternAs(UIA_ValuePatternId,IID_PPV_ARGS(&pattern)))){BSTR value{};pattern->get_CurrentValue(&value);std::wstring result=value?value:L"";SysFreeString(value);return result;}return L"";}
+// Local reorder fixtures: screen frames of the strip (DWM output, so
+// DirectComposition animation is visible), hashed to count distinct frames.
+unsigned long long FrameHash(RECT r){const int w=r.right-r.left,h=r.bottom-r.top;if(w<=0||h<=0)return 0;HDC screen=GetDC(nullptr),dc=CreateCompatibleDC(screen);BITMAPINFO info{};info.bmiHeader.biSize=sizeof(info.bmiHeader);info.bmiHeader.biWidth=w;info.bmiHeader.biHeight=-h;info.bmiHeader.biPlanes=1;info.bmiHeader.biBitCount=32;void* bits{};HBITMAP bitmap=CreateDIBSection(screen,&info,DIB_RGB_COLORS,&bits,nullptr,0);unsigned long long hash=1469598103934665603ull;
+ if(bitmap){auto old=SelectObject(dc,bitmap);BitBlt(dc,0,0,w,h,screen,r.left,r.top,SRCCOPY|CAPTUREBLT);GdiFlush();const auto* p=static_cast<const unsigned char*>(bits);for(size_t i=0;i<static_cast<size_t>(w)*h*4;++i){hash^=p[i];hash*=1099511628211ull;}SelectObject(dc,old);DeleteObject(bitmap);}
+ DeleteDC(dc);ReleaseDC(nullptr,screen);return hash;}
+// Moves the held pointer once and counts the distinct strip frames for 400 ms.
+struct Frames{size_t distinct{},samples{};};
+Frames FramesAfterMove(RECT strip,POINT to){std::vector<unsigned long long> seen{FrameHash(strip)};size_t samples=1;SetCursorPos(to.x,to.y);const ULONGLONG end=GetTickCount64()+400;while(GetTickCount64()<end){const auto h=FrameHash(strip);++samples;if(h!=seen.back())seen.push_back(h);}std::sort(seen.begin(),seen.end());return {static_cast<size_t>(std::unique(seen.begin(),seen.end())-seen.begin()),samples};}
+// The controller's timing log (when enabled) records "motion <ms>" whenever the
+// compositor is left running an animation; read what was appended since offset.
+std::wstring TimingPath(){wchar_t path[MAX_PATH]{};DWORD bytes=sizeof(path);if(RegGetValueW(HKEY_CURRENT_USER,patch::SettingsKey,L"TimingLog",RRF_RT_REG_SZ,nullptr,path,&bytes)!=ERROR_SUCCESS)return {};return path;}
+// The fixture appends its own note so marks are found after it (file sizes on
+// the mapped results folder can be stale).
+void LogNote(const std::wstring& path,const char* note){HANDLE file=path.empty()?INVALID_HANDLE_VALUE:CreateFileW(path.c_str(),FILE_APPEND_DATA,FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE,nullptr,OPEN_ALWAYS,0,nullptr);if(file==INVALID_HANDLE_VALUE)return;std::string line=std::string("0 note ")+note;line+='\n';DWORD written{};WriteFile(file,line.data(),static_cast<DWORD>(line.size()),&written,nullptr);CloseHandle(file);}
+int MotionAfter(const std::wstring& path,const char* note){HANDLE file=path.empty()?INVALID_HANDLE_VALUE:CreateFileW(path.c_str(),GENERIC_READ,FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE,nullptr,OPEN_EXISTING,0,nullptr);if(file==INVALID_HANDLE_VALUE)return -1;
+ std::string text;char buffer[4096];DWORD read{};while(ReadFile(file,buffer,sizeof(buffer),&read,nullptr)&&read)text.append(buffer,read);CloseHandle(file);
+ const size_t from=text.rfind(std::string(" note ")+note);if(from==std::string::npos)return -1;
+ int longest=0;for(size_t i=text.find(" motion ",from);i!=std::string::npos;i=text.find(" motion ",i+1))longest=std::max(longest,atoi(text.c_str()+i+8));return longest;}
+void Glide(POINT a,POINT b){for(int i=1;i<=20;++i){SetCursorPos(a.x+(b.x-a.x)*i/20,a.y+(b.y-a.y)*i/20);Pump(35);}}
+// Writes the Options "Animate tabs" bit and tells the frame, as Options does.
+void TabMotion(HWND frame,bool on,const std::vector<BYTE>& saved){patch::Config c;if(saved.size()==sizeof(c))std::memcpy(&c,saved.data(),sizeof(c));c.flags|=patch::ExplorerTabs;if(on)c.flags&=~DWORD(patch::NoTabAnimations);else c.flags|=patch::NoTabAnimations;
+ RegSetKeyValueW(HKEY_CURRENT_USER,patch::SettingsKey,L"Config",REG_BINARY,&c,sizeof(c));SendMessageW(frame,RegisterWindowMessageW(L"Win10NativePatch.SettingsChanged.v2"),0,0);Pump(200);}
+std::vector<BYTE> SavedConfig(){DWORD size{};if(RegGetValueW(HKEY_CURRENT_USER,patch::SettingsKey,L"Config",RRF_RT_REG_BINARY,nullptr,nullptr,&size)!=ERROR_SUCCESS)return {};std::vector<BYTE> data(size);if(RegGetValueW(HKEY_CURRENT_USER,patch::SettingsKey,L"Config",RRF_RT_REG_BINARY,nullptr,data.data(),&size)!=ERROR_SUCCESS)return {};data.resize(size);return data;}
+void RestoreConfig(const std::vector<BYTE>& saved){if(saved.empty())RegDeleteKeyValueW(HKEY_CURRENT_USER,patch::SettingsKey,L"Config");else RegSetKeyValueW(HKEY_CURRENT_USER,patch::SettingsKey,L"Config",REG_BINARY,saved.data(),static_cast<DWORD>(saved.size()));}
+bool Order(HWND frame,std::initializer_list<const wchar_t*> names){const auto tabs=TabNames(frame);if(tabs.size()!=names.size())return false;size_t i=0;for(auto n:names)if(tabs[i++]!=n)return false;return true;}
 }
 int wmain(int argc,wchar_t** argv){
  if(argc!=4||!Guest())return 2;
@@ -164,6 +193,59 @@ int wmain(int argc,wchar_t** argv){
      <<",\"firstShown\":"<<shown<<",\"afterWheel\":"<<afterWheel<<",\"afterReveal\":"<<afterReveal<<",\"success\":"<<(good?"true":"false")<<'}';
   PostMessageW(frame,apply,0,0);Pump(400);UnhookWindowsHookEx(hook);FreeLibrary(lab);PostMessageW(frame,WM_CLOSE,0,0);CoUninitialize();return good?0:1;
  }
+ if(mode==L"reorder"){
+  // AE5/AE6: Firefox-style local reorder. Tabs: Alpha, Beta, Gamma (Gamma shown).
+  // The guest ships with "Animate controls and elements inside windows" off;
+  // motion needs it on (restored at the end).
+  BOOL systemMotion=FALSE;SystemParametersInfoW(SPI_GETCLIENTAREAANIMATION,0,&systemMotion,0);
+  SystemParametersInfoW(SPI_SETCLIENTAREAANIMATION,0,reinterpret_cast<PVOID>(TRUE),SPIF_SENDCHANGE);Pump(400);
+  const auto saved=SavedConfig();RECT strip{};GetWindowRect(Strip(frame),&strip);
+  auto rect=[&](const wchar_t* name){return Named(frame,name).rect;};
+  auto press=[&](POINT p){SetCursorPos(p.x,p.y);Pump(80);MouseButton(MOUSEEVENTF_LEFTDOWN);};
+  auto release=[&]{MouseButton(MOUSEEVENTF_LEFTUP);Pump(700);};
+  // Live order while held, then Escape puts the tab back.
+  RECT a=rect(L"Alpha"),b=rect(L"Beta");const int w=a.right-a.left,y=(a.top+a.bottom)/2;
+  press(Center(a));Glide(Center(a),{Center(b).x+w/4,y});Pump(300);
+  check("reorder-live-while-held",Order(frame,{L"Beta",L"Alpha",L"Gamma"}));
+  Escape();release();
+  check("reorder-escape-restores",Order(frame,{L"Alpha",L"Beta",L"Gamma"})&&SelectedIndex(frame)==2);
+  // Crossing a neighbour's midpoint slides it aside over several frames.
+  // Accessible tab rectangles cover the body only (the close button is its own
+  // child), so the slot pitch is the distance between neighbouring bodies.
+  auto crossing=[&](RECT held,RECT next){return next.left+(Center(held).x-held.left)-(next.left-held.left)/2;};
+  a=rect(L"Alpha");b=rect(L"Beta");int cross=crossing(a,b);press(Center(a));Glide(Center(a),{cross-6,y});Pump(400);
+  const auto log=TimingPath();LogNote(log,"motion-on");
+  const auto framesOn=FramesAfterMove(strip,{cross+6,y});Pump(300);const int motionOn=MotionAfter(log,"motion-on");
+  check("reorder-neighbour-glides",Order(frame,{L"Beta",L"Alpha",L"Gamma"})&&motionOn>=150&&motionOn<=motion::ReorderMs+20);
+  Escape();release();
+  // Dropping keeps the new order and shows the dropped tab.
+  a=rect(L"Alpha");b=rect(L"Beta");press(Center(b));Glide(Center(b),Center(a));release();
+  const bool dropOn=Order(frame,{L"Beta",L"Alpha",L"Gamma"})&&SelectedIndex(frame)==0;
+  check("reorder-drop-keeps-order-and-selects",dropOn&&CurrentUrl(frame)==L"file:///C:/NativeLabFolders/Beta");
+  // Pulled out of the strip: the row settles back, then the Shell drag detaches the tab.
+  PostMessageW(frame,apply,83,0);Pump(100);
+  a=rect(L"Alpha");RECT g=rect(L"Gamma");press(Center(a));Glide(Center(a),{Center(g).x+w/4,y});Pump(200);
+  const bool liveBeforeExit=Order(frame,{L"Beta",L"Gamma",L"Alpha"});
+  RECT frameRect{};GetWindowRect(frame,&frameRect);
+  Glide({Center(g).x+w/4,y},{Center(g).x+w/4,strip.bottom+160});Glide({Center(g).x+w/4,strip.bottom+160},{std::max(8L,frameRect.left-60),strip.bottom+160});release();
+  HWND created=static_cast<HWND>(GetPropW(frame,L"HeaderLab.ProductCreatedFrame"));HHOOK createdHook{};
+  if(created){createdHook=SetWindowsHookExW(WH_GETMESSAGE,reinterpret_cast<HOOKPROC>(GetProcAddress(lab,"HeaderLabHook")),lab,GetWindowThreadProcessId(created,nullptr));PostMessageW(created,apply,64,0);Pump(1500);}
+  check("reorder-exit-restores-then-detaches",liveBeforeExit&&created&&Order(frame,{L"Beta",L"Gamma"})&&CurrentUrl(created)==L"file:///C:/NativeLabFolders/Alpha");
+  PostMessageW(frame,apply,84,0);if(created)PostMessageW(created,WM_CLOSE,0,0);Pump(500);if(createdHook)UnhookWindowsHookEx(createdHook);
+  SetForegroundWindow(frame);Pump(300);
+  // Options "Animate tabs" off: the same moves end in the same state, instantly.
+  TabMotion(frame,false,saved);
+  b=rect(L"Beta");g=rect(L"Gamma");cross=crossing(b,g);press(Center(b));Glide(Center(b),{cross-6,y});Pump(400);
+  LogNote(log,"motion-off");const auto framesOff=FramesAfterMove(strip,{cross+6,y});Pump(300);const int motionOff=MotionAfter(log,"motion-off");
+  check("reorder-motion-off-instant",Order(frame,{L"Gamma",L"Beta"})&&framesOff.distinct<=2&&motionOff==0);
+  Escape();release();
+  b=rect(L"Beta");g=rect(L"Gamma");press(Center(g));Glide(Center(g),Center(b));release();
+  check("reorder-motion-off-same-end-state",Order(frame,{L"Gamma",L"Beta"})&&SelectedIndex(frame)==0&&CurrentUrl(frame)==L"file:///C:/NativeLabFolders/Gamma");
+  RestoreConfig(saved);
+  SystemParametersInfoW(SPI_SETCLIENTAREAANIMATION,0,reinterpret_cast<PVOID>(static_cast<INT_PTR>(systemMotion)),SPIF_SENDCHANGE);
+  out<<"],\"motionOnMs\":"<<motionOn<<",\"motionOffMs\":"<<motionOff<<",\"framesMotionOn\":"<<framesOn.distinct<<",\"samplesMotionOn\":"<<framesOn.samples<<",\"framesMotionOff\":"<<framesOff.distinct<<",\"samplesMotionOff\":"<<framesOff.samples<<",\"created\":"<<reinterpret_cast<ULONG_PTR>(created)<<",\"after\":";State(out,frame);out<<",\"success\":"<<(good?"true":"false")<<'}';
+  PostMessageW(frame,apply,0,0);Pump(400);UnhookWindowsHookEx(hook);FreeLibrary(lab);PostMessageW(frame,WM_CLOSE,0,0);CoUninitialize();return good?0:1;
+ }
  if(mode==L"switching"){
   // AE1/AE2 and the Firefox chords. Tabs: Alpha, Beta, Gamma (Gamma shown).
   CreateDirectoryW(L"C:\\NativeLabFolders\\Gamma",nullptr);{HANDLE z=CreateFileW(L"C:\\NativeLabFolders\\Gamma\\Zeta.txt",GENERIC_WRITE,0,nullptr,CREATE_ALWAYS,0,nullptr);if(z!=INVALID_HANDLE_VALUE)CloseHandle(z);}
@@ -200,7 +282,8 @@ int wmain(int argc,wchar_t** argv){
   auto access=Access(frame);auto alpha=Named(frame,L"Alpha");if(access&&alpha.child)access->accDoDefaultAction(Child(alpha.child));Pump(500);alpha=Named(frame,L"Alpha");auto destination=Named(target,L"New tab");
   if(target&&alpha.child&&destination.child)DragPointer(alpha.rect,destination.rect);
   check("physical-cross-window-drop-moves-original",target&&TabCount(frame)==2&&!Named(frame,L"Alpha").child&&TabCount(target)==2&&Named(target,L"Alpha").child&&CurrentUrl(target)==L"file:///C:/NativeLabFolders/Alpha");
-  out<<"],\"source\":";State(out,frame);out<<",\"target\":";State(out,target);out<<",\"success\":"<<(good?"true":"false")<<'}';if(target)PostMessageW(target,WM_CLOSE,0,0);Pump(300);if(targetHook)UnhookWindowsHookEx(targetHook);PostMessageW(frame,apply,0,0);Pump(300);UnhookWindowsHookEx(hook);FreeLibrary(lab);CoUninitialize();return good?0:1;
+  auto box=[&](const RECT& r){out<<'['<<r.left<<','<<r.top<<','<<r.right<<','<<r.bottom<<']';};
+  out<<"],\"alphaRect\":";box(alpha.rect);out<<",\"destinationRect\":";box(destination.rect);out<<",\"source\":";State(out,frame);out<<",\"target\":";State(out,target);out<<",\"success\":"<<(good?"true":"false")<<'}';if(target)PostMessageW(target,WM_CLOSE,0,0);Pump(300);if(targetHook)UnhookWindowsHookEx(targetHook);PostMessageW(frame,apply,0,0);Pump(300);UnhookWindowsHookEx(hook);FreeLibrary(lab);CoUninitialize();return good?0:1;
  }
  if(mode==L"nested-save"){
   DWORD pid{};GetWindowThreadProcessId(frame,&pid);HANDLE process=OpenProcess(SYNCHRONIZE,FALSE,pid);PostMessageW(frame,apply,85,0);Pump(100);DWORD_PTR result{};
