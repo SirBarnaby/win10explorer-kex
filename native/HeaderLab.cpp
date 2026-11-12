@@ -276,6 +276,10 @@ extern "C" __declspec(dllexport) LRESULT CALLBACK HeaderLabHook(int code,WPARAM 
                     if(!wcsncmp(name,L"Win10NativePatch.ExplorerTabs.v2",32))InvalidateRect(child,nullptr,FALSE);
                     return TRUE;
                 },0);
+                // The strip only draws what changed, so a repaint request alone
+                // may draw nothing. A colour change, as Windows sends it, makes
+                // it draw everything again and so meet the injected fault.
+                SendMessageW(m->hwnd,WM_SYSCOLORCHANGE,0,0);
                 return CallNextHookEx(nullptr,code,w,l);
             }
             if(m->wParam==70){FallbackState(m->hwnd);return CallNextHookEx(nullptr,code,w,l);}

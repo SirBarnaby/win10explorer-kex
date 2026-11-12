@@ -144,7 +144,11 @@ bool VisualStates(HWND frame,const std::wstring& directory) {
     if(rowTabs.size()>=3) {
         auto plus=rowTabs[rowTabs.size()-2].rect;POINT point{(plus.left+plus.right)/2,(plus.top+plus.bottom)/2};SetPropW(frame,L"HeaderProof.Case",reinterpret_cast<HANDLE>(40));Hit(rowHit,frame,Strip(frame),point);PhysicalClick(point);RemovePropW(frame,L"HeaderProof.Case");
         rowNew=Count(frame)==before+1;
-        Pump(1200);auto current=Targets(frame);for(const auto& active:current)if((active.state&STATE_SYSTEM_SELECTED)&&!IsRectEmpty(&active.rect)){const auto closeRect=TargetNamed(frame,L"Close "+active.name).rect;PhysicalClick({(closeRect.left+closeRect.right)/2,(closeRect.top+closeRect.bottom)/2});break;}Pump(1000);
+        // The new tab shows the same folder as the one it was opened from, so
+        // its name is not unique; and narrow background tabs hide their close
+        // button (an empty rectangle). Close the selected tab through its own
+        // close button, which is the accessible child right after its body.
+        Pump(1200);auto current=Targets(frame);for(const auto& active:current)if((active.state&STATE_SYSTEM_SELECTED)&&!IsRectEmpty(&active.rect)){const auto own=std::find_if(current.begin(),current.end(),[&](const Target& t){return t.child==active.child+1&&t.role==ROLE_SYSTEM_PUSHBUTTON;});if(own!=current.end()&&!IsRectEmpty(&own->rect)){const auto closeRect=own->rect;PhysicalClick({(closeRect.left+closeRect.right)/2,(closeRect.top+closeRect.bottom)/2});}break;}Pump(1000);
     }
     {std::ofstream report(directory+L"\\allocated-row-input.json");report<<"{\"rowPixels\":"<<reinterpret_cast<ULONG_PTR>(GetPropW(frame,L"Win10NativePatch.HeaderRowPixels.v1"))<<",\"newByPhysicalMouse\":"<<(rowNew?"true":"false")<<",\"countRestored\":"<<(Count(frame)==before?"true":"false")<<"}";}
     const bool rowRestored=Count(frame)==before;Capture(frame,directory+L"\\state-allocated-row-settled.png");SetWindowPos(frame,nullptr,0,0,1050,650,SWP_NOMOVE|SWP_NOACTIVATE|SWP_NOZORDER);Pump(1000);NativeContent(frame,directory+L"\\native-content-wide-again.json");return rowNew&&rowRestored;

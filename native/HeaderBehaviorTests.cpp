@@ -322,9 +322,18 @@ int wmain(int argc,wchar_t** argv){
    PhysicalClick({550,350});const auto folder=CurrentUrl(frame);Key(VK_MENU);Key(VK_SPACE);Key(VK_SPACE,true);Key(VK_MENU,true);Pump(150);Key('T');Key('T',true);Pump(250);GUITHREADINFO focus{sizeof(focus)};GetGUIThreadInfo(GetWindowThreadProcessId(frame,nullptr),&focus);check("native-system-menu-keyboard-entry",focus.hwndFocus==Strip(frame));Escape();
    PhysicalClick({550,350});Chord('L');Chord('A');Type(L"BackspaceProbe");Key(VK_BACK);Key(VK_BACK,true);Pump(100);auto address=FocusText(frame);check("address-backspace-edits",address==L"BackspaceProb"&&CurrentUrl(frame)==folder);Escape();
    Chord('E');Type(L"BackspaceProbe");Key(VK_BACK);Key(VK_BACK,true);Pump(100);auto search=FocusText(frame);check("search-backspace-edits",search==L"BackspaceProb"&&CurrentUrl(frame)==folder);Escape();
-   Navigate(frame,L"C:\\NativeLabFolders\\Gamma");PhysicalClick({550,350});Key(VK_HOME);Key(VK_HOME,true);Key(VK_F2);Key(VK_F2,true);Pump(250);Chord('A');Type(L"BackspaceProbe");Key(VK_BACK);Key(VK_BACK,true);Pump(100);const auto rename=FocusText(frame);check("rename-backspace-edits",rename==L"BackspaceProb");Escape();
+   Navigate(frame,L"C:\\NativeLabFolders\\Gamma");const auto gamma=CurrentUrl(frame);PhysicalClick({550,350});
+   GUITHREADINFO clicked{sizeof(clicked)};GetGUIThreadInfo(GetWindowThreadProcessId(frame,nullptr),&clicked);const auto clickFocus=Class(clicked.hwndFocus);
+   // Select the item through the folder view: Home does not select when the
+   // click already left keyboard focus on the first item. F2 is a real key.
+   const bool renameChosen=SelectInView(frame,L"RenameProbe.txt");Pump(150);Key(VK_F2);Key(VK_F2,true);
+   // Explorer opens its rename editor asynchronously. Type only once it has
+   // focus, so the keys test the editor rather than the folder view.
+   const ULONGLONG renameStart=GetTickCount64();long long editorMs=-1;std::wstring editorFocus;
+   while(GetTickCount64()-renameStart<3000){Pump(50);GUITHREADINFO typing{sizeof(typing)};GetGUIThreadInfo(GetWindowThreadProcessId(frame,nullptr),&typing);editorFocus=Class(typing.hwndFocus);if(editorFocus==L"Edit"){editorMs=static_cast<long long>(GetTickCount64()-renameStart);break;}}
+   Chord('A');Type(L"BackspaceProbe");Key(VK_BACK);Key(VK_BACK,true);Pump(100);const auto rename=FocusText(frame);const auto renameUrl=CurrentUrl(frame);check("rename-backspace-edits",renameChosen&&rename==L"BackspaceProb"&&renameUrl==gamma);Escape();
    Navigate(frame,L"C:\\NativeLabFolders\\Beta");Navigate(frame,L"C:\\NativeLabFolders\\Gamma");PhysicalClick({550,350});Key(VK_BACK);Key(VK_BACK,true);Pump(700);check("folder-view-backspace-travels-history",CurrentUrl(frame)==L"file:///C:/NativeLabFolders/Beta");
-   out<<"],\"address\":"<<Json(address)<<",\"search\":"<<Json(search)<<",\"rename\":"<<Json(rename);
+   out<<"],\"address\":"<<Json(address)<<",\"search\":"<<Json(search)<<",\"rename\":"<<Json(rename)<<",\"renameClickFocus\":"<<Json(clickFocus)<<",\"renameSelected\":"<<(renameChosen?"true":"false")<<",\"renameEditorMs\":"<<editorMs<<",\"renameEditorFocus\":"<<Json(editorFocus)<<",\"renameFolderAfter\":"<<Json(renameUrl);
   }
   out<<",\"success\":"<<(good?"true":"false")<<'}';PostMessageW(frame,apply,0,0);Pump(300);UnhookWindowsHookEx(hook);FreeLibrary(lab);CoUninitialize();return good?0:1;
  }

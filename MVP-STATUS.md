@@ -6,6 +6,8 @@ Tab switching no longer waits for Explorer: the strip highlights the new tab at 
 
 Measured results, what was proven in Windows Sandbox and the known limits are in `docs/reports/2026-11-10-refinement-report.md`.
 
+Installed on the user's desktop on 12 November at 20:26 with `ExplorerMvpSetup.exe --install` from `dist/Explorer-MVP-0.1.0-x64-20261112-202604` (setup SHA-256 `795F8E8A…`, the copy the Sandbox tested). The host and snap receiver run from payload `498d517dbe8292cf22ba8bc2f867ca3c76f7b272d9fae8302f13e672fad5964f`; startup entries and Apps & Features point there, and all five installed hashes match the acceptance receipt. Settings, gesture cycle, QAT, Ribbon collapse state, the touchpad key and the active bindings were unchanged. Explorer was not restarted and no folder window was open, so the new DLL loads into the next folder window; live appearance on the host was not reverified. Evidence: `evidence/refine-20261110/u10/install/`. The four earlier payloads remain on disk.
+
 ## 4 November 2026 follow-up: tab startup and snap transition fixes installed
 
 The installed follow-up payload is `7d82f98aba3dc4472824ad72113316d619fb2da172329dbb6b5b65301d8a4e68`. Tabs had remained off in a newly opened frame after a temporary header-layout rejection; the controller now retries safely for up to two seconds. Persistent failure still restores ordinary chrome and preserves the saved session. Side-to-side snapping now repositions an already-arranged window directly, avoiding the native Win+Arrow restore cycle through its floating position.
