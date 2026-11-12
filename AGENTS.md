@@ -1,6 +1,6 @@
 # Win10NativePatch
 
-Explorer MVP: native title-bar tabs for Windows 10 Explorer and touchpad snapping. Current state and history: `MVP-STATUS.md`. Building: `BUILDING.md`.
+Explorer MVP: native title-bar tabs for Windows 10 Explorer and touchpad snapping. Current state and history: `MVP-STATUS.md`. Building: `docs/building.md`.
 
 ## Read before changing code here
 
