@@ -42,7 +42,7 @@ Explorer MVP adds folder tabs to the real File Explorer window on Windows 10. Th
 
 ![Dragging a tab along the strip while the others slide aside](assets/tab-reorder.gif)
 
-**Many tabs** scroll with the wheel or the arrows
+**Many tabs** scroll with the mouse wheel
 
 ![A strip with many tabs scrolling](assets/tab-overflow.gif)
 
@@ -50,7 +50,7 @@ Explorer MVP adds folder tabs to the real File Explorer window on Windows 10. Th
 
 ![Dragging a tab out to a new window and into another window](assets/tab-tear-out.gif)
 
-**Snap windows** to halves and corners
+**Snap windows** to halves and corners (recorded with Ctrl+Alt+Win+Arrow, the shortcut the three-finger swipes are bound to)
 
 ![Windows snapping to the left half, a corner and the right half](assets/touchpad-snap.gif)
 
