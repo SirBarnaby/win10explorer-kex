@@ -77,7 +77,8 @@ int main() {
     // ---- Overflow (R7-R10) ----
     std::vector<std::uint64_t> ids;for(unsigned i=1;i<=500;++i)ids.push_back(i);
     for(const UINT dpi:{96u,120u,144u,192u}){
-        const int width=MulDiv(900,dpi,96),height=MulDiv(30,dpi,96),unit=MulDiv(30,dpi,96),minimum=MulDiv(76,dpi,96);
+        const int scale=static_cast<int>(dpi);
+        const int width=MulDiv(900,scale,96),height=MulDiv(30,scale,96),unit=MulDiv(30,scale,96),minimum=MulDiv(76,scale,96);
         for(const size_t count:{size_t{1},size_t{8},size_t{64},size_t{120},size_t{500}}){
             const std::span<const std::uint64_t> some(ids.data(),count);
             const std::uint64_t active=count>2?count-2:1;
@@ -96,7 +97,8 @@ int main() {
             } else Check("no arrows without overflow",IsRectEmpty(&row.scrollLeft)&&IsRectEmpty(&row.scrollRight));
             bool clipped=true;size_t visibleCount=0;
             for(const auto& tab:row.tabs)if(tab.Visible()){++visibleCount;clipped=clipped&&tab.bounds.right>row.tabViewport.left&&tab.bounds.left<row.tabViewport.right;}
-            Check("only tabs meeting the viewport are realised",clipped&&visibleCount<=static_cast<size_t>((row.tabViewport.right-row.tabViewport.left)/std::max(1,row.tabWidth)+2));
+            const int fits=(row.tabViewport.right-row.tabViewport.left)/std::max(1,row.tabWidth)+2;
+            Check("only tabs meeting the viewport are realised",clipped&&visibleCount<=static_cast<size_t>(fits));
         }
     }
     const std::span<const std::uint64_t> hundred(ids.data(),120);

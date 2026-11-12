@@ -111,7 +111,7 @@ class BlurGlassCache {
         if (snapshot == INVALID_HANDLE_VALUE) return result;
         PROCESSENTRY32W entry{sizeof(entry)};
         for (BOOL more = Process32FirstW(snapshot, &entry); more && result.empty(); more = Process32NextW(snapshot, &entry)) {
-            if (_wcsicmp(entry.szExeFile, L"DWMBlurGlass.exe")) continue;
+            if (_wcsicmp(entry.szExeFile, L"DWMBlurGlass.exe") != 0) continue;
             // Limited query access is granted even for its elevated host.
             HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, entry.th32ProcessID);
             if (!process) continue;

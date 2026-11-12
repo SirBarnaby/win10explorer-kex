@@ -236,7 +236,7 @@ struct TabHeaderRenderer::Impl {
     }
     // Starts `value` towards `to` from what is on screen now.
     template <class Set, class Animate>
-    HRESULT Move(motion::Transition& value, double to, motion::Timing timing, std::uint64_t now, Set set, Animate animate) {
+    HRESULT Move(motion::Transition& value, double to, const motion::Timing& timing, std::uint64_t now, Set set, Animate animate) {
         const double from = value.At(now);
         value = {from, to, now, timing.milliseconds, timing.curve};
         if (timing.milliseconds <= 0 || std::abs(from - to) < 1e-3) {
@@ -396,14 +396,11 @@ struct TabHeaderRenderer::Impl {
         pushed = true;
         return S_OK;
     }
-    HRESULT DrawTab(ID2D1DeviceContext* dc, const TabVisual& tab, const TabKey& key) {
+    // Selection and hover fills, button affordances and the selection underline.
+    void DrawTabBackground(ID2D1DeviceContext* dc, const TabKey& key, const TabGeometry& geometry) {
         const Inks& inks = key.inks;
-        auto px = [&](int n) { return MulDiv(n, static_cast<int>(key.dpi), 96); };
-        const float stroke = static_cast<float>(std::max(1, px(1)));
-        const auto geometry = LocalTab(key.width, key.height, key.dpi, key.showClose);
-        bool faded = false;
-        HRESULT hr = PushFade(dc, key, faded);
-        if (FAILED(hr)) return hr;
+        const int scale = static_cast<int>(key.dpi);
+        const float stroke = static_cast<float>(std::max(1, MulDiv(1, scale, 96)));
         const RECT bounds = geometry.bounds;
         if (key.selected) Fill(dc, bounds, inks.selectedFill, inks.contrast ? 1.f : (inks.active ? .26f : .16f));
         // A body hover includes its close button; the independent button gets
@@ -411,13 +408,49 @@ struct TabHeaderRenderer::Impl {
         if (key.hot != Part::None) Fill(dc, bounds, inks.hotFill, inks.contrast ? 1.f : .10f);
         Affordance(dc, geometry.body, key.hot == Part::Body, key.pressed == Part::Body, inks);
         Affordance(dc, geometry.close, key.hot == Part::Close, key.pressed == Part::Close, inks);
-        const bool highlighted = inks.contrast && (key.selected || key.hot != Part::None);
-        const COLORREF ink = highlighted ? inks.selectedText : inks.text;
-        const float opacity = inks.active ? 1.f : .82f;
         if (key.selected)
             Line(dc, static_cast<float>(bounds.left), bounds.bottom - stroke / 2, static_cast<float>(bounds.right),
                  bounds.bottom - stroke / 2, inks.contrast ? inks.selectedText : inks.accent, inks.active ? 1.f : .65f,
-                 std::max(1.f, static_cast<float>(px(2))));
+                 std::max(1.f, static_cast<float>(MulDiv(2, scale, 96))));
+    }
+    // Close glyph, keyboard focus ring and the busy clock, drawn over the label.
+    void DrawTabMarks(ID2D1DeviceContext* dc, const TabKey& key, const TabGeometry& geometry, COLORREF ink, float opacity) {
+        auto px = [&](int n) { return MulDiv(n, static_cast<int>(key.dpi), 96); };
+        const float stroke = static_cast<float>(std::max(1, px(1)));
+        // Narrow tabs keep the close button on the selected tab only.
+        if (geometry.showClose && !IsRectEmpty(&geometry.closeGlyph)) {
+            const auto glyph = geometry.closeGlyph;
+            Line(dc, glyph.left + .5f, glyph.top + .5f, glyph.right - .5f, glyph.bottom - .5f, ink, opacity, stroke);
+            Line(dc, glyph.right - .5f, glyph.top + .5f, glyph.left + .5f, glyph.bottom - .5f, ink, opacity, stroke);
+        }
+        if (key.focused && key.focus != Part::None) {
+            RECT focus = key.focus == Part::Body ? geometry.body : geometry.close;
+            InflateRect(&focus, -px(3), -px(3));
+            brush->SetColor(Color(ink, .8f));
+            dc->DrawRectangle(Box(focus), brush.Get(), stroke);
+        }
+        if (key.busy) {
+            // A slow tab shows a clock on its icon; the rest of the strip stays usable.
+            const RECT bounds = geometry.bounds;
+            const float x = bounds.left + px(8) + px(16) / 2.f, y = (bounds.top + bounds.bottom) / 2.f, r = px(6) * 1.f;
+            brush->SetColor(Color(key.inks.text, .8f));
+            dc->DrawEllipse(D2D1::Ellipse(D2D1::Point2F(x, y), r, r), brush.Get(), stroke);
+            Line(dc, x, y, x, y - r * .6f, key.inks.text, 1.f, stroke);
+            Line(dc, x, y, x + r * .5f, y, key.inks.text, 1.f, stroke);
+        }
+    }
+    HRESULT DrawTab(ID2D1DeviceContext* dc, const TabVisual& tab, const TabKey& key) {
+        const Inks& inks = key.inks;
+        auto px = [&](int n) { return MulDiv(n, static_cast<int>(key.dpi), 96); };
+        const auto geometry = LocalTab(key.width, key.height, key.dpi, key.showClose);
+        bool faded = false;
+        HRESULT hr = PushFade(dc, key, faded);
+        if (FAILED(hr)) return hr;
+        DrawTabBackground(dc, key, geometry);
+        const RECT bounds = geometry.bounds;
+        const bool highlighted = inks.contrast && (key.selected || key.hot != Part::None);
+        const COLORREF ink = highlighted ? inks.selectedText : inks.text;
+        const float opacity = inks.active ? 1.f : .82f;
         const int pad = px(8), icon = px(16);
         ComPtr<ID2D1Bitmap> bitmap;
         if (FAILED(hr = PictureOf(dc, tab, &bitmap))) {
@@ -435,26 +468,7 @@ struct TabHeaderRenderer::Impl {
         brush->SetColor(Color(ink, inks.textOpacity));
         if (label.right > label.left)
             dc->DrawTextW(tab.title.data(), static_cast<UINT>(tab.title.size()), font.Get(), label, brush.Get(), D2D1_DRAW_TEXT_OPTIONS_CLIP);
-        // Narrow tabs keep the close button on the selected tab only.
-        if (geometry.showClose && !IsRectEmpty(&geometry.closeGlyph)) {
-            const auto glyph = geometry.closeGlyph;
-            Line(dc, glyph.left + .5f, glyph.top + .5f, glyph.right - .5f, glyph.bottom - .5f, ink, opacity, stroke);
-            Line(dc, glyph.right - .5f, glyph.top + .5f, glyph.left + .5f, glyph.bottom - .5f, ink, opacity, stroke);
-        }
-        if (key.focused && key.focus != Part::None) {
-            RECT focus = key.focus == Part::Body ? geometry.body : geometry.close;
-            InflateRect(&focus, -px(3), -px(3));
-            brush->SetColor(Color(ink, .8f));
-            dc->DrawRectangle(Box(focus), brush.Get(), stroke);
-        }
-        if (key.busy) {
-            // A slow tab shows a clock on its icon; the rest of the strip stays usable.
-            const float x = bounds.left + pad + icon / 2.f, y = (bounds.top + bounds.bottom) / 2.f, r = px(6) * 1.f;
-            brush->SetColor(Color(inks.text, .8f));
-            dc->DrawEllipse(D2D1::Ellipse(D2D1::Point2F(x, y), r, r), brush.Get(), stroke);
-            Line(dc, x, y, x, y - r * .6f, inks.text, 1.f, stroke);
-            Line(dc, x, y, x + r * .5f, y, inks.text, 1.f, stroke);
-        }
+        DrawTabMarks(dc, key, geometry, ink, opacity);
         if (faded) dc->PopLayer();
         return S_OK;
     }
@@ -500,7 +514,7 @@ struct TabHeaderRenderer::Impl {
         const RECT bounds{0, 0, key.width, key.height};
         if (key.enabled) Affordance(dc, bounds, key.hot, key.pressed, inks);
         const COLORREF ink = !key.enabled ? inks.disabled : inks.contrast && key.hot ? inks.highlightText : inks.text;
-        const float cx = key.width / 2.f, cy = key.height / 2.f;
+        const float cx = static_cast<float>(key.width) / 2.f, cy = static_cast<float>(key.height) / 2.f;
         Line(dc, cx - r, cy, cx + r, cy, ink, 1.f, stroke);
         Line(dc, cx, cy - r, cx, cy + r, ink, 1.f, stroke);
         if (key.focus) {
@@ -554,34 +568,24 @@ struct TabHeaderRenderer::Impl {
         }
         return key;
     }
-    HRESULT UpdateTab(Slot& slot, const VisualState& state, const TabGeometry& geometry, const TabVisual& tab, const Inks& inks,
-                      motion::Timing timing, bool fresh, bool opening, std::uint64_t now, int fade, bool& changed) {
-        const auto& layout = state.layout;
-        const int width = layout.tabWidth, height = layout.viewport.bottom;
-        const bool dragged = tab.id == state.dragTab;
-        // A dropped tab glides into its slot on the reorder curve (when
-        // motion is on at all: an instant timing stays instant).
-        if (slot.dragged && !dragged && timing.milliseconds > 0) timing = {motion::ReorderMs, motion::Photon};
+    // Moves a slot between the tabs layer and the drag layer.
+    HRESULT Reparent(Slot& slot, bool dragged, bool& changed) {
+        if (dragged == slot.dragged) return S_OK;
         HRESULT hr = S_OK;
-        if (dragged != slot.dragged) {
-            if (FAILED(hr = (slot.dragged ? dragLayer : tabsLayer)->RemoveVisual(slot.visual.Get())) ||
-                FAILED(hr = (dragged ? dragLayer : tabsLayer)->AddVisual(slot.visual.Get(), FALSE, nullptr)))
-                return hr;
-            slot.dragged = dragged;
-            changed = true;
-        }
-        // The dragged tab follows the pointer exactly; everything else glides.
-        const double x = dragged ? state.dragX : geometry.x;
-        if (fresh || slot.x.to != x) {
-            if (FAILED(hr = Move(slot.x, x, fresh || dragged ? Instant : timing, now, [&](float v) { return slot.visual->SetOffsetX(v); },
-                                 [&](IDCompositionAnimation* a) { return slot.visual->SetOffsetX(a); })))
-                return hr;
-            changed = true;
-        }
+        if (FAILED(hr = (slot.dragged ? dragLayer : tabsLayer)->RemoveVisual(slot.visual.Get())) ||
+            FAILED(hr = (dragged ? dragLayer : tabsLayer)->AddVisual(slot.visual.Get(), FALSE, nullptr)))
+            return hr;
+        slot.dragged = dragged;
+        changed = true;
+        return S_OK;
+    }
+    // The slot's right edge. A new tab grows from nothing while its content
+    // fades in; an existing one follows the tab width.
+    HRESULT Grow(Slot& slot, int width, const motion::Timing& timing, bool fresh, bool opening, std::uint64_t now, bool& changed) {
         auto setRight = [&](float v) { return slot.clip->SetRight(v); };
         auto animateRight = [&](IDCompositionAnimation* a) { return slot.clip->SetRight(a); };
+        HRESULT hr = S_OK;
         if (fresh && opening) {
-            // A new tab grows from nothing while its content fades in.
             constexpr motion::Timing open{motion::OpenMs, motion::EaseOut};
             if (!slot.effect && FAILED(hr = composition->CreateEffectGroup(&slot.effect))) return hr;
             if (FAILED(hr = slot.visual->SetEffect(slot.effect.Get()))) return hr;
@@ -595,6 +599,27 @@ struct TabHeaderRenderer::Impl {
             if (FAILED(hr = Move(slot.right, width, fresh ? Instant : timing, now, setRight, animateRight))) return hr;
             changed = true;
         }
+        return S_OK;
+    }
+    HRESULT UpdateTab(Slot& slot, const VisualState& state, const TabGeometry& geometry, const TabVisual& tab, const Inks& inks,
+                      motion::Timing timing, bool fresh, bool opening, std::uint64_t now, int fade, bool& changed) {
+        const auto& layout = state.layout;
+        const int width = layout.tabWidth, height = layout.viewport.bottom;
+        const bool dragged = tab.id == state.dragTab;
+        // A dropped tab glides into its slot on the reorder curve (when
+        // motion is on at all: an instant timing stays instant).
+        if (slot.dragged && !dragged && timing.milliseconds > 0) timing = {motion::ReorderMs, motion::Photon};
+        HRESULT hr = Reparent(slot, dragged, changed);
+        if (FAILED(hr)) return hr;
+        // The dragged tab follows the pointer exactly; everything else glides.
+        const double x = dragged ? state.dragX : geometry.x;
+        if (fresh || slot.x.to != x) {
+            if (FAILED(hr = Move(slot.x, x, fresh || dragged ? Instant : timing, now, [&](float v) { return slot.visual->SetOffsetX(v); },
+                                 [&](IDCompositionAnimation* a) { return slot.visual->SetOffsetX(a); })))
+                return hr;
+            changed = true;
+        }
+        if (FAILED(hr = Grow(slot, width, timing, fresh, opening, now, changed))) return hr;
         if (slot.height != height && FAILED(hr = slot.clip->SetBottom(static_cast<float>(height)))) return hr;
         if (FAILED(hr = Prepare(slot, width, height))) return hr;
         TabKey key = KeyFor(state, geometry, tab, inks, fade);
@@ -605,45 +630,23 @@ struct TabHeaderRenderer::Impl {
         }
         return S_OK;
     }
-    HRESULT UpdateTabs(const VisualState& state, const Inks& inks, std::vector<std::uint64_t> ids, motion::Change change,
-                       motion::Timing timing, bool animate, std::uint64_t now, bool& changed) {
-        const auto& layout = state.layout;
-        std::unordered_set<std::uint64_t> before;
-        if (animate && change == motion::Change::Membership) before.insert(previousIds.begin(), previousIds.end());
-        const int visible = layout.tabViewport.right - layout.tabViewport.left;
-        const int fade = std::min(visible / 2, MulDiv(24, static_cast<int>(layout.allocation.dpi), 96));
-        // Realise what is visible plus what a running scroll passes through.
-        const double shown = -scroll.At(now), wanted = layout.scroll;
-        const double low = std::min(shown, wanted), high = std::max(shown, wanted) + visible;
-        for (auto& slot : slots) slot->seen = false;
+    // The visual for a laid-out tab: normally at the same index, else found by id.
+    static const TabVisual* VisualFor(const VisualState& state, size_t index, std::uint64_t id) {
+        if (index < state.tabs.size() && state.tabs[index].id == id) return &state.tabs[index];
+        for (const auto& candidate : state.tabs)
+            if (candidate.id == id) return &candidate;
+        return nullptr;
+    }
+    // Slots nothing realised this frame. A tab that was just closed shrinks
+    // where it was while its neighbours slide in; anything else, and a ghost
+    // whose shrink has finished, is released.
+    HRESULT RetireSlots(const std::vector<std::uint64_t>& ids, bool closing, std::uint64_t now, bool& changed) {
         HRESULT hr = S_OK;
-        for (size_t i = 0; i < layout.tabs.size(); ++i) {
-            const auto& geometry = layout.tabs[i];
-            const TabVisual* tab = i < state.tabs.size() && state.tabs[i].id == geometry.id ? &state.tabs[i] : nullptr;
-            if (!tab)
-                for (const auto& candidate : state.tabs)
-                    if (candidate.id == geometry.id) tab = &candidate;
-            if (!tab) continue;
-            Slot* slot = FindSlot(geometry.id);
-            const double left = geometry.x, right = left + layout.tabWidth;
-            bool realise = (right > low && left < high) || geometry.id == state.dragTab;
-            if (!realise && slot && slot->x.Running(now)) {
-                const double at = slot->x.At(now);
-                realise = at + layout.tabWidth > low && at < high;
-            }
-            if (!realise) continue;
-            const bool fresh = !slot;
-            if (fresh && FAILED(hr = CreateSlot(geometry.id, slot))) return hr;
-            slot->seen = true;
-            const bool opening = fresh && !before.empty() && !before.contains(geometry.id);
-            if (FAILED(hr = UpdateTab(*slot, state, geometry, *tab, inks, timing, fresh, opening, now, fade, changed))) return hr;
-        }
         for (auto it = slots.begin(); it != slots.end();) {
             Slot& slot = **it;
             if (slot.seen) { ++it; continue; }
             const bool removed = std::find(ids.begin(), ids.end(), slot.id) == ids.end();
-            if (removed && !slot.ghost && animate && change == motion::Change::Membership) {
-                // A closed tab shrinks where it was while its neighbours slide in.
+            if (removed && !slot.ghost && closing) {
                 slot.ghost = true;
                 slot.ghostEnd = now + motion::CloseMs;
                 if (FAILED(hr = Move(slot.right, 0, {motion::CloseMs, motion::EaseOut}, now,
@@ -659,8 +662,125 @@ struct TabHeaderRenderer::Impl {
             it = slots.erase(it);
             changed = true;
         }
+        return S_OK;
+    }
+    HRESULT UpdateTabs(const VisualState& state, const Inks& inks, std::vector<std::uint64_t> ids, motion::Change change,
+                       const motion::Timing& timing, bool animate, std::uint64_t now, bool& changed) {
+        const auto& layout = state.layout;
+        const bool membership = animate && change == motion::Change::Membership;
+        std::unordered_set<std::uint64_t> before;
+        if (membership) before.insert(previousIds.begin(), previousIds.end());
+        const int visible = layout.tabViewport.right - layout.tabViewport.left;
+        const int fade = std::min(visible / 2, MulDiv(24, static_cast<int>(layout.allocation.dpi), 96));
+        // Realise what is visible plus what a running scroll passes through.
+        const double shown = -scroll.At(now), wanted = layout.scroll;
+        const double low = std::min(shown, wanted), high = std::max(shown, wanted) + visible;
+        for (const auto& slot : slots) slot->seen = false;
+        HRESULT hr = S_OK;
+        for (size_t i = 0; i < layout.tabs.size(); ++i) {
+            const auto& geometry = layout.tabs[i];
+            const TabVisual* tab = VisualFor(state, i, geometry.id);
+            if (!tab) continue;
+            Slot* slot = FindSlot(geometry.id);
+            const double left = geometry.x, right = left + layout.tabWidth;
+            bool realise = (right > low && left < high) || geometry.id == state.dragTab;
+            if (!realise && slot && slot->x.Running(now)) {
+                const double at = slot->x.At(now);
+                realise = at + layout.tabWidth > low && at < high;
+            }
+            if (!realise) continue;
+            const bool fresh = !slot;
+            if (fresh && FAILED(hr = CreateSlot(geometry.id, slot))) return hr;
+            slot->seen = true;
+            const bool opening = fresh && !before.empty() && !before.contains(geometry.id);
+            if (FAILED(hr = UpdateTab(*slot, state, geometry, *tab, inks, timing, fresh, opening, now, fade, changed))) return hr;
+        }
+        if (FAILED(hr = RetireSlots(ids, membership, now, changed))) return hr;
         previousIds = std::move(ids);
         previousWidth = layout.tabWidth;
+        return S_OK;
+    }
+    // Row background, overflow chevron and scroll arrows: one surface.
+    HRESULT PaintControls(const VisualState& state, const Inks& inks, bool& changed) {
+        const auto& layout = state.layout;
+        const int stripWidth = layout.viewport.right, stripHeight = layout.viewport.bottom;
+        const ControlsKey wanted{stripWidth, stripHeight, layout.allocation.dpi, EdgeOf(layout.overflow), EdgeOf(layout.scrollLeft),
+                                 EdgeOf(layout.scrollRight), layout.fadeLeft, layout.fadeRight, state.focused,
+                                 ControlOf(state.hot), ControlOf(state.pressed), ControlOf(state.focus), inks};
+        HRESULT hr = Prepare(controls, stripWidth, stripHeight);
+        if (FAILED(hr)) return hr;
+        if (controls.painted && wanted == controlsKey) return S_OK;
+        if (FAILED(hr = DrawSurface(controls, [&](ID2D1DeviceContext* dc) { return DrawControls(dc, state, inks); }))) return hr;
+        controlsKey = wanted;
+        changed = true;
+        return S_OK;
+    }
+    // The clipped tab area, moved only when the layout moves it.
+    HRESULT PlaceViewport(const RECT& area, bool& changed) {
+        if (EdgeOf(area) == placedViewport) return S_OK;
+        HRESULT hr = S_OK;
+        if (FAILED(hr = viewport->SetOffsetX(static_cast<float>(area.left))) ||
+            FAILED(hr = viewport->SetOffsetY(static_cast<float>(area.top))) || FAILED(hr = viewportClip->SetLeft(0.f)) ||
+            FAILED(hr = viewportClip->SetTop(0.f)) || FAILED(hr = viewportClip->SetRight(static_cast<float>(area.right - area.left))) ||
+            FAILED(hr = viewportClip->SetBottom(static_cast<float>(area.bottom - area.top))))
+            return hr;
+        placedViewport = EdgeOf(area);
+        changed = true;
+        return S_OK;
+    }
+    HRESULT ScrollTo(const VisualState& state, bool animate, std::uint64_t now, bool& changed) {
+        const int offset = state.layout.scroll;
+        if (hasPainted && scroll.to == -offset) return S_OK;
+        // Scrolling and scroll-into-view glide (Firefox: 150 ms ease-out).
+        // Under a dragged tab the row follows the pointer directly, or the
+        // tab would drift against the content it is being dropped into.
+        const motion::Timing glide = animate && !state.dragTab ? motion::Timing{motion::SettleMs, motion::EaseOut} : Instant;
+        const HRESULT hr = Move(scroll, -static_cast<double>(offset), glide, now, [&](float v) { return scroller->SetOffsetX(v); },
+                                [&](IDCompositionAnimation* a) { return scroller->SetOffsetX(a); });
+        if (FAILED(hr)) return hr;
+        changed = true;
+        return S_OK;
+    }
+    HRESULT PaintNewTab(const VisualState& state, const Inks& inks, const motion::Timing& movement, std::uint64_t now, bool& changed) {
+        const RECT plus = state.layout.newTab;
+        const NewTabKey wanted{plus.right - plus.left, plus.bottom - plus.top, state.layout.allocation.dpi, state.canCreate,
+                               state.hot.kind == TargetKind::NewTab,
+                               state.pressed.kind == TargetKind::NewTab && state.hot.kind == TargetKind::NewTab,
+                               state.focused && state.focus.kind == TargetKind::NewTab, inks};
+        HRESULT hr = Prepare(newTab, wanted.width, wanted.height);
+        if (FAILED(hr)) return hr;
+        if (!newTab.painted || !(wanted == newTabKey)) {
+            if (FAILED(hr = DrawSurface(newTab, [&](ID2D1DeviceContext* dc) { return DrawNewTab(dc, wanted); }))) return hr;
+            newTabKey = wanted;
+            changed = true;
+        }
+        if (hasPainted && newTabX.to == plus.left) return S_OK;
+        // The new-tab button travels with the end of the tab row.
+        if (FAILED(hr = Move(newTabX, plus.left, hasPainted ? movement : Instant, now,
+                             [&](float v) { return newTab.visual->SetOffsetX(v); },
+                             [&](IDCompositionAnimation* a) { return newTab.visual->SetOffsetX(a); })) ||
+            FAILED(hr = newTab.visual->SetOffsetY(static_cast<float>(plus.top))))
+            return hr;
+        changed = true;
+        return S_OK;
+    }
+    // Drops cached icon bitmaps no tab shows any more.
+    void PrunePictures(const VisualState& state) {
+        std::erase_if(pictures, [&](const Picture& cached) {
+            return std::none_of(state.tabs.begin(), state.tabs.end(), [&](const TabVisual& tab) {
+                return tab.id == cached.id && tab.iconRevision == cached.revision && tab.icon == cached.handle;
+            });
+        });
+    }
+    // Readiness is established once for a new target. Ordinary hover, resize,
+    // focus and metadata paints never synchronously wait for the compositor.
+    HRESULT Commit() {
+        HRESULT hr = composition->Commit();
+        if (FAILED(hr)) return hr;
+        if (firstSurface) {
+            if (FAILED(hr = composition->WaitForCommitCompletion())) return hr;
+            firstSurface = false;
+        }
         return S_OK;
     }
     HRESULT Paint(HWND owned, const VisualState& state) {
@@ -676,80 +796,24 @@ struct TabHeaderRenderer::Impl {
         const bool animate = state.animate && hasPainted && stripWidth == previousStripWidth &&
                              stripHeight == previousStripHeight && scale == previousDpi;
         const Inks inks = MakeInks(state);
-        bool changed = !hasPainted;
-        const ControlsKey controlsWanted{stripWidth, stripHeight, scale, EdgeOf(layout.overflow), EdgeOf(layout.scrollLeft),
-                                         EdgeOf(layout.scrollRight), layout.fadeLeft, layout.fadeRight, state.focused,
-                                         ControlOf(state.hot), ControlOf(state.pressed), ControlOf(state.focus), inks};
-        if (FAILED(hr = Prepare(controls, stripWidth, stripHeight))) return hr;
-        if (!controls.painted || !(controlsWanted == controlsKey)) {
-            if (FAILED(hr = DrawSurface(controls, [&](ID2D1DeviceContext* dc) { return DrawControls(dc, state, inks); }))) return hr;
-            controlsKey = controlsWanted;
-            changed = true;
-        }
-        const RECT area = layout.tabViewport;
-        if (!(EdgeOf(area) == placedViewport)) {
-            if (FAILED(hr = viewport->SetOffsetX(static_cast<float>(area.left))) ||
-                FAILED(hr = viewport->SetOffsetY(static_cast<float>(area.top))) || FAILED(hr = viewportClip->SetLeft(0.f)) ||
-                FAILED(hr = viewportClip->SetTop(0.f)) || FAILED(hr = viewportClip->SetRight(static_cast<float>(area.right - area.left))) ||
-                FAILED(hr = viewportClip->SetBottom(static_cast<float>(area.bottom - area.top))))
-                return hr;
-            placedViewport = EdgeOf(area);
-            changed = true;
-        }
-        if (!hasPainted || scroll.to != -layout.scroll) {
-            // Scrolling and scroll-into-view glide (Firefox: 150 ms ease-out).
-            // Under a dragged tab the row follows the pointer directly, or the
-            // tab would drift against the content it is being dropped into.
-            const motion::Timing glide = animate && !state.dragTab ? motion::Timing{motion::SettleMs, motion::EaseOut} : Instant;
-            if (FAILED(hr = Move(scroll, -static_cast<double>(layout.scroll), glide, now, [&](float v) { return scroller->SetOffsetX(v); },
-                                 [&](IDCompositionAnimation* a) { return scroller->SetOffsetX(a); })))
-                return hr;
-            changed = true;
-        }
         std::vector<std::uint64_t> ids;
         ids.reserve(layout.tabs.size());
         for (const auto& tab : layout.tabs) ids.push_back(tab.id);
         const auto change = motion::Classify(previousIds, ids, previousWidth, layout.tabWidth);
         const motion::Timing movement = animate ? motion::TimingFor(change) : Instant;
-        if (FAILED(hr = UpdateTabs(state, inks, std::move(ids), change, movement, animate, now, changed))) return hr;
-        const RECT plus = layout.newTab;
-        const NewTabKey newTabWanted{plus.right - plus.left, plus.bottom - plus.top, scale, state.canCreate,
-                                     state.hot.kind == TargetKind::NewTab,
-                                     state.pressed.kind == TargetKind::NewTab && state.hot.kind == TargetKind::NewTab,
-                                     state.focused && state.focus.kind == TargetKind::NewTab, inks};
-        if (FAILED(hr = Prepare(newTab, newTabWanted.width, newTabWanted.height))) return hr;
-        if (!newTab.painted || !(newTabWanted == newTabKey)) {
-            if (FAILED(hr = DrawSurface(newTab, [&](ID2D1DeviceContext* dc) { return DrawNewTab(dc, newTabWanted); }))) return hr;
-            newTabKey = newTabWanted;
-            changed = true;
-        }
-        if (!hasPainted || newTabX.to != plus.left) {
-            // The new-tab button travels with the end of the tab row.
-            if (FAILED(hr = Move(newTabX, plus.left, hasPainted ? movement : Instant, now,
-                                 [&](float v) { return newTab.visual->SetOffsetX(v); },
-                                 [&](IDCompositionAnimation* a) { return newTab.visual->SetOffsetX(a); })) ||
-                FAILED(hr = newTab.visual->SetOffsetY(static_cast<float>(plus.top))))
-                return hr;
-            changed = true;
-        }
-        std::erase_if(pictures, [&](const Picture& cached) {
-            return std::none_of(state.tabs.begin(), state.tabs.end(), [&](const TabVisual& tab) {
-                return tab.id == cached.id && tab.iconRevision == cached.revision && tab.icon == cached.handle;
-            });
-        });
+        bool changed = !hasPainted;
+        // Order matters: the tabs realise against the scroll that was just started.
+        if (FAILED(hr = PaintControls(state, inks, changed)) || FAILED(hr = PlaceViewport(layout.tabViewport, changed)) ||
+            FAILED(hr = ScrollTo(state, animate, now, changed)) ||
+            FAILED(hr = UpdateTabs(state, inks, std::move(ids), change, movement, animate, now, changed)) ||
+            FAILED(hr = PaintNewTab(state, inks, movement, now, changed)))
+            return hr;
+        PrunePictures(state);
         previousStripWidth = stripWidth;
         previousStripHeight = stripHeight;
         previousDpi = scale;
         hasPainted = true;
-        if (!changed) return S_FALSE;
-        if (FAILED(hr = composition->Commit())) return hr;
-        // Establish readiness once for the new target. Ordinary hover, resize,
-        // focus and metadata paints never synchronously wait for the compositor.
-        if (firstSurface) {
-            if (FAILED(hr = composition->WaitForCommitCompletion())) return hr;
-            firstSurface = false;
-        }
-        return S_OK;
+        return changed ? Commit() : S_FALSE;
     }
     unsigned PendingMs() const {
         const std::uint64_t now = GetTickCount64();
@@ -760,7 +824,7 @@ struct TabHeaderRenderer::Impl {
     void Invalidate() {
         dpi = 0;
         controls.painted = newTab.painted = false;
-        for (auto& slot : slots) slot->painted = false;
+        for (const auto& slot : slots) slot->painted = false;
     }
     ~Impl() {
         if (target) target->SetRoot(nullptr);

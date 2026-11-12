@@ -1,5 +1,11 @@
 # Explorer MVP status
 
+## 10–12 November 2026: tab strip refinement round
+
+Tab switching no longer waits for Explorer: the strip highlights the new tab at once, the latest request wins when tabs are pressed quickly, and the folder view is restored in one pass. Sessions are saved once after a short pause instead of on every switch. The strip scrolls when tabs no longer fit (up to 500 tabs, Firefox-style minimum width, arrows, wheel and reveal), tabs reorder live under the pointer, and opening, closing and moving use Firefox's timings. Tabs in the title bar use the window's own caption colours. The hidden starter now wakes only for top-level windows, and setup is a single file that verifies every embedded file before installing. An *Animate tabs* option turns the motion off.
+
+Measured results, what was proven in Windows Sandbox and the known limits are in `docs/reports/2026-11-10-refinement-report.md`.
+
 ## 4 November 2026 follow-up: tab startup and snap transition fixes installed
 
 The installed follow-up payload is `7d82f98aba3dc4472824ad72113316d619fb2da172329dbb6b5b65301d8a4e68`. Tabs had remained off in a newly opened frame after a temporary header-layout rejection; the controller now retries safely for up to two seconds. Persistent failure still restores ordinary chrome and preserves the saved session. Side-to-side snapping now repositions an already-arranged window directly, avoiding the native Win+Arrow restore cycle through its floating position.

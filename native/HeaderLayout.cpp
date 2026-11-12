@@ -10,6 +10,13 @@ bool Empty(const RECT& r) { return r.right<=r.left || r.bottom<=r.top; }
 bool Overlap(const RECT& a,const RECT& b) {
     return !Empty(a)&&!Empty(b)&&a.left<b.right&&b.left<a.right&&a.top<b.bottom&&b.top<a.bottom;
 }
+// The smallest scroll change that shows [left, left+width) in a view
+// `visible` pixels wide, kept inside the scrollable range.
+int ScrollToShow(int left,int width,int scroll,int visible,int maxScroll) {
+    if(left<scroll)scroll=left;
+    else if(left+width>scroll+visible)scroll=left+width-visible;
+    return std::clamp(scroll,0,maxScroll);
+}
 }
 bool TabGeometry::Visible() const { return !Empty(bounds); }
 bool LayoutState::Usable() const { return allocation.region!=Region::Unavailable&&!Empty(viewport); }
@@ -30,14 +37,8 @@ TargetId LayoutState::Hit(POINT p) const {
     return {};
 }
 int LayoutState::Reveal(std::uint64_t id) const {
-    for(size_t i=0;i<tabs.size();++i)if(tabs[i].id==id){
-        const int visible=tabViewport.right-tabViewport.left,left=tabs[i].x;
-        int target=scroll;
-        if(left<target)target=left;
-        else if(left+tabWidth>target+visible)target=left+tabWidth-visible;
-        return std::clamp(target,0,maxScroll);
-    }
-    return scroll;
+    const TabGeometry* tab=Find(id);
+    return tab?ScrollToShow(tab->x,tabWidth,scroll,tabViewport.right-tabViewport.left,maxScroll):scroll;
 }
 TabGeometry LocalTab(int width,int height,UINT dpi,bool showClose) {
     TabGeometry tab;tab.showClose=showClose;tab.bounds={0,0,width,height};tab.body=tab.bounds;
@@ -93,12 +94,8 @@ LayoutState BuildLayout(const Allocation& allocation,std::span<const std::uint64
     result.maxScroll=std::max(0,result.contentWidth-visible);
     int scroll=std::clamp(input.scroll,0,result.maxScroll);
     const auto found=std::find(ids.begin(),ids.end(),active);
-    if(input.revealActive&&found!=ids.end()){
-        const int left=static_cast<int>(found-ids.begin())*tabWidth;
-        if(left<scroll)scroll=left;
-        else if(left+tabWidth>scroll+visible)scroll=left+tabWidth-visible;
-        scroll=std::clamp(scroll,0,result.maxScroll);
-    }
+    if(input.revealActive&&found!=ids.end())
+        scroll=ScrollToShow(static_cast<int>(found-ids.begin())*tabWidth,tabWidth,scroll,visible,result.maxScroll);
     result.scroll=scroll;result.fadeLeft=scroll>0;result.fadeRight=scroll<result.maxScroll;
     const bool narrow=tabWidth<MulDiv(TabClipDip,dpi,96);
     bool anyVisible=false;

@@ -61,12 +61,12 @@ void NavigateMarked(HWND frame,const std::wstring& folder,const char* label){
   VARIANT destination{};destination.vt=VT_BSTR;destination.bstrVal=SysAllocString(folder.c_str());VARIANT empty{};
   Mark(label);browser->Navigate2(&destination,&empty,&empty,&empty,&empty);VariantClear(&destination);Pump(2000);return;}
 }
-void SwitchRounds(HWND frame,WORD first,WORD second,unsigned rounds,const char* label){
+void SwitchRounds(WORD first,WORD second,unsigned rounds,const char* label){
  for(unsigned i=0;i<rounds;++i){Mark(label,first);CtrlKey(first);Pump(1800);Mark(label,second);CtrlKey(second);Pump(2200);}
 }
 template<class Check> bool RapidSwitchAndMeasure(HWND frame,Check& check,std::ostream& out){
  Navigate(frame,L"C:\\NativeLabFolders\\Big");Pump(1500);
- Mark("phase",3);SwitchRounds(frame,'1','3',8,"input-switch");
+ Mark("phase",3);SwitchRounds('1','3',8,"input-switch");
  Mark("phase",4);CtrlKey('1');Pump(1500);
  for(unsigned i=0;i<8;++i){NavigateMarked(frame,L"C:\\NativeLabFolders\\Big","input-plain");NavigateMarked(frame,L"C:\\NativeLabFolders\\Alpha","input-plain");}
  Mark("phase",5);CtrlKey('T');Pump(1500);CtrlKey('T');Pump(1500);CtrlKey('1');Pump(1500);
@@ -82,7 +82,7 @@ template<class Check> bool RapidSwitchAndMeasure(HWND frame,Check& check,std::os
  for(size_t target:{size_t{10},size_t{120}}){
   size_t stuck=0;while(TabCount(frame)<target&&stuck<3){const size_t n=TabCount(frame);Mark("input-new",n);CtrlKey('T');Pump(500);stuck=TabCount(frame)==n?stuck+1:0;}
   out<<",\"tabs"<<target<<"\":"<<TabCount(frame);
-  Mark("phase",static_cast<ULONGLONG>(TabCount(frame)));SwitchRounds(frame,'1','9',5,"input-switch-many");
+  Mark("phase",static_cast<ULONGLONG>(TabCount(frame)));SwitchRounds('1','9',5,"input-switch-many");
  }
  return after==(before+3)%5;
 }
@@ -114,7 +114,7 @@ void LogNote(const std::wstring& path,const char* note){HANDLE file=path.empty()
 int MotionAfter(const std::wstring& path,const char* note){HANDLE file=path.empty()?INVALID_HANDLE_VALUE:CreateFileW(path.c_str(),GENERIC_READ,FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE,nullptr,OPEN_EXISTING,0,nullptr);if(file==INVALID_HANDLE_VALUE)return -1;
  std::string text;char buffer[4096];DWORD read{};while(ReadFile(file,buffer,sizeof(buffer),&read,nullptr)&&read)text.append(buffer,read);CloseHandle(file);
  const size_t from=text.rfind(std::string(" note ")+note);if(from==std::string::npos)return -1;
- int longest=0;for(size_t i=text.find(" motion ",from);i!=std::string::npos;i=text.find(" motion ",i+1))longest=std::max(longest,atoi(text.c_str()+i+8));return longest;}
+ int longest=0;for(size_t i=text.find(" motion ",from);i!=std::string::npos;i=text.find(" motion ",i+1))longest=std::max(longest,static_cast<int>(std::strtol(text.c_str()+i+8,nullptr,10)));return longest;}
 void Glide(POINT a,POINT b){for(int i=1;i<=20;++i){SetCursorPos(a.x+(b.x-a.x)*i/20,a.y+(b.y-a.y)*i/20);Pump(35);}}
 // Writes the Options "Animate tabs" bit and tells the frame, as Options does.
 void TabMotion(HWND frame,bool on,const std::vector<BYTE>& saved){patch::Config c;if(saved.size()==sizeof(c))std::memcpy(&c,saved.data(),sizeof(c));c.flags|=patch::ExplorerTabs;if(on)c.flags&=~DWORD(patch::NoTabAnimations);else c.flags|=patch::NoTabAnimations;

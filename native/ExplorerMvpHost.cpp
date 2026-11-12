@@ -141,7 +141,9 @@ LRESULT CALLBACK HostProc(HWND window,UINT message,WPARAM w,LPARAM l) {
         }
         return 0;
     }
-    case WM_DESTROY:PostQuitMessage(0);return 0;
+    case WM_DESTROY:
+        if(shellHook)DeregisterShellHookWindow(window);
+        PostQuitMessage(0);return 0;
     }
     return DefWindowProcW(window,message,w,l);
 }

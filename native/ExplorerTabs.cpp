@@ -1175,6 +1175,7 @@ class Controller final : public IObjectWithSite, public IAccessible, public IDro
     void ApplyRestore();
     void CancelRestore();
     bool IsViewInput(const MSG &) const;
+    bool HookedInput(const MSG &);
     bool Shortcut(UINT key, bool ctrl, bool shift, bool alt, bool repeated);
     bool BackspaceTravels(bool repeated);
     void RetryHeader();
@@ -1215,10 +1216,16 @@ class Controller final : public IObjectWithSite, public IAccessible, public IDro
     LONG TargetChild(header::TargetId) const;
     bool ValidChild(VARIANT v) const {return v.vt==VT_I4&&v.lVal>=0&&v.lVal<=static_cast<LONG>(tabs_.size()*2+2);}
     void Mouse(UINT, WPARAM, LPARAM);
+    void MouseMove(POINT);
+    void ButtonDown(UINT, POINT);
+    void LeftUp(POINT);
+    void MiddleUp(POINT);
     bool BeginStartupGuard();
     void CompleteStartupGuard();
     void LegacyBand(bool);
     void BindFolderDrop();
+    DWORD DropTab(Tab, POINTL, DWORD);
+    DWORD DropFolders(IDataObject *, DWORD);
     HRESULT ChildName(LONG, BSTR *);
     bool ChildRect(LONG, RECT &) const;
     HRESULT AccessTypeInfo();
@@ -2078,7 +2085,8 @@ void Controller::ApplyRestore()
     CancelRestore();
     timing::Mark("restore");
     Restore(browser.Get(),state);
-}bool Controller::IsViewInput(const MSG& message) const
+}
+bool Controller::IsViewInput(const MSG& message) const
 {
     if(!restoreView_||!(message.hwnd==restoreView_||IsChild(restoreView_,message.hwnd)))return false;
     switch(message.message)
@@ -2599,10 +2607,7 @@ void Controller::Menu(int hit, POINT point)
 void Controller::CancelPointer()
 {
     // Escape, a lost capture or a disabled header put a dragged tab back.
-    if(reordering_){
-        timing::Mark("reordercancel",(Ready()?1:0)|(strip_&&GetCapture()==strip_?2:0)|(rendererReady_?4:0),static_cast<ULONGLONG>(dragPointer_.x));
-        EndReorder(false);
-    }
+    if(reordering_)EndReorder(false);
     pressedTarget_={};pressedButton_=0;
     if(strip_)KillTimer(strip_,ScrollTimer);
     if(strip_&&GetCapture()==strip_)ReleaseCapture();
@@ -2827,100 +2832,104 @@ std::wstring Controller::TooltipText(header::TargetId target) const
     }
     return text;
 }
+void Controller::MouseMove(POINT point)
+{
+    if(reordering_){Reorder(point);return;}
+    const auto target=layout_.Hit(point);
+    if (hotTarget_!=target)
+    {
+        hotTarget_=target;
+        InvalidateRect(strip_, nullptr, FALSE);
+    }
+    Tooltip(target);
+    TRACKMOUSEEVENT t{sizeof(t), TME_LEAVE, strip_, 0};
+    TrackMouseEvent(&t);
+    const bool pressingTab=pressedButton_==WM_LBUTTONDOWN&&pressedTarget_.kind==header::TargetKind::Tab&&
+        (GetKeyState(VK_LBUTTON)&0x8000)&&!inDrag_;
+    if(!pressingTab)return;
+    if(abs(point.x-dragStart_.x)<GetSystemMetrics(SM_CXDRAG)&&abs(point.y-dragStart_.y)<GetSystemMetrics(SM_CYDRAG))return;
+    // Within the strip a drag reorders in place; a tab pulled
+    // straight out (or the only tab) starts the Shell drag.
+    if(tabs_.size()>1&&InReorderBand(point)){BeginReorder(point);return;}
+    const auto source=pressedTarget_.tab;
+    CancelPointer();
+    if(const int index=Index(source);index>=0)StartDrag(static_cast<size_t>(index));
+}
+void Controller::ButtonDown(UINT message, POINT point)
+{
+    const int hit=Hit(point);
+    CancelPointer();
+    FocusTarget(layout_.Hit(point));
+    pressedButton_=message;
+    pressedTarget_=layout_.Hit(point);hotTarget_=pressedTarget_;
+    InvalidateRect(strip_,nullptr,FALSE);
+    dragStart_ = point;
+    SetCapture(strip_);
+    if(message==WM_LBUTTONDOWN&&hit==-4){ScrollRepeat(true);return;}
+    if (hit == -1)
+    {
+        ReleaseCapture();
+        POINT screen = point;
+        ClientToScreen(strip_, &screen);
+        SendMessageW(frame_, WM_NCLBUTTONDOWN, HTCAPTION, MAKELPARAM(screen.x, screen.y));
+    }
+}
+void Controller::LeftUp(POINT point)
+{
+    if(reordering_) {
+        // Dropping keeps the new order and shows the dragged tab.
+        const ULONGLONG dropped=dragTab_;
+        EndReorder(true);
+        CancelPointer();
+        if(const int index=Index(dropped);index>=0)Activate(static_cast<size_t>(index));
+        return;
+    }
+    const auto was=pressedTarget_;
+    const bool valid=pressedButton_==WM_LBUTTONDOWN&&GetCapture()==strip_&&was==layout_.Hit(point);
+    // Capture-change cleanup can run synchronously during ReleaseCapture.
+    // Preserve the intended ordinary up action before releasing it.
+    CancelPointer();
+    // Closing with the mouse keeps tab widths until the pointer leaves the
+    // strip, so the next close button lands under it (Firefox).
+    if(valid&&was.kind==header::TargetKind::Close&&!layout_.overflowing)lockedWidth_=layout_.tabWidth;
+    // Scroll arrows act on press and repeat while held; release only stops them.
+    const bool arrow=was.kind==header::TargetKind::ScrollLeft||was.kind==header::TargetKind::ScrollRight;
+    if(valid&&!arrow)InvokeTarget(was);
+}
+void Controller::MiddleUp(POINT point)
+{
+    const auto was=pressedTarget_;
+    const auto now=layout_.Hit(point);
+    const bool valid=pressedButton_==WM_MBUTTONDOWN&&GetCapture()==strip_&&was.tab&&was.tab==now.tab&&was==now;
+    CancelPointer();
+    if(valid&&!layout_.overflowing)lockedWidth_=layout_.tabWidth;
+    if(valid)InvokeTarget({header::TargetKind::Close,was.tab});
+}
 void Controller::Mouse(UINT message, WPARAM, LPARAM data)
 {
     if(!Ready()){CancelPointer();return;}
     POINT point{GET_X_LPARAM(data), GET_Y_LPARAM(data)};
-    int hit = Hit(point);
-    if (message == WM_MOUSEMOVE)
+    switch (message)
     {
-        if(reordering_){Reorder(point);return;}
-        const auto target=layout_.Hit(point);
-        if (hotTarget_!=target)
-        {
-            hotTarget_=target;
-            InvalidateRect(strip_, nullptr, FALSE);
-        }
-        Tooltip(target);
-        TRACKMOUSEEVENT t{sizeof(t), TME_LEAVE, strip_, 0};
-        TrackMouseEvent(&t);
-        if (pressedButton_==WM_LBUTTONDOWN&&pressedTarget_.kind==header::TargetKind::Tab&& (GetKeyState(VK_LBUTTON) & 0x8000) && !inDrag_)
-        {
-            if (abs(point.x - dragStart_.x) >= GetSystemMetrics(SM_CXDRAG) ||
-                abs(point.y - dragStart_.y) >= GetSystemMetrics(SM_CYDRAG))
-            {
-                // Within the strip a drag reorders in place; a tab pulled
-                // straight out (or the only tab) starts the Shell drag.
-                if(tabs_.size()>1&&InReorderBand(point))BeginReorder(point);
-                else {
-                    const auto source=pressedTarget_.tab;
-                    CancelPointer();
-                    const int index=Index(source);if(index>=0)StartDrag(index);
-                }
-            }
-        }
-        return;
-    }
-    if (message == WM_LBUTTONDOWN||message==WM_MBUTTONDOWN)
+    case WM_MOUSEMOVE: MouseMove(point); break;
+    case WM_LBUTTONDOWN:
+    case WM_MBUTTONDOWN: ButtonDown(message, point); break;
+    case WM_LBUTTONUP: LeftUp(point); break;
+    case WM_MBUTTONUP: MiddleUp(point); break;
+    case WM_RBUTTONUP:
     {
-        CancelPointer();
-        FocusTarget(layout_.Hit(point));
-        pressedButton_=message;
-        pressedTarget_=layout_.Hit(point);hotTarget_=pressedTarget_;
-        InvalidateRect(strip_,nullptr,FALSE);
-        dragStart_ = point;
-        SetCapture(strip_);
-        if(message==WM_LBUTTONDOWN&&hit==-4){ScrollRepeat(true);return;}
-        if (hit == -1)
-        {
-            ReleaseCapture();
-            POINT screen = point;
-            ClientToScreen(strip_, &screen);
-            SendMessageW(frame_, WM_NCLBUTTONDOWN, HTCAPTION, MAKELPARAM(screen.x, screen.y));
-        }
-        return;
-    }
-    if (message == WM_LBUTTONUP)
-    {
-        if(reordering_) {
-            // Dropping keeps the new order and shows the dragged tab.
-            const ULONGLONG dropped=dragTab_;
-            EndReorder(true);
-            CancelPointer();
-            if(const int index=Index(dropped);index>=0)Activate(static_cast<size_t>(index));
-            return;
-        }
-        const auto was=pressedTarget_;
-        const bool valid=pressedButton_==WM_LBUTTONDOWN&&GetCapture()==strip_&&was==layout_.Hit(point);
-        // Capture-change cleanup can run synchronously during ReleaseCapture.
-        // Preserve the intended ordinary up action before releasing it.
-        CancelPointer();
-        // Closing with the mouse keeps tab widths until the pointer leaves the
-        // strip, so the next close button lands under it (Firefox).
-        if(valid&&was.kind==header::TargetKind::Close&&!layout_.overflowing)lockedWidth_=layout_.tabWidth;
-        // Scroll arrows act on press and repeat while held; release only stops them.
-        const bool arrow=was.kind==header::TargetKind::ScrollLeft||was.kind==header::TargetKind::ScrollRight;
-        if(valid&&!arrow)InvokeTarget(was);
-        return;
-    }
-    if (message == WM_MBUTTONUP)
-    {
-        const auto was=pressedTarget_;
-        const auto now=layout_.Hit(point);
-        const bool valid=pressedButton_==WM_MBUTTONDOWN&&GetCapture()==strip_&&was.tab&&was.tab==now.tab&&was==now;
-        CancelPointer();
-        if(valid&&!layout_.overflowing)lockedWidth_=layout_.tabWidth;
-        if(valid)InvokeTarget({header::TargetKind::Close,was.tab});
-        return;
-    }
-    if (message == WM_RBUTTONUP)
-    {
+        const int hit = Hit(point);
         ClientToScreen(strip_, &point);
         Menu(hit, point);
-        return;
+        break;
     }
-    if (message == WM_LBUTTONDBLCLK && hit == -1)
-        SendMessageW(frame_, WM_SYSCOMMAND, IsZoomed(frame_) ? SC_RESTORE : SC_MAXIMIZE, 0);
+    case WM_LBUTTONDBLCLK:
+        if (Hit(point) == -1)
+            SendMessageW(frame_, WM_SYSCOMMAND, IsZoomed(frame_) ? SC_RESTORE : SC_MAXIMIZE, 0);
+        break;
+    default:
+        break;
+    }
 }
 LRESULT CALLBACK Controller::StripProc(HWND h, UINT m, WPARAM w, LPARAM l)
 {
@@ -3245,7 +3254,7 @@ LRESULT CALLBACK Controller::TravelProc(HWND h, UINT m, WPARAM w, LPARAM l, UINT
 bool Controller::Shortcut(UINT key, bool ctrl, bool shift, bool alt, bool repeated)
 {
     using Action = bool (*)(Controller&, UINT key, bool repeated);
-    struct Binding { UINT first, last; bool ctrl, shift, alt, repeats; Action run; };
+    struct Binding { UINT first{}, last{}; bool ctrl{}, shift{}, alt{}, repeats{}; Action run{}; };
     static constexpr auto step=[](Controller& c,int delta){
         if(c.tabs_.empty())return true;
         const auto count=static_cast<long long>(c.tabs_.size());
@@ -3302,6 +3311,31 @@ void Controller::MoveTab(int direction)
     Shift(from,to);
     TabChanged();
 }
+// A message this thread is about to dispatch. True when a tab shortcut or a
+// mouse travel button consumed it; other input into the view cancels a
+// pending view restore so the user's own scrolling or selection wins.
+bool Controller::HookedInput(const MSG &message)
+{
+    bool eat = false;
+    if (message.message == WM_KEYDOWN || message.message == WM_SYSKEYDOWN)
+    {
+        const bool ctrl = (GetKeyState(VK_CONTROL) & 0x8000) != 0, shift = (GetKeyState(VK_SHIFT) & 0x8000) != 0,
+                   alt = (GetKeyState(VK_MENU) & 0x8000) != 0;
+        const UINT key = static_cast<UINT>(message.wParam);
+        if(key==VK_ESCAPE)CancelPointer();
+        eat = Shortcut(key, ctrl, shift, alt, (message.lParam & (1ll << 30)) != 0);
+    }
+    else if (message.message == WM_XBUTTONUP)
+    {
+        History(GET_XBUTTON_WPARAM(message.wParam) == XBUTTON1 ? -1 : 1);
+        eat = true;
+    }
+    else if (message.message == WM_XBUTTONDOWN)
+        eat = true;
+    if (!eat && restoreState_ && IsViewInput(message))
+        CancelRestore();
+    return eat;
+}
 LRESULT CALLBACK Controller::KeyProc(int code, WPARAM remove, LPARAM data)
 {
     if (code >= 0 && remove == PM_REMOVE)
@@ -3314,25 +3348,7 @@ LRESULT CALLBACK Controller::KeyProc(int code, WPARAM remove, LPARAM data)
         {
             self->AddRef();
             struct Reference {Controller* owner;~Reference(){owner->Release();}} reference{self};
-            bool eat = false;
-            if (message->message == WM_KEYDOWN || message->message == WM_SYSKEYDOWN)
-            {
-                const bool ctrl = (GetKeyState(VK_CONTROL) & 0x8000) != 0, shift = (GetKeyState(VK_SHIFT) & 0x8000) != 0,
-                           alt = (GetKeyState(VK_MENU) & 0x8000) != 0;
-                const UINT key = static_cast<UINT>(message->wParam);
-                if(key==VK_ESCAPE)self->CancelPointer();
-                eat = self->Shortcut(key, ctrl, shift, alt, (message->lParam & (1ll << 30)) != 0);
-            }
-            else if (message->message == WM_XBUTTONUP)
-            {
-                self->History(GET_XBUTTON_WPARAM(message->wParam) == XBUTTON1 ? -1 : 1);
-                eat = true;
-            }
-            else if (message->message == WM_XBUTTONDOWN)
-                eat = true;
-            if (!eat && self->restoreState_ && self->IsViewInput(*message))
-                self->CancelRestore();
-            if (eat)
+            if (self->HookedInput(*message))
             {
                 message->message = WM_NULL;
                 message->wParam = 0;
@@ -3385,7 +3401,7 @@ HRESULT Controller::AccessTypeInfo()
 }
 void Controller::LimitMemory()
 {
-    constexpr size_t budget = 32 * 1024 * 1024;
+    constexpr size_t budget = size_t{32} * 1024 * 1024;
     auto size = [](const ViewState &s) {
         size_t n = 0;
         for (auto *p : {&s.folder, &s.focused, &s.anchor})
@@ -3524,9 +3540,8 @@ void Controller::StartDrag(size_t index)
     DWORD effect = 0;
     if (data && sourceObject)
     {
-        const HRESULT dropped=DoDragDrop(data.Get(), sourceObject.Get(), DROPEFFECT_MOVE | DROPEFFECT_COPY, &effect);
+        DoDragDrop(data.Get(), sourceObject.Get(), DROPEFFECT_MOVE | DROPEFFECT_COPY, &effect);
         inDrag_ = false;
-        timing::Mark("dragdrop", effect, (dropped==DRAGDROP_S_DROP?1:0)|(sourceObject->released?2:0)|(sourceObject->escaped?4:0));
         auto i = std::find_if(tabs_.begin(), tabs_.end(), [&](auto &t) { return t.id == source; });
         if (i != tabs_.end() && frame_ && enabled_)
         {
@@ -3538,7 +3553,6 @@ void Controller::StartDrag(size_t index)
                 POINT point{};
                 GetCursorPos(&point);
                 HWND target = GetAncestor(WindowFromPoint(point), GA_ROOT);
-                timing::Mark("dragout", target == frame_ ? 1 : 0, (pending_ ? 1 : 0) | (detached_ ? 2 : 0));
                 if (target != frame_)
                     DetachTab(position);
             }
@@ -3646,7 +3660,6 @@ HRESULT Controller::DragEnter(IDataObject *object, DWORD keys, POINTL point, DWO
     dropObject_ = object;
     FORMATETC f{static_cast<CLIPFORMAT>(TabFormat()), nullptr, DVASPECT_CONTENT, -1, TYMED_HGLOBAL};
     dropPrivate_ = object && SUCCEEDED(object->QueryGetData(&f));
-    timing::Mark("dragenter", dropPrivate_ ? 1 : 0, *effect);
     hoverDrop_ = -1;
     hoverStart_ = GetTickCount64();
     BindFolderDrop();
@@ -3727,51 +3740,25 @@ HRESULT Controller::Drop(IDataObject *object, DWORD keys, POINTL point, DWORD *e
     STGMEDIUM medium{};
     if (object && SUCCEEDED(object->GetData(&f, &medium)))
     {
+        // A tab packet is handled here and nowhere else, even when it is unreadable.
+        std::optional<Tab> tab;
         if (medium.tymed == TYMED_HGLOBAL)
         {
-            SIZE_T size = GlobalSize(medium.hGlobal);
+            const SIZE_T size = GlobalSize(medium.hGlobal);
             const BYTE *data = static_cast<const BYTE *>(GlobalLock(medium.hGlobal));
-            auto tab = Deserialize(data, size);
+            tab = Deserialize(data, size);
             if (data)
                 GlobalUnlock(medium.hGlobal);
-            if (tab)
-            {
-                POINT local{point.x, point.y};
-                ScreenToClient(strip_, &local);
-                int hit = Hit(local);
-                if (tab->sourceFrame == frame_ && tab->sourceProcess == GetCurrentProcessId())
-                {
-                    auto i = std::find_if(tabs_.begin(), tabs_.end(), [&](auto &t) { return t.id == tab->sourceId; });
-                    if (i != tabs_.end() && !pending_)
-                    {
-                        ULONGLONG activeId = tabs_[active_].id;
-                        size_t from = static_cast<size_t>(i - tabs_.begin()),
-                               to = hit >= 0 ? static_cast<size_t>(hit) : tabs_.size() - 1;
-                        Tab moved = std::move(*i);
-                        tabs_.erase(i);
-                        to = std::min(to, tabs_.size());
-                        tabs_.insert(tabs_.begin() + static_cast<ptrdiff_t>(to), std::move(moved));
-                        auto active =
-                            std::find_if(tabs_.begin(), tabs_.end(), [&](auto &t) { return t.id == activeId; });
-                        active_ = static_cast<size_t>(active - tabs_.begin());
-                        sameWindowDrop_ = true;
-                        *effect = allowed & DROPEFFECT_MOVE;
-                        TabChanged();
-                        (void)from;
-                    }
-                }
-                else if (Import(std::move(*tab), false))
-                    *effect = allowed & DROPEFFECT_MOVE;
-            }
-            timing::Mark("droptab", *effect, (tab ? 1 : 0) | (pending_ ? 2 : 0) | (enabled_ ? 4 : 0));
         }
         ReleaseStgMedium(&medium);
+        if (tab)
+            *effect = DropTab(std::move(*tab), point, allowed);
         DragLeave();
         return S_OK;
     }
     POINT local{point.x, point.y};
     ScreenToClient(strip_, &local);
-    int hit = Hit(local);
+    const int hit = Hit(local);
     if (hit >= 0 && hit == static_cast<int>(active_) && !pending_)
     {
         if (!folderDrop_)
@@ -3779,7 +3766,7 @@ HRESULT Controller::Drop(IDataObject *object, DWORD keys, POINTL point, DWORD *e
         if (folderDrop_)
         {
             *effect = allowed;
-            HRESULT hr = folderDrop_->Drop(object, keys, point, effect);
+            const HRESULT hr = folderDrop_->Drop(object, keys, point, effect);
             folderDrop_.Reset();
             dropObject_.Reset();
             dropPrivate_ = false;
@@ -3788,46 +3775,68 @@ HRESULT Controller::Drop(IDataObject *object, DWORD keys, POINTL point, DWORD *e
     }
     // Dropping directories on the spare/new-tab area opens folders. Files dropped
     // on a tab itself always use the Shell's real move/copy/drop implementation.
-    FORMATETC files{CF_HDROP, nullptr, DVASPECT_CONTENT, -1, TYMED_HGLOBAL};
-    if (hit < 0 && object && SUCCEEDED(object->GetData(&files, &medium)))
-    {
-        auto drop = reinterpret_cast<HDROP>(medium.hGlobal);
-        UINT count = DragQueryFileW(drop, 0xffffffff, nullptr, 0);
-        size_t first = tabs_.size();
-        for (UINT i = 0; i < count && tabs_.size() < MaxTabs; i++)
-        {
-            UINT n = DragQueryFileW(drop, i, nullptr, 0);
-            std::wstring path(n + 1, L'\0');
-            DragQueryFileW(drop, i, path.data(), n + 1);
-            path.resize(n);
-            DWORD attrs = GetFileAttributesW(path.c_str());
-            if (attrs == INVALID_FILE_ATTRIBUTES || !(attrs & FILE_ATTRIBUTE_DIRECTORY))
-                continue;
-            PIDLIST_ABSOLUTE id{};
-            if (SUCCEEDED(SHParseDisplayName(path.c_str(), nullptr, &id, 0, nullptr)))
-            {
-                Tab t;
-                ViewState s;
-                s.folder = Pidl::Adopt(id);
-                t.title = CachedName(s);
-                t.history.push_back(std::move(s));
-                tabs_.push_back(std::move(t));
-            }
-        }
-        ReleaseStgMedium(&medium);
-        if (tabs_.size() > first)
-        {
-            Activate(first);
-            *effect = allowed & (DROPEFFECT_LINK | DROPEFFECT_COPY);
-            if (*effect & DROPEFFECT_LINK)
-                *effect = DROPEFFECT_LINK;
-            else if (*effect & DROPEFFECT_COPY)
-                *effect = DROPEFFECT_COPY;
-            TabChanged();
-        }
-    }
+    if (hit < 0 && object)
+        *effect = DropFolders(object, allowed);
     DragLeave();
     return S_OK;
+}
+// A tab from this window moves to the drop point; one from another window is
+// imported. Returns the effect the drag source sees.
+DWORD Controller::DropTab(Tab tab, POINTL point, DWORD allowed)
+{
+    if (tab.sourceFrame != frame_ || tab.sourceProcess != GetCurrentProcessId())
+        return Import(std::move(tab), false) ? allowed & DROPEFFECT_MOVE : DROPEFFECT_NONE;
+    const auto i = std::find_if(tabs_.begin(), tabs_.end(), [&](const auto &t) { return t.id == tab.sourceId; });
+    if (i == tabs_.end() || pending_)
+        return DROPEFFECT_NONE;
+    POINT local{point.x, point.y};
+    ScreenToClient(strip_, &local);
+    const int hit = Hit(local);
+    const ULONGLONG activeId = tabs_[active_].id;
+    Tab moved = std::move(*i);
+    tabs_.erase(i);
+    const size_t to = hit >= 0 ? std::min(static_cast<size_t>(hit), tabs_.size()) : tabs_.size();
+    tabs_.insert(tabs_.begin() + static_cast<ptrdiff_t>(to), std::move(moved));
+    active_ = static_cast<size_t>(std::max(0, Index(activeId)));
+    sameWindowDrop_ = true;
+    TabChanged();
+    return allowed & DROPEFFECT_MOVE;
+}
+// Folders dropped on the spare strip open as new tabs, the first one shown.
+// Returns the effect the drag source sees.
+DWORD Controller::DropFolders(IDataObject *object, DWORD allowed)
+{
+    FORMATETC files{CF_HDROP, nullptr, DVASPECT_CONTENT, -1, TYMED_HGLOBAL};
+    STGMEDIUM medium{};
+    if (FAILED(object->GetData(&files, &medium)))
+        return DROPEFFECT_NONE;
+    const auto drop = reinterpret_cast<HDROP>(medium.hGlobal);
+    const UINT count = DragQueryFileW(drop, 0xffffffff, nullptr, 0);
+    const size_t first = tabs_.size();
+    for (UINT i = 0; i < count && tabs_.size() < MaxTabs; i++)
+    {
+        const UINT n = DragQueryFileW(drop, i, nullptr, 0);
+        std::wstring path(n + 1, L'\0');
+        DragQueryFileW(drop, i, path.data(), n + 1);
+        path.resize(n);
+        const DWORD attrs = GetFileAttributesW(path.c_str());
+        PIDLIST_ABSOLUTE id{};
+        if (attrs == INVALID_FILE_ATTRIBUTES || !(attrs & FILE_ATTRIBUTE_DIRECTORY) ||
+            FAILED(SHParseDisplayName(path.c_str(), nullptr, &id, 0, nullptr)))
+            continue;
+        Tab t;
+        ViewState s;
+        s.folder = Pidl::Adopt(id);
+        t.title = CachedName(s);
+        t.history.push_back(std::move(s));
+        tabs_.push_back(std::move(t));
+    }
+    ReleaseStgMedium(&medium);
+    if (tabs_.size() == first)
+        return DROPEFFECT_NONE;
+    Activate(first);
+    TabChanged();
+    return (allowed & DROPEFFECT_LINK) ? DROPEFFECT_LINK : allowed & DROPEFFECT_COPY;
 }
 header::TargetId Controller::ChildTarget(LONG child) const
 {

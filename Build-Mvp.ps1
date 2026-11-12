@@ -60,7 +60,7 @@ if($StageSetup){
 if(-not(Test-Path -LiteralPath $HeaderAcceptance -PathType Leaf)){throw 'Complete the native header acceptance checks before packaging.'}
 $header=Get-Content -LiteralPath $HeaderAcceptance -Raw | ConvertFrom-Json
 if(-not $header.success){throw 'Native header acceptance has not passed.'}
-foreach($gate in 'nativeContent','physicalInput','material','accessibility','lifecycle','snapping','combinedExplorerSnapping','setupRehearsal'){
+foreach($gate in 'nativeContent','physicalInput','material','accessibility','lifecycle','snapping','combinedExplorerSnapping','setupRehearsal','switching','overflow','motion','colours','footprint','singleFileSetup'){
  if($header.checks.$gate -ne $true){throw "Native acceptance is incomplete: $gate"}
 }
 if($header.review.status -ne 'complete'){throw 'The completed code review receipt is required.'}

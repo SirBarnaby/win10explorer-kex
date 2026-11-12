@@ -37,7 +37,8 @@ int main(int argc, char** argv) {
     }
     Check("parse-missing-key", !ParseBlurGlass(L"[config]\nactiveTextColor=1\ninactiveTextColor=2\nactiveTextColorDark=3\n"));
     Check("parse-garbage", !ParseBlurGlass(L"activeTextColor=x\ninactiveTextColor=2\nactiveTextColorDark=3\ninactiveTextColorDark=4\n"));
-    Check("parse-prefix-not-confused", ParseBlurGlass(L"activeTextColorDark=3\nactiveTextColor=1\ninactiveTextColorDark=4\ninactiveTextColor=2\n")->active == 1);
+    const auto prefixed = ParseBlurGlass(L"activeTextColorDark=3\nactiveTextColor=1\ninactiveTextColorDark=4\ninactiveTextColor=2\n");
+    Check("parse-prefix-not-confused", prefixed && prefixed->active == 1);
 
     Inputs in;
     in.themeText = Theme;

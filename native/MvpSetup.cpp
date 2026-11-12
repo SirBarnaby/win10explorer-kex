@@ -174,7 +174,7 @@ bool Hash(const BYTE* data,size_t size,const std::wstring* path,Sha256& digest) 
     BCRYPT_ALG_HANDLE algorithm{};BCRYPT_HASH_HANDLE hash{};
     bool ok=BCryptOpenAlgorithmProvider(&algorithm,BCRYPT_SHA256_ALGORITHM,nullptr,0)>=0&&BCryptCreateHash(algorithm,&hash,nullptr,0,nullptr,0,0)>=0;
     if(ok&&path){
-        Handle file(CreateFileW(path->c_str(),GENERIC_READ,FILE_SHARE_READ|FILE_SHARE_DELETE,nullptr,OPEN_EXISTING,FILE_FLAG_SEQUENTIAL_SCAN,nullptr));std::vector<BYTE> buffer(64*1024);DWORD count{};
+        Handle file(CreateFileW(path->c_str(),GENERIC_READ,FILE_SHARE_READ|FILE_SHARE_DELETE,nullptr,OPEN_EXISTING,FILE_FLAG_SEQUENTIAL_SCAN,nullptr));std::vector<BYTE> buffer(size_t{64}*1024);DWORD count{};
         ok=static_cast<bool>(file);
         while(ok){if(!ReadFile(file.value,buffer.data(),static_cast<DWORD>(buffer.size()),&count,nullptr)){ok=false;break;}if(!count)break;ok=BCryptHashData(hash,buffer.data(),count,0)>=0;}
     }else if(ok)for(size_t done=0;ok&&done<size;){const ULONG part=static_cast<ULONG>(std::min<size_t>(size-done,1u<<30));ok=BCryptHashData(hash,const_cast<PUCHAR>(data+done),part,0)>=0;done+=part;}
@@ -209,7 +209,7 @@ const wchar_t* SupportText(Support support) {
 // The single-file setup carries the payload as resources with their SHA-256.
 // It writes them, verified, into a private folder under the install root and
 // installs from there; the folder is removed again whatever happens.
-struct EmbeddedFile {const wchar_t* name;const BYTE* data;size_t size;Sha256 sha256;};
+struct EmbeddedFile {const wchar_t* name{};const BYTE* data{};size_t size{};Sha256 sha256{};};
 bool LoadEmbedded(std::vector<EmbeddedFile>& files,std::wstring& error) {
     files.clear();
 #ifdef MVP_EMBEDDED_PAYLOAD
