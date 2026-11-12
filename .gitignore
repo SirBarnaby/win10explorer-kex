@@ -1,13 +1,59 @@
+# Build output
 /bin/
 /build*/
-/dist/
-/evidence/
-/package/
-/tools/
-/vendor/
 /native/build*/
+/dist/
+/package/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+
+# Build products, wherever they land
+*.exe
+*.dll
+*.pdb
+*.ilk
+*.obj
+*.lib
+*.exp
+*.res
+*.msi
+*.wixobj
+*.wixpdb
+*.tlog
 *.zip
 *.zip.sha256
+
+# Local toolchains and downloaded upstream trees (native/vendor is tracked)
+/tools/
+/vendor/
+
+# Test evidence, Sandbox lab payloads and results
+/evidence/
+/sandbox/results/
+/sandbox/payload/
+*.wsb
+
+# Scratch and staging
+.kex-stage-tmp/
+.scratch/
+*.tmp
+*.bak
+*.log
+
+# Python
+__pycache__/
+*.pyc
+
+# IDE and OS files
+.vs/
+.vscode/
+.idea/
 *.user
 *.suo
-*.log
+*.VC.db
+*.VC.opendb
+Thumbs.db
+ehthumbs.db
+desktop.ini
+.DS_Store
