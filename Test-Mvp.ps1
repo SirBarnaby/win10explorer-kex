@@ -30,7 +30,7 @@ foreach($pin in @(@('RibbonImage','ribbonHash'),@('ThemeImage','themeHash'))){
 # One flipped byte inside an embedded file must fail the setup's own integrity
 # check. The licence text is embedded verbatim, so it is easy to find.
 $latin=[Text.Encoding]::GetEncoding(28591)
-$license=[IO.File]::ReadAllBytes((Join-Path $PSScriptRoot 'LICENSE.native-v2.txt'))
+$license=[IO.File]::ReadAllBytes((Join-Path $PSScriptRoot 'LICENSE'))
 $image=[IO.File]::ReadAllBytes($SetupPath)
 $at=$latin.GetString($image).IndexOf($latin.GetString($license,0,[Math]::Min(256,$license.Length)),[StringComparison]::Ordinal)
 $tamperRejected=$false

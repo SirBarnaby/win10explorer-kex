@@ -22,7 +22,7 @@ function New-SourceZip([string]$Destination){
  $source=Join-Path $work 'Source'
  New-Item -ItemType Directory -Path $source | Out-Null
  try{
-  foreach($file in 'Build-Native.ps1','Test-Native.ps1','Build-Mvp.ps1','Test-Mvp.ps1','Test-MvpExplorer.ps1','Test-HeaderIntegration.ps1','MVP-README.md','MVP-STATUS.md','LICENSE.native-v2.txt'){
+  foreach($file in 'Build-Native.ps1','Test-Native.ps1','Build-Mvp.ps1','Test-Mvp.ps1','Test-MvpExplorer.ps1','Test-HeaderIntegration.ps1','MVP-README.md','MVP-STATUS.md','LICENSE'){
    Copy-Item -LiteralPath (Join-Path $PSScriptRoot $file) -Destination $source
   }
   $native=Join-Path $source 'native';New-Item -ItemType Directory -Path $native | Out-Null
@@ -46,7 +46,7 @@ if($StageSetup){
  New-Item -ItemType Directory -Path $payloadDirectory | Out-Null
  foreach($file in $binaries){Copy-Item -LiteralPath (Join-Path $BinaryDirectory $file) -Destination $payloadDirectory}
  Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'MVP-README.md') -Destination (Join-Path $payloadDirectory 'README.txt')
- Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'LICENSE.native-v2.txt') -Destination (Join-Path $payloadDirectory 'LICENSE.txt')
+ Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'LICENSE') -Destination (Join-Path $payloadDirectory 'LICENSE.txt')
  New-SourceZip (Join-Path $payloadDirectory 'Source.zip')
  $cmake=(Get-Command cmake -ErrorAction SilentlyContinue).Source;if(-not $cmake){$cmake='C:\mingw64\bin\cmake.exe'}
  & $cmake -S (Join-Path $PSScriptRoot 'native') -B $SetupBuildDirectory -G 'Visual Studio 17 2022' -A x64 ('-DMVP_PAYLOAD_DIR='+($payloadDirectory -replace '\\','/')) | Out-Null

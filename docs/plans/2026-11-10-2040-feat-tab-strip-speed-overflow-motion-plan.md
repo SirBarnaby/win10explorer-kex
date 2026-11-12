@@ -218,7 +218,7 @@ All requirements met or explicitly deferred with a reason in the report; accepta
 
 ## Executor rules
 
-- Work in `C:\Users\barna\ReverseEngineering\Win10NativePatch` on branch `feature/explorer-mvp`. First commit the current uncommitted Codex work as a baseline (sources only; `.gitignore` already excludes build, dist and evidence), then one commit per unit. Do not create other branches; do not push anywhere.
+- Work in `C:\Users\<you>\ReverseEngineering\Win10NativePatch` on branch `feature/explorer-mvp`. First commit the current uncommitted Codex work as a baseline (sources only; `.gitignore` already excludes build, dist and evidence), then one commit per unit. Do not create other branches; do not push anywhere.
 - Build with the existing VS 2022 Build Tools + `C:\mingw64\bin\cmake.exe` (`build-mvp`, Release). Static CRT stays.
 - Runtime tests only in Windows Sandbox using the existing lab (`sandbox/`, `evidence/header-rebuild-20261104/renderer-production/guest-*/payload`). Never restart Explorer, kill Explorer or drive input on the host. No Computer Use.
 - Do not edit `HeaderIntegration.cpp` mechanics, hash pins, offsets or version guards. If a requirement seems to need that, stop and report.

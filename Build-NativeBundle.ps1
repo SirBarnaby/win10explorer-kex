@@ -36,7 +36,7 @@ if (Test-Path -LiteralPath $out) {throw "Output already exists; choose/archive t
 New-Item -ItemType Directory -Path $out -Force | Out-Null
 foreach ($exe in 'NativePatchSetup.exe','Win10PatchOptions.exe','NativeSnap.exe','ExplorerTabs.dll','NativePatchModelTests.exe') {Copy-Item -LiteralPath (Join-Path $BinaryDirectory $exe) -Destination $out}
 Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'NATIVE-README.md') -Destination (Join-Path $out 'README.txt')
-$license=Join-Path $PSScriptRoot 'LICENSE.native-v2.txt';if(-not(Test-Path -LiteralPath $license)){$license=Join-Path $PSScriptRoot 'LICENSE.txt'}
+$license=Join-Path $PSScriptRoot 'LICENSE';if(-not(Test-Path -LiteralPath $license)){$license=Join-Path $PSScriptRoot 'LICENSE.txt'}
 Copy-Item -LiteralPath $license -Destination (Join-Path $out 'LICENSE.txt')
 $source=Join-Path $out 'Source'
 New-Item -ItemType Directory -Path $source | Out-Null

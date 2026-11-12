@@ -168,7 +168,7 @@ Replacing Explorer's compiled Ribbon markup is rejected: the documented framewor
 
 ### Dependencies and Implementation-Time Questions
 
-The host runs DWMBlurGlass 2.3.1.0 through `DWMBlurGlass_Extend`, using `C:\DevTools\DWMBlur\DWMBlurGlass.exe` and `data\config.ini`. Capture its exact executable, extension, configuration and `data\symbols` cache identity read-only, then reproduce the provider in the guest. Its current blur amount is 44, with effect type 2 and method 0. The provider's `runhost` route requires an elevated guest token; stage it outside the guest profile and use its existing lifecycle. No host settings are changed to simplify testing.
+The host runs DWMBlurGlass 2.3.1.0 through `DWMBlurGlass_Extend`, using `<DWMBlurGlass folder>\DWMBlurGlass.exe` and `data\config.ini`. Capture its exact executable, extension, configuration and `data\symbols` cache identity read-only, then reproduce the provider in the guest. Its current blur amount is 44, with effect type 2 and method 0. The provider's `runhost` route requires an elevated guest token; stage it outside the guest profile and use its existing lifecycle. No host settings are changed to simplify testing.
 
 The existing guest reports base build 19041 while the relevant Explorer/Ribbon components match the 19045 host. Extend this identity check to the DWM components and provider dependencies needed by the material proof. A stock-guest alpha test does not establish DWMBlurGlass compatibility. Any attach-time version-query adaptation stays lab-only and remains disclosed.
 
