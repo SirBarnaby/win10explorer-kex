@@ -22,7 +22,7 @@ function New-SourceZip([string]$Destination){
  $source=Join-Path $work 'Source'
  New-Item -ItemType Directory -Path $source | Out-Null
  try{
-  foreach($file in 'Build-Native.ps1','Test-Native.ps1','Build-Mvp.ps1','Test-Mvp.ps1','Test-MvpExplorer.ps1','Test-HeaderIntegration.ps1','MVP-README.md','MVP-STATUS.md','LICENSE'){
+  foreach($file in 'Build-Native.ps1','Test-Native.ps1','Build-Mvp.ps1','Test-Mvp.ps1','Test-MvpExplorer.ps1','Test-HeaderIntegration.ps1','MVP-README.md','LICENSE'){
    Copy-Item -LiteralPath (Join-Path $PSScriptRoot $file) -Destination $source
   }
   $native=Join-Path $source 'native';New-Item -ItemType Directory -Path $native | Out-Null

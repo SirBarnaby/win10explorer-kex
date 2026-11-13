@@ -2,7 +2,7 @@
 
 ## 0.1.0 (12 November 2026)
 
-First public release. Compared with the earlier internal build:
+First public release: [ExplorerMvpSetup.exe](https://github.com/SirBarnaby/win10explorer-kex/releases/download/v0.1.0/ExplorerMvpSetup.exe). Compared with the earlier internal build:
 
 **Faster**
 

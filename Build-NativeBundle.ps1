@@ -35,14 +35,14 @@ $out=Join-Path $PSScriptRoot ('dist\'+$label)
 if (Test-Path -LiteralPath $out) {throw "Output already exists; choose/archive the old bundle explicitly: $out"}
 New-Item -ItemType Directory -Path $out -Force | Out-Null
 foreach ($exe in 'NativePatchSetup.exe','Win10PatchOptions.exe','NativeSnap.exe','ExplorerTabs.dll','NativePatchModelTests.exe') {Copy-Item -LiteralPath (Join-Path $BinaryDirectory $exe) -Destination $out}
-Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'NATIVE-README.md') -Destination (Join-Path $out 'README.txt')
+Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'MVP-README.md') -Destination (Join-Path $out 'README.txt')
 $license=Join-Path $PSScriptRoot 'LICENSE';if(-not(Test-Path -LiteralPath $license)){$license=Join-Path $PSScriptRoot 'LICENSE.txt'}
 Copy-Item -LiteralPath $license -Destination (Join-Path $out 'LICENSE.txt')
 $source=Join-Path $out 'Source'
 New-Item -ItemType Directory -Path $source | Out-Null
 $nativeSource=Join-Path $source 'native';New-Item -ItemType Directory -Path $nativeSource | Out-Null
 Get-ChildItem -LiteralPath (Join-Path $PSScriptRoot 'native') | Where-Object {$_.Name -notlike 'build*'} | ForEach-Object {Copy-Item -LiteralPath $_.FullName -Destination $nativeSource -Recurse}
-foreach ($file in 'Build-Native.ps1','Test-Native.ps1','Test-ReleaseGate.ps1','Build-NativeBundle.ps1','NATIVE-README.md','NATIVE-STATUS.md','MANUAL-TESTING.md','SANDBOX-REQUEST.md') {Copy-Item -LiteralPath (Join-Path $PSScriptRoot $file) -Destination $source}
+foreach ($file in 'Build-Native.ps1','Test-Native.ps1','Test-ReleaseGate.ps1','Build-NativeBundle.ps1','MVP-README.md') {Copy-Item -LiteralPath (Join-Path $PSScriptRoot $file) -Destination $source}
 $notices=Join-Path $source 'vendor';New-Item -ItemType Directory -Path $notices | Out-Null
 foreach ($file in 'AppDock.LICENSE','RectangleWin.LICENSE','PowerToys.LICENSE','WindowsTouchpadSettings.reference.cs','TouchpadWindowsCache.reference.cs') {Copy-Item -LiteralPath (Join-Path $PSScriptRoot ('vendor\'+$file)) -Destination $notices}
 Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'vendor\rectanglewin-reference') -Destination $notices -Recurse
@@ -60,7 +60,7 @@ if ($Release) {
  if ($LASTEXITCODE) {throw 'MSI linking/validation failed.'}
 } else {
  Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'native\acceptance.template.json') -Destination (Join-Path $out 'acceptance.NOT-TESTED.json')
- 'DEVELOPMENT ONLY. No MSI is included. Explorer is not registered or deployed. See NATIVE-STATUS.md in Source.' | Set-Content -LiteralPath (Join-Path $out 'NOT-A-RELEASE.txt') -Encoding UTF8
+ 'DEVELOPMENT ONLY. No MSI is included. Explorer is not registered or deployed.' | Set-Content -LiteralPath (Join-Path $out 'NOT-A-RELEASE.txt') -Encoding UTF8
 }
 $manifest=Get-ChildItem -LiteralPath $out -File -Recurse | ForEach-Object { '{0}  {1}' -f (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash,$_.FullName.Substring($out.Length+1) }
 $manifest | Set-Content -LiteralPath (Join-Path $out 'SHA256SUMS.txt') -Encoding ASCII

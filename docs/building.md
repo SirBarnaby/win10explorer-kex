@@ -19,7 +19,7 @@ MinHook is vendored in `native/vendor/minhook`; nothing is downloaded during the
 
 This configures `native/` with the Visual Studio 2022 generator and builds Release into `build-mvp\Release`.
 
-If a build stops making progress without an error, see "Builds that hang forever" in [solutions/2026-11-12-tab-strip-refinement-learnings.md](solutions/2026-11-12-tab-strip-refinement-learnings.md).
+If a build stops making progress without an error, look for build processes left suspended by an earlier build (`MSBuild.exe`, `mspdbsrv.exe`, `vctip.exe`, `Tracker.exe`); new builds reuse them and wait. Signing out clears them. Setting `MSBUILDDISABLENODEREUSE=1` before building avoids the reuse.
 
 ## Test
 
@@ -29,7 +29,7 @@ If a build stops making progress without an error, see "Builds that hang forever
 
 This runs the model and self-tests of each binary on the build PC: snapping, snap layout, Options and settings, the Explorer tab model, settings migration and the setup self-test. It also checks that a setup with one changed byte is refused, and that setup and the add-on agree on the supported `UIRibbon.dll` and `uxtheme.dll`.
 
-These tests do not attach to Explorer. Anything that loads the add-on into Explorer, restarts Explorer or drives the pointer and keyboard is run in Windows Sandbox, never on the working desktop. `sandbox/` holds the guest scripts; `SANDBOX-REQUEST.md` describes the environment.
+These tests do not attach to Explorer. Anything that loads the add-on into Explorer, restarts Explorer or drives the pointer and keyboard is run in Windows Sandbox, never on the working desktop. `sandbox/` holds the guest scripts.
 
 ## Package
 
@@ -72,6 +72,5 @@ Do not change the pins, offsets or version checks in `native/HeaderIntegration.c
 
 ## More
 
-- [reports/2026-11-10-refinement-report.md](reports/2026-11-10-refinement-report.md): measurements, what was tested and known limits for the current release.
-- `MVP-STATUS.md`: project state and history.
+- [CHANGELOG.md](../CHANGELOG.md): changes and known limits per release.
 - `legacy/`: version 1.0, based on QTTabBar.

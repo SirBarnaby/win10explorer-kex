@@ -6,7 +6,7 @@ Tabs in the title bar of Windows 10 File Explorer, and three-finger touchpad sna
 
 [![Windows 10 22H2](https://img.shields.io/badge/Windows%2010-22H2%20(19045)%20x64-0078D4)](#requirements)
 [![Licence: GPL-3.0-or-later](https://img.shields.io/badge/licence-GPL--3.0--or--later-blue)](LICENSE)
-[![Release](https://img.shields.io/github/v/release/OWNER/REPO)](https://github.com/OWNER/REPO/releases/latest)
+[![Release](https://img.shields.io/github/v/release/SirBarnaby/win10explorer-kex)](https://github.com/SirBarnaby/win10explorer-kex/releases/latest)
 
 [Features](#features) · [See it in action](#see-it-in-action) · [Install](#install) · [Options and shortcuts](#options-and-shortcuts) · [Requirements](#requirements) · [Common questions](#common-questions) · [Building](#building-from-source) · [Licence](#licence)
 
@@ -60,7 +60,7 @@ Explorer MVP adds folder tabs to the real File Explorer window on Windows 10. Th
 
 ## Install
 
-1. Download `ExplorerMvpSetup.exe` from the [latest release](https://github.com/OWNER/REPO/releases/latest).
+1. Download [`ExplorerMvpSetup.exe`](https://github.com/SirBarnaby/win10explorer-kex/releases/latest/download/ExplorerMvpSetup.exe) from the [latest release](https://github.com/SirBarnaby/win10explorer-kex/releases/latest).
 2. Double-click it. The file is not code-signed, so SmartScreen may show "Windows protected your PC". Select **More info**, then **Run anyway**.
 3. Setup says what this PC gets: tabs in the title bar, tabs in a row under the Ribbon, or snapping only. Choose tabs and/or touchpad snapping and select **Install / Update**.
 4. Open a File Explorer window. Windows that were already open get tabs too; nothing needs restarting.

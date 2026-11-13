@@ -5,6 +5,6 @@ These files belong to the first version of this project, which packaged QTTabBar
 They were moved here from the repository root unchanged. The scripts still expect to sit at the root, next to `src\`, `bin\` and `package\`, so copy them back there before running them.
 
 - `README.txt`: the user guide shipped with version 1.0.
-- `BUILDING.md`, `Research.md`: how version 1.0 was built, and the upstream sources it pinned.
+- Upstream: [indiff QTTabBar v1.6.4](https://github.com/indiff/qttabbar/releases/tag/v1.6.4), GPL-3.0-or-later.
 - `Install.*`, `Uninstall.*`, `Common.ps1`, `Test-Installer.ps1`: the version 1.0 installer.
 - `Build-Package.ps1`, `Build-NativeSnap.ps1`, `Build-TouchpadCache.ps1`: the version 1.0 build scripts.

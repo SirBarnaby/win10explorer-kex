@@ -40,11 +40,10 @@ Copy-Item -LiteralPath (Join-Path $root 'vendor\PowerToys.LICENSE') -Destination
 Copy-Item -LiteralPath (Join-Path $root 'Build-NativeSnap.ps1'),(Join-Path $root 'Build-Package.ps1') -Destination (Join-Path $root 'package\sources') -Force
 Copy-Item -LiteralPath (Join-Path $root 'Test-Installer.ps1'),(Join-Path $root 'Build-TouchpadCache.ps1') -Destination (Join-Path $root 'package\sources') -Force
 Copy-Item -LiteralPath (Join-Path $root 'vendor\TouchpadWindowsCache.reference.cs'),(Join-Path $root 'vendor\WindowsTouchpadSettings.reference.cs') -Destination (Join-Path $root 'package\sources') -Force
-Copy-Item -LiteralPath (Join-Path $root 'BUILDING.md') -Destination (Join-Path $root 'package\sources') -Force
 New-Item -ItemType Directory -Path (Join-Path $root 'package\sources\tools') -Force | Out-Null
 Copy-Item -LiteralPath (Join-Path $root 'tools\Generate-NativeSnapIcon.py') -Destination (Join-Path $root 'package\sources\tools') -Force
 Copy-Item -LiteralPath (Join-Path $root 'evidence') -Destination (Join-Path $root 'package') -Recurse -Force
-foreach ($file in 'Install.cmd','Install.ps1','Uninstall.cmd','Uninstall.ps1','Common.ps1','README.txt','Research.md') {
+foreach ($file in 'Install.cmd','Install.ps1','Uninstall.cmd','Uninstall.ps1','Common.ps1','README.txt') {
     Copy-Item -LiteralPath (Join-Path $root $file) -Destination (Join-Path $root "package\$file") -Force
 }
 $files = Get-ChildItem -LiteralPath (Join-Path $root 'package') -Recurse -File | Where-Object Name -ne 'SHA256SUMS.txt' | Sort-Object FullName

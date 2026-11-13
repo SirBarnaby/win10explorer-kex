@@ -82,7 +82,6 @@ through Install.cmd so that transform and the safe defaults are applied.
 VERIFICATION AND SOURCE
 SHA256SUMS.txt verifies package contents for accidental corruption. It is not a
 digital signature. Locally built NativeSnap and TouchpadCache are unsigned.
-Research.md records upstream sources, pinned versions, and test boundaries.
 The sources folder contains corresponding QTTabBar source, helper source,
 attribution, and build information. Licenses are included in licenses/.
 Automated geometry/cache checks do not establish that a physical swipe has been
