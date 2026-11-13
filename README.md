@@ -2,17 +2,17 @@
 
 # Explorer MVP
 
-Tabs in the title bar of Windows 10 File Explorer, and three-finger touchpad snapping.
+Tabs in the title bar of Windows 10 File Explorer.
 
 [![Windows 10 22H2](https://img.shields.io/badge/Windows%2010-22H2%20(19045)%20x64-0078D4)](#requirements)
 [![Licence: GPL-3.0-or-later](https://img.shields.io/badge/licence-GPL--3.0--or--later-blue)](LICENSE)
 [![Release](https://img.shields.io/github/v/release/SirBarnaby/win10explorer-kex)](https://github.com/SirBarnaby/win10explorer-kex/releases/latest)
 
-[Features](#features) · [See it in action](#see-it-in-action) · [Install](#install) · [Options and shortcuts](#options-and-shortcuts) · [Requirements](#requirements) · [Common questions](#common-questions) · [Building](#building-from-source) · [Licence](#licence)
+[Features](#features) · [See it in action](#see-it-in-action) · [Install](#install) · [Options and shortcuts](#options-and-shortcuts) · [Optional extra: touchpad snapping](#optional-extra-touchpad-snapping) · [Requirements](#requirements) · [Common questions](#common-questions) · [Building](#building-from-source) · [Licence](#licence)
 
 </div>
 
-Explorer MVP adds folder tabs to the real File Explorer window on Windows 10. The tabs sit in the title bar, next to Explorer's own Quick Access Toolbar, and use the window's own colours. The Ribbon, address bar, search box and folder view stay Explorer's own. It also makes three-finger touchpad swipes snap windows to halves and corners.
+Explorer MVP adds folder tabs to the real File Explorer window on Windows 10. The tabs sit in the title bar, next to Explorer's own Quick Access Toolbar, and use the window's own colours. The Ribbon, address bar, search box and folder view stay Explorer's own.
 
 ## Features
 
@@ -21,14 +21,11 @@ Explorer MVP adds folder tabs to the real File Explorer window on Windows 10. Th
 - **Many tabs.** Up to 500 tabs per window; tabs shrink to 76 px, then the strip scrolls with the wheel, the touchpad or its arrows.
 - **Reorder by dragging.** Drag a tab along the strip and the others slide aside.
 - **Move tabs between windows.** Drag a tab out to open it in its own window, or drop it on another Explorer window.
-- **Reopen closed tabs.** Ctrl+Shift+T brings back the tab you just closed.
+- **Reopen closed tabs.** The tab you just closed can be brought back.
 - **Session restore.** Explorer can reopen the tabs you had the last time.
 - **Motion.** Tabs slide when they open, close or move, and stay smooth while a folder loads; one checkbox turns it off.
 - **Native colours.** Tab text follows light, dark and accent-coloured title bars, high contrast, and DWMBlurGlass title colours.
-- **Keyboard.** The usual browser shortcuts: Ctrl+T, Ctrl+W, Ctrl+Tab, Ctrl+1 to 9.
 - **Screen readers.** Tabs, close buttons and off-screen tabs are announced through Windows' own accessibility interface.
-- **Touchpad snapping.** Three-finger swipes snap the active window to a half or a corner, or maximize it; they never minimize or centre it.
-- **Remembered split.** Drag Windows' divider between two snapped windows and later snaps on that display reuse the split.
 - **No background cost.** No tray icon, no timers, no polling; the hidden starter uses about 3.5 MB of memory and no measurable CPU while idle.
 - **Per-user install.** One 2.2 MB setup file, no administrator rights, no Windows system file replaced.
 
@@ -50,13 +47,9 @@ Explorer MVP adds folder tabs to the real File Explorer window on Windows 10. Th
 
 ![Dragging a tab out to a new window and into another window](assets/tab-tear-out.gif)
 
-**Snap windows** to halves and corners (recorded with Ctrl+Alt+Win+Arrow, the shortcut the three-finger swipes are bound to)
-
-![Windows snapping to the left half, a corner and the right half](assets/touchpad-snap.gif)
-
 **Options** for each feature
 
-![The Explorer Options window with its General, Tabs and Snapping pages](assets/options.gif)
+![The Explorer Options window with its pages](assets/options.gif)
 
 ## Install
 
@@ -85,9 +78,6 @@ Open **Explorer MVP → Options** from the Start menu, or right-click a tab and 
 | Explorer title-bar tabs | Turns tabs on or off. Turning them off keeps the current folder open and saves the tabs. |
 | Restore tabs when starting Explorer | Reopens the tabs from the last session. |
 | Animate tabs | Tabs slide when they open, close or move. "Show animations in Windows" in Ease of Access also turns this off. |
-| Touchpad snap gestures | Three-finger swipes snap the active window. |
-| Optional keyboard shortcuts | Ctrl+Alt+Win+Arrow does the same as the swipes. Win+Arrow keeps its Windows behaviour. |
-| Restore previous gestures | Puts back the three-finger gestures you had before. |
 
 | Shortcut | Action |
 |---|---|
@@ -101,6 +91,16 @@ Open **Explorer MVP → Options** from the Start menu, or right-click a tab and 
 | Ctrl+9 | Select the last tab |
 | Win+E, Ctrl+N | Open a separate Explorer window, as before |
 
+Right-click a tab for **Duplicate tab**, **Move tab to new window** and **Close tab**.
+
+## Optional extra: touchpad snapping
+
+The setup also carries a separate extra that is not part of the tabs: three-finger touchpad swipes that snap the active window. Turn it on with the **Touchpad snap gestures** checkbox in setup or in Options. Turning it off again puts back the three-finger gestures you had before.
+
+![Windows snapping to the left half, a corner and the right half](assets/touchpad-snap.gif)
+
+The recording uses Ctrl+Alt+Win+Arrow, the shortcut the swipes are bound to.
+
 | Three-finger swipe | Result |
 |---|---|
 | Left / Right | Snap to that half of the screen |
@@ -108,14 +108,17 @@ Open **Explorer MVP → Options** from the Start menu, or right-click a tab and 
 | Up again at a top corner | Maximize; Down returns to the corner |
 | Up / Down on a floating window | Nothing changes |
 
-Right-click a tab for **Duplicate tab**, **Move tab to new window** and **Close tab**.
+- Swipes never minimize or centre a window.
+- Drag Windows' divider between two snapped windows and later snaps on that display reuse the split.
+- It needs a Precision Touchpad. Without one, **Optional keyboard shortcuts** in Options makes Ctrl+Alt+Win+Arrow do the same; Win+Arrow keeps its Windows behaviour.
+- **Restore previous gestures** in Options puts back the three-finger gestures you had before.
+- It runs as its own hidden program, `NativeSnap.exe`, only while it is turned on.
 
 ## Requirements
 
 - Windows 10 version 22H2, 64-bit, build 19045. It does not install on other Windows versions, including Windows 11.
 - For tabs in the title bar, `UIRibbon.dll` and `uxtheme.dll` in `C:\Windows\System32` must be exactly the versions this release was tested with. Setup checks this and tells you the result before installing.
 - If only `uxtheme.dll` differs, tabs go in a row under the Ribbon. If `UIRibbon.dll` differs, tabs stay off and only touchpad snapping is offered.
-- A Precision Touchpad for the swipes. Without one, the optional keyboard shortcuts do the same.
 - No administrator rights. It installs for the current Windows account, in `%LOCALAPPDATA%\Programs\Explorer MVP`.
 
 Disk use is about 4 MB per installed version. Earlier versions are kept, at about 2 MB each, until you uninstall.
@@ -123,7 +126,7 @@ Disk use is about 4 MB per installed version. Earlier versions are kept, at abou
 ## Common questions
 
 **How does it work?**
-A small hidden program, `ExplorerMvpHost.exe`, starts when you sign in and loads `ExplorerTabs.dll` into File Explorer when a folder window opens. Inside Explorer, the add-on creates the tab strip as a child of the Explorer window. To make room for it, it redirects one internal callback in `UIRibbon.dll` and hooks two drawing functions in `uxtheme.dll` (`BeginBufferedPaint` and `EndBufferedPaint`). These changes are made in memory only; no file in the Windows folder is modified. A second hidden program, `NativeSnap.exe`, receives the touchpad swipes and asks Windows to snap the window.
+A small hidden program, `ExplorerMvpHost.exe`, starts when you sign in and loads `ExplorerTabs.dll` into File Explorer when a folder window opens. Inside Explorer, the add-on creates the tab strip as a child of the Explorer window. To make room for it, it redirects one internal callback in `UIRibbon.dll` and hooks two drawing functions in `uxtheme.dll` (`BeginBufferedPaint` and `EndBufferedPaint`). These changes are made in memory only; no file in the Windows folder is modified.
 
 **What happens after a Windows update?**
 Most monthly updates leave the two files alone, and the tabs keep working. If an update replaces `UIRibbon.dll` or `uxtheme.dll`, the add-on notices that the file is no longer the tested one and turns the title-bar tabs off, or moves them to the row under the Ribbon. Explorer then looks as it does without the add-on. Tabs come back with a release tested against the new files.
