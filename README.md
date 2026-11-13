@@ -55,7 +55,7 @@ Explorer MVP adds folder tabs to the real File Explorer window on Windows 10. Th
 
 1. Download [`ExplorerMvpSetup.exe`](https://github.com/SirBarnaby/win10explorer-kex/releases/latest/download/ExplorerMvpSetup.exe) from the [latest release](https://github.com/SirBarnaby/win10explorer-kex/releases/latest).
 2. Double-click it. The file is not code-signed, so SmartScreen may show "Windows protected your PC". Select **More info**, then **Run anyway**.
-3. Setup says what this PC gets: tabs in the title bar, tabs in a row under the Ribbon, or snapping only. Choose tabs and/or touchpad snapping and select **Install / Update**.
+3. Setup says what this PC gets: tabs in the title bar, tabs in a row under the Ribbon, or snapping only. Select **Install / Update**. Tabs are ticked; the optional touchpad snapping starts unticked.
 4. Open a File Explorer window. Windows that were already open get tabs too; nothing needs restarting.
 
 To update, run the newer setup the same way. Your settings and open tabs are kept.
@@ -95,7 +95,7 @@ Right-click a tab for **Duplicate tab**, **Move tab to new window** and **Close 
 
 ## Optional extra: touchpad snapping
 
-The setup also carries a separate extra that is not part of the tabs: three-finger touchpad swipes that snap the active window. Turn it on with the **Touchpad snap gestures** checkbox in setup or in Options. Turning it off again puts back the three-finger gestures you had before.
+The setup also carries a separate extra that is not part of the tabs: three-finger touchpad swipes that snap the active window. It is off by default. Turn it on with **Touchpad snap gestures** in Options, or tick **Optional extra: touchpad snapping** in setup. An update keeps the choice you already made. Turning it off again puts back the three-finger gestures you had before.
 
 ![Windows snapping to the left half, a corner and the right half](assets/touchpad-snap.gif)
 

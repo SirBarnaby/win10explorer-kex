@@ -1,5 +1,19 @@
 # Patch notes
 
+## 0.1.1 (13 November 2026)
+
+[ExplorerMvpSetup.exe](https://github.com/SirBarnaby/win10explorer-kex/releases/download/v0.1.1/ExplorerMvpSetup.exe)
+
+**Fixed**
+
+- Tabs could stop appearing in new folder windows until the next sign-in. Setup and Options started the hidden starter as their own child process; when setup had been run from a terminal, a script or a remote tool, Windows ended the starter together with that program. The starter and the snap receiver are now started by the Windows desktop itself, so they keep running.
+- The starter checks folder windows again when Explorer restarts or starts after it.
+
+**Changed**
+
+- Touchpad snapping is an optional extra and is off on a new install. Turn it on in Options or tick it in setup. An update keeps the choice you already made.
+- While snapping is off, its receiver does not run and has no startup entry.
+
 ## 0.1.0 (12 November 2026)
 
 First public release: [ExplorerMvpSetup.exe](https://github.com/SirBarnaby/win10explorer-kex/releases/download/v0.1.0/ExplorerMvpSetup.exe). Compared with the earlier internal build:
