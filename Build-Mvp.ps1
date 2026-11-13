@@ -1,4 +1,4 @@
-[CmdletBinding()]
+﻿[CmdletBinding()]
 param(
  [string]$BinaryDirectory=(Join-Path $PSScriptRoot 'build-mvp\Release'),
  [string]$SetupBuildDirectory=(Join-Path $PSScriptRoot 'build-mvp-setup'),
@@ -89,7 +89,7 @@ foreach($entry in $header.sourceSha256.PSObject.Properties){
 foreach($entry in $header.evidence){
  if($entry.sha256-ne (Get-FileHash -LiteralPath (Join-Path $PSScriptRoot $entry.path) -Algorithm SHA256).Hash){throw "Native evidence changed: $($entry.path)"}
 }
-$label='Explorer-MVP-0.1.0-x64-'+(Get-Date -Format 'yyyyMMdd-HHmmss')
+$label='Explorer-MVP-0.1.1-x64-'+(Get-Date -Format 'yyyyMMdd-HHmmss')
 $out=Join-Path $PSScriptRoot ('dist\'+$label)
 New-Item -ItemType Directory -Path $out | Out-Null
 # One file to install; the corresponding source beside it.
@@ -106,7 +106,7 @@ foreach($report in 'snap.json','split-layout.json','config.json','explorer-model
  Copy-Item -LiteralPath (Join-Path $PSScriptRoot ('evidence\native-v2\'+$report)) -Destination $verification
 }
 $inventory=foreach($file in $shipped.Keys){[ordered]@{name=$file;sha256=(Get-FileHash -LiteralPath $shipped[$file] -Algorithm SHA256).Hash;embedded=$file-ne 'ExplorerMvpSetup.exe'}}
-[ordered]@{product='Explorer MVP';version='0.1.0';target='Windows 10 22H2 x64';runtime='Explorer child controls plus hidden starter and snap receiver';setup='ExplorerMvpSetup.exe (single file, payload embedded with SHA-256)';binaries=$inventory;physicalGesturesVerified=$false;cleanPcVerified=$false;fullyNativeSnapVerified=$false} | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $out 'MVP.json') -Encoding UTF8
+[ordered]@{product='Explorer MVP';version='0.1.1';target='Windows 10 22H2 x64';runtime='Explorer child controls plus hidden starter and snap receiver';setup='ExplorerMvpSetup.exe (single file, payload embedded with SHA-256)';binaries=$inventory;physicalGesturesVerified=$false;cleanPcVerified=$false;fullyNativeSnapVerified=$false} | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $out 'MVP.json') -Encoding UTF8
 Get-ChildItem -LiteralPath $out -File -Recurse | ForEach-Object {'{0}  {1}' -f (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash,$_.FullName.Substring($out.Length+1)} | Set-Content -LiteralPath (Join-Path $out 'SHA256SUMS.txt') -Encoding ASCII
 Compress-Archive -LiteralPath $out -DestinationPath ($out+'.zip') -CompressionLevel Optimal
 '{0}  {1}' -f (Get-FileHash -LiteralPath ($out+'.zip') -Algorithm SHA256).Hash,([IO.Path]::GetFileName($out+'.zip')) | Set-Content -LiteralPath ($out+'.zip.sha256') -Encoding ASCII

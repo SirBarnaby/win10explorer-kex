@@ -24,7 +24,8 @@ enum Feature : DWORD { ExplorerTabs=1, TouchpadGestures=2, KeyboardShortcuts=4, 
 struct Config {
     DWORD size=sizeof(Config);
     DWORD version=2;
-    DWORD flags=ExplorerTabs|TouchpadGestures;
+    // Touchpad snapping is an optional extra: off until the user turns it on.
+    DWORD flags=ExplorerTabs;
     DWORD keyboardModifiers=MOD_CONTROL|MOD_ALT|MOD_WIN;
     std::array<DWORD,4> keyboardKeys{VK_LEFT,VK_UP,VK_RIGHT,VK_DOWN};
     std::array<DWORD,8> reserved{};

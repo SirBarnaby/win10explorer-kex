@@ -332,7 +332,7 @@ bool RestoreMetadata(const Snapshot& state) {
 }
 bool RegisterMetadata(const Paths& paths,const std::wstring& directory,std::uint64_t bytes,std::wstring& error) {
     const std::wstring setup=Join(directory,L"ExplorerMvpSetup.exe");
-    bool ok=StoreString(UninstallKey,L"DisplayName",L"Explorer MVP")&&StoreString(UninstallKey,L"DisplayVersion",L"0.1.0")&&StoreString(UninstallKey,L"Publisher",L"Explorer MVP project")&&StoreString(UninstallKey,L"InstallLocation",directory)&&StoreString(UninstallKey,L"UninstallString",Quote(setup)+L" --uninstall-ui")&&StoreString(UninstallKey,L"QuietUninstallString",Quote(setup)+L" --uninstall")&&StoreString(UninstallKey,L"ModifyPath",Quote(setup))&&StoreString(UninstallKey,L"DisplayIcon",Quote(setup)+L",0")&&StoreDword(UninstallKey,L"NoRepair",1)&&StoreDword(UninstallKey,L"NoModify",0)&&StoreDword(UninstallKey,L"EstimatedSize",static_cast<DWORD>(std::min<std::uint64_t>(bytes/1024,MAXDWORD)))&&StoreValue(patch::SettingsKey,PendingValue,Value{});
+    bool ok=StoreString(UninstallKey,L"DisplayName",L"Explorer MVP")&&StoreString(UninstallKey,L"DisplayVersion",L"0.1.1")&&StoreString(UninstallKey,L"Publisher",L"Explorer MVP project")&&StoreString(UninstallKey,L"InstallLocation",directory)&&StoreString(UninstallKey,L"UninstallString",Quote(setup)+L" --uninstall-ui")&&StoreString(UninstallKey,L"QuietUninstallString",Quote(setup)+L" --uninstall")&&StoreString(UninstallKey,L"ModifyPath",Quote(setup))&&StoreString(UninstallKey,L"DisplayIcon",Quote(setup)+L",0")&&StoreDword(UninstallKey,L"NoRepair",1)&&StoreDword(UninstallKey,L"NoModify",0)&&StoreDword(UninstallKey,L"EstimatedSize",static_cast<DWORD>(std::min<std::uint64_t>(bytes/1024,MAXDWORD)))&&StoreValue(patch::SettingsKey,PendingValue,Value{});
     if(ok)ok=SafeDirectory(paths.links,true,error)&&SaveShortcut(Join(paths.links,L"Explorer MVP Options.lnk"),Join(directory,L"Win10PatchOptions.exe"),directory,L"",L"Configure Explorer title-bar tabs and snapping")&&SaveShortcut(Join(paths.links,L"Change or Remove Explorer MVP.lnk"),setup,directory,L"",L"Install, disable or remove Explorer MVP");
     if(!ok&&error.empty())error=L"Windows could not create the Start menu or Apps & Features entries.";return ok;
 }
@@ -358,7 +358,9 @@ Result Install(const Options& options) {
     patch::Config old=patch::LoadConfig(),next=old;
     // Only feature checkboxes change here. Keyboard mappings and the user's
     // restore-session choice survive every update and feature toggle.
-    if(!before.config.present)next=patch::Config{};
+    // A first install starts with snapping off. Someone coming from the first
+    // version with its swipes still active keeps them.
+    if(!before.config.present){next=patch::Config{};if(patch::ReadGestureStatus().privateBindingsActive)next.flags|=patch::TouchpadGestures;}
     if(options.tabs>=0){if(options.tabs)next.flags|=patch::ExplorerTabs;else next.flags&=~patch::ExplorerTabs;}
     if(options.gestures>=0){if(options.gestures)next.flags|=patch::TouchpadGestures;else next.flags&=~patch::TouchpadGestures;}
     Incoming incoming;std::wstring source;
@@ -483,6 +485,7 @@ int SelfTest(const std::wstring& report) {
     const auto exe=Join(root,L"NativeSnap.exe");test("quoted-owned-run",OwnedCommand(Quote(exe),exe));test("unquoted-owned-run",OwnedCommand(exe,exe));
     test("run-with-arguments",!OwnedCommand(Quote(exe)+L" --anything",exe));test("other-run-program",!OwnedCommand(Quote(exe+L".other"),exe));
     test("default-dialog",Parse({},options)&&options.action==Options::Action::Dialog);
+    test("snapping-off-by-default",patch::Config{}.flags==patch::ExplorerTabs);
     test("install-default-choices",Parse({L"--install"},options)&&options.tabs==-1&&options.gestures==-1);
     test("independent-choices",Parse({L"--install",L"--no-tabs",L"--gestures"},options)&&options.tabs==0&&options.gestures==1);
     test("opposite-choices",Parse({L"--install",L"--tabs",L"--no-gestures"},options)&&options.tabs==1&&options.gestures==0);
@@ -524,12 +527,12 @@ struct DialogState {bool busy=false,removeOnOpen=false;int result=0;std::wstring
 void Refresh(HWND dialog,const DialogState& state) {
     const bool supported=patch::SupportedWindows();for(int id:{1501,1502,1503,1504,1505,1506,IDCANCEL})EnableWindow(GetDlgItem(dialog,id),!state.busy&&(id==IDCANCEL||supported));
     std::wstring directory,error;bool installed=ReadDirectory(directory,nullptr,error)&&RegularFile(Join(directory,L"Win10PatchOptions.exe"));EnableWindow(GetDlgItem(dialog,1504),!state.busy&&installed&&supported);
-    const std::wstring text=!state.message.empty()&&supported?state.message:std::wstring(SupportText(state.support))+(supported?L" Keyboard shortcuts and restoring tabs at sign-in are off by default; Options changes them.":L"");
+    const std::wstring text=!state.message.empty()&&supported?state.message:std::wstring(SupportText(state.support))+(supported?L" Touchpad snapping, keyboard shortcuts and restoring tabs at sign-in are off by default; Options changes them.":L"");
     SetDlgItemTextW(dialog,1510,text.c_str());
 }
 INT_PTR CALLBACK Dialog(HWND dialog,UINT message,WPARAM w,LPARAM l) {
     auto state=reinterpret_cast<DialogState*>(GetWindowLongPtrW(dialog,GWLP_USERDATA));
-    if(message==WM_INITDIALOG){state=reinterpret_cast<DialogState*>(l);SetWindowLongPtrW(dialog,GWLP_USERDATA,l);Value value;std::wstring ignored;bool configured=ReadValue(patch::SettingsKey,L"Config",value,ignored)&&value.present;const auto config=patch::LoadConfig();CheckDlgButton(dialog,1501,!configured||(config.flags&patch::ExplorerTabs)?BST_CHECKED:BST_UNCHECKED);CheckDlgButton(dialog,1502,!configured||(config.flags&patch::TouchpadGestures)?BST_CHECKED:BST_UNCHECKED);SendMessageW(dialog,WM_SETICON,ICON_BIG,reinterpret_cast<LPARAM>(LoadIconW(GetModuleHandleW(nullptr),MAKEINTRESOURCEW(101))));Refresh(dialog,*state);if(state->removeOnOpen)PostMessageW(dialog,WM_COMMAND,1506,0);return TRUE;}
+    if(message==WM_INITDIALOG){state=reinterpret_cast<DialogState*>(l);SetWindowLongPtrW(dialog,GWLP_USERDATA,l);Value value;std::wstring ignored;bool configured=ReadValue(patch::SettingsKey,L"Config",value,ignored)&&value.present;const auto config=patch::LoadConfig();CheckDlgButton(dialog,1501,!configured||(config.flags&patch::ExplorerTabs)?BST_CHECKED:BST_UNCHECKED);CheckDlgButton(dialog,1502,(configured?(config.flags&patch::TouchpadGestures)!=0:patch::ReadGestureStatus().privateBindingsActive)?BST_CHECKED:BST_UNCHECKED);SendMessageW(dialog,WM_SETICON,ICON_BIG,reinterpret_cast<LPARAM>(LoadIconW(GetModuleHandleW(nullptr),MAKEINTRESOURCEW(101))));Refresh(dialog,*state);if(state->removeOnOpen)PostMessageW(dialog,WM_COMMAND,1506,0);return TRUE;}
     if(!state)return FALSE;if(message==WM_CLOSE||(message==WM_COMMAND&&LOWORD(w)==IDCANCEL)){if(!state->busy)EndDialog(dialog,state->result);return TRUE;}
     if(message!=WM_COMMAND||state->busy)return FALSE;const int action=LOWORD(w);if(action==1504){patch::OpenOptions(dialog);return TRUE;}if(action!=1503&&action!=1505&&action!=1506)return FALSE;
     if(action==1506&&MessageBoxW(dialog,L"Disable both features and remove this account's Explorer MVP files? If Windows still needs to restore gestures, or Explorer is using a file, removal will stay pending. Explorer will not be restarted.",L"Remove Explorer MVP",MB_YESNO|MB_ICONQUESTION|MB_DEFBUTTON2)!=IDYES)return TRUE;

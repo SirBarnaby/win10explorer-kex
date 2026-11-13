@@ -7,7 +7,7 @@ FONT 9,"Segoe UI"
 BEGIN
  LTEXT "Add features to your existing File Explorer",-1,14,12,328,15
  CONTROL "Tabs in Explorer's title bar",1501,"Button",BS_AUTOCHECKBOX | WS_TABSTOP,16,36,322,15
- CONTROL "Touchpad snapping: left, right and corners",1502,"Button",BS_AUTOCHECKBOX | WS_TABSTOP,16,57,322,15
+ CONTROL "Optional extra: touchpad snapping (left, right and corners)",1502,"Button",BS_AUTOCHECKBOX | WS_TABSTOP,16,57,322,15
  LTEXT "Installed for your Windows account. No tray icon or administrator approval.",-1,16,81,322,27
  LTEXT "",1510,16,113,322,47
  DEFPUSHBUTTON "Install / Update",1503,14,169,89,18

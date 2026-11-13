@@ -2,6 +2,10 @@
 #include "MvpHostProtocol.h"
 #include <shellapi.h>
 #include <shlobj.h>
+#include <exdisp.h>
+#include <shldisp.h>
+#include <shlguid.h>
+#include <wrl/client.h>
 #include <algorithm>
 #include <fstream>
 #include <cstring>
@@ -76,6 +80,47 @@ Diagnostics ReadDiagnostics() {
     if(d.gestures.state==EffectiveState::Enabled&&!(activeInputs&TouchpadGestures)){d.gestures.state=EffectiveState::Pending;d.gestures.detail=L"Windows gesture assignments are active, but snapping is paused or its receiver has not confirmed startup.";}
     EnumWindows([](HWND h,LPARAM data)->BOOL{auto& d=*reinterpret_cast<Diagnostics*>(data);wchar_t c[80];GetClassNameW(h,c,80);if(!_wcsicmp(c,L"CabinetWClass")){d.explorerWindows++;if(GetPropW(h,TabsActiveProperty))d.tabWindows++;if(GetPropW(h,L"Win10NativePatch.TabsRejected.v2"))d.detail=L"At least one Explorer window has unsupported caption geometry or could not isolate native caption painting. Tabs stayed off in that window.";}return TRUE;},reinterpret_cast<LPARAM>(&d));return d;
 }
+namespace {
+// A helper started with CreateProcess joins the caller's job object. When
+// setup or Options run from a terminal, a script host or a remote tool, the
+// helper would end as soon as that parent closes, and nothing starts it again
+// before the next sign-in. The desktop shell starts it instead in that case.
+bool InJob(){BOOL in=FALSE;return IsProcessInJob(GetCurrentProcess(),nullptr,&in)&&in;}
+bool StartFromShell(const std::wstring& app,const std::wstring& directory) {
+    using Microsoft::WRL::ComPtr;
+    const HRESULT init=CoInitializeEx(nullptr,COINIT_APARTMENTTHREADED);
+    if(FAILED(init)&&init!=RPC_E_CHANGED_MODE)return false;
+    bool started=false;
+    {
+        ComPtr<IShellWindows> windows;ComPtr<IDispatch> desktop,background,application;ComPtr<IServiceProvider> provider;
+        ComPtr<IShellBrowser> browser;ComPtr<IShellView> view;ComPtr<IShellFolderViewDual> folder;ComPtr<IShellDispatch2> shell;
+        VARIANT location{},empty{};V_VT(&location)=VT_I4;V_I4(&location)=CSIDL_DESKTOP;long window{};
+        if(SUCCEEDED(CoCreateInstance(CLSID_ShellWindows,nullptr,CLSCTX_LOCAL_SERVER,IID_PPV_ARGS(&windows)))&&
+           windows->FindWindowSW(&location,&empty,SWC_DESKTOP,&window,SWFO_NEEDDISPATCH,&desktop)==S_OK&&
+           SUCCEEDED(desktop.As(&provider))&&SUCCEEDED(provider->QueryService(SID_STopLevelBrowser,IID_PPV_ARGS(&browser)))&&
+           SUCCEEDED(browser->QueryActiveShellView(&view))&&SUCCEEDED(view->GetItemObject(SVGIO_BACKGROUND,IID_PPV_ARGS(&background)))&&
+           SUCCEEDED(background.As(&folder))&&SUCCEEDED(folder->get_Application(&application))&&SUCCEEDED(application.As(&shell))) {
+            BSTR file=SysAllocString(app.c_str());VARIANT start{},show{};V_VT(&start)=VT_BSTR;V_BSTR(&start)=SysAllocString(directory.c_str());V_VT(&show)=VT_I4;V_I4(&show)=SW_HIDE;
+            started=file&&V_BSTR(&start)&&SUCCEEDED(shell->ShellExecute(file,empty,start,empty,show));
+            SysFreeString(file);VariantClear(&start);
+        }
+    }
+    if(SUCCEEDED(init))CoUninitialize();
+    return started;
+}
+// `process` stays null when the shell started the helper.
+bool StartHelper(const std::wstring& app,HANDLE& process) {
+    process=nullptr;const size_t slash=app.find_last_of(L"\\/");
+    const std::wstring directory=slash==std::wstring::npos?ModuleDirectory():app.substr(0,slash);
+    if(InJob()&&StartFromShell(app,directory))return true;
+    std::wstring command=L"\""+app+L"\"";
+    STARTUPINFOW start{sizeof(start)};start.dwFlags=STARTF_USESHOWWINDOW;start.wShowWindow=SW_HIDE;PROCESS_INFORMATION info{};
+    if(!CreateProcessW(app.c_str(),command.data(),nullptr,nullptr,FALSE,CREATE_NO_WINDOW,nullptr,directory.c_str(),&start,&info))return false;
+    CloseHandle(info.hThread);process=info.hProcess;return true;
+}
+// One readiness poll step: true once a directly started helper has exited.
+bool HelperExited(HANDLE process){if(process)return WaitForSingleObject(process,30)==WAIT_OBJECT_0;Sleep(30);return false;}
+}
 bool ReconcileSnapRuntime(const Config& c,std::wstring& error) {
     GestureStatus status=ReadGestureStatus();bool needed=(c.flags&KeyboardShortcuts)||status.privateBindingsActive;
     HKEY run{};LONG result=RegCreateKeyExW(HKEY_CURRENT_USER,RunKey,0,nullptr,0,KEY_SET_VALUE,nullptr,&run,nullptr);
@@ -86,12 +131,11 @@ bool ReconcileSnapRuntime(const Config& c,std::wstring& error) {
     HWND h=FindWindowW(SnapWindowClass,nullptr);
     if(h){DWORD_PTR response{};ULONGLONG deadline=GetTickCount64()+1500;do{if(!SendMessageTimeoutW(h,SettingsChangedMessage(),1,0,SMTO_ABORTIFHUNG|SMTO_BLOCK,2000,&response))break;if(response==1)return true;if(response!=2)break;Sleep(30);}while(GetTickCount64()<deadline);error=L"Native Snap could not apply the shortcuts. Check for a conflicting shortcut utility.";return false;}
     if(!needed)return true;
-    std::wstring app=SiblingPath(L"NativeSnap.exe"),command=L"\""+app+L"\"";
-    STARTUPINFOW si{sizeof(si)};si.dwFlags=STARTF_USESHOWWINDOW;si.wShowWindow=SW_HIDE;PROCESS_INFORMATION pi{};
-    if(!CreateProcessW(app.c_str(),command.data(),nullptr,nullptr,FALSE,CREATE_NO_WINDOW,nullptr,ModuleDirectory().c_str(),&si,&pi)){error=L"Native Snap could not start.";return false;}
-    CloseHandle(pi.hThread);bool ready=false;ULONGLONG deadline=GetTickCount64()+5000;
-    while(GetTickCount64()<deadline){if(WaitForSingleObject(pi.hProcess,30)==WAIT_OBJECT_0)break;h=FindWindowW(SnapWindowClass,nullptr);if(h){DWORD_PTR response{};if(SendMessageTimeoutW(h,SettingsChangedMessage(),1,0,SMTO_ABORTIFHUNG|SMTO_BLOCK,1500,&response)){ready=response==1;if(response!=2)break;}else break;}}
-    CloseHandle(pi.hProcess);if(!ready){error=L"Native Snap could not register its shortcuts.";return false;}return true;
+    HANDLE process{};
+    if(!StartHelper(SiblingPath(L"NativeSnap.exe"),process)){error=L"Native Snap could not start.";return false;}
+    bool ready=false;ULONGLONG deadline=GetTickCount64()+5000;
+    while(GetTickCount64()<deadline){if(HelperExited(process))break;h=FindWindowW(SnapWindowClass,nullptr);if(h){DWORD_PTR response{};if(SendMessageTimeoutW(h,SettingsChangedMessage(),1,0,SMTO_ABORTIFHUNG|SMTO_BLOCK,1500,&response)){ready=response==1;if(response!=2)break;}else break;}}
+    if(process)CloseHandle(process);if(!ready){error=L"Native Snap could not register its shortcuts.";return false;}return true;
 }
 bool ReconcileTabsRuntime(const Config& config,std::wstring& error) {
     const std::wstring app=SiblingPath(L"ExplorerMvpHost.exe");
@@ -120,11 +164,11 @@ bool ReconcileTabsRuntime(const Config& config,std::wstring& error) {
             PostMessageW(host,SettingsChangedMessage(),0,0);return true;
         }
     }
-    STARTUPINFOW start{sizeof(start)};start.dwFlags=STARTF_USESHOWWINDOW;start.wShowWindow=SW_HIDE;PROCESS_INFORMATION process{};
-    if(!CreateProcessW(app.c_str(),command.data(),nullptr,nullptr,FALSE,CREATE_NO_WINDOW,nullptr,ModuleDirectory().c_str(),&start,&process)){error=L"Explorer integration could not start.";return false;}
-    CloseHandle(process.hThread);bool ready=false;ULONGLONG deadline=GetTickCount64()+4000;
-    while(GetTickCount64()<deadline){if(WaitForSingleObject(process.hProcess,30)==WAIT_OBJECT_0)break;if(FindWindowW(mvp::HostClass,nullptr)){ready=true;break;}}
-    CloseHandle(process.hProcess);if(!ready)error=L"Explorer integration did not confirm startup.";return ready;
+    HANDLE process{};
+    if(!StartHelper(app,process)){error=L"Explorer integration could not start.";return false;}
+    bool ready=false;ULONGLONG deadline=GetTickCount64()+4000;
+    while(GetTickCount64()<deadline){if(HelperExited(process))break;if(FindWindowW(mvp::HostClass,nullptr)){ready=true;break;}}
+    if(process)CloseHandle(process);if(!ready)error=L"Explorer integration did not confirm startup.";return ready;
 }
 bool ApplyConfig(const Config& c,GestureStatus& status,std::wstring& error) {
     ConfigLock lock;if(!lock.owned){error=L"Another settings update is running.";return false;}

@@ -73,6 +73,9 @@ void Destroyed(HWND window) {
 // button (shell hook). The WinEvent range below is the fallback when the
 // shell hook cannot be registered: it wakes for every object in the session.
 UINT shellHook{};
+// Broadcast when the desktop shell (re)starts: Explorer was restarted, or it
+// came up after this starter did. Folder windows and hooks are checked again.
+UINT taskbarCreated{};
 void CALLBACK WindowEvent(HWINEVENTHOOK,DWORD event,HWND window,LONG object,LONG child,DWORD,DWORD) {
     if(object!=OBJID_WINDOW||child!=CHILDID_SELF)return;
     if(event==EVENT_OBJECT_DESTROY)Destroyed(window);else Created(window);
@@ -100,6 +103,10 @@ bool DetachAll(bool preserveSession,ULONG_PTR request) {
 }
 LRESULT CALLBACK HostProc(HWND window,UINT message,WPARAM w,LPARAM l) {
     if(message==patch::SettingsChangedMessage()) {Refresh();return 1;}
+    if(taskbarCreated&&message==taskbarCreated) {
+        if(shellHook)RegisterShellHookWindow(window);
+        Refresh();return 0;
+    }
     if(shellHook&&message==shellHook) {
         const auto target=reinterpret_cast<HWND>(l);
         switch(w&0x7FFF) {
@@ -214,6 +221,7 @@ int WINAPI wWinMain(HINSTANCE instance,HINSTANCE,PWSTR,int) {
     if(!host){FreeLibrary(extension);CloseHandle(mutex);return 1;}
     SetPropW(host,patch::mvp::SessionHandoffCapability,reinterpret_cast<HANDLE>(1));
     HWINEVENTHOOK events{};
+    taskbarCreated=RegisterWindowMessageW(L"TaskbarCreated");
     shellHook=RegisterWindowMessageW(L"SHELLHOOK");
     const bool shellHooked=shellHook&&RegisterShellHookWindow(host);
     if(!shellHooked){shellHook=0;events=SetWinEventHook(EVENT_OBJECT_CREATE,EVENT_OBJECT_HIDE,nullptr,WindowEvent,0,0,WINEVENT_OUTOFCONTEXT|WINEVENT_SKIPOWNPROCESS);}
