@@ -28,7 +28,7 @@ On this project's earlier QTTabBar installation, the new tabs replace the lower 
 
 ## What this MVP is
 
-The tabs are child controls of Explorer's window. A hidden starter attaches the module to Explorer folder windows; it is woken only when a top-level window opens or closes, and is otherwise idle. Extra row space is reserved through the native Ribbon height notification; native commands are never cut out. A hidden receiver invokes Windows Snap and preserves its arranged state while adjusting frame geometry. Options and Setup run only when opened. This is an Explorer extension, not a Microsoft tab backport.
+The tabs are child controls of Explorer's window. A hidden starter attaches the module to Explorer folder windows; it is woken only when a top-level window opens or closes, and is otherwise idle. A second, idle copy of the starter starts it again if it is ended. Extra row space is reserved through the native Ribbon height notification; native commands are never cut out. A hidden receiver invokes Windows Snap and preserves its arranged state while adjusting frame geometry. Options and Setup run only when opened. This is an Explorer extension, not a Microsoft tab backport.
 
 Install only on the stated Windows version. Header integration additionally checks the exact supported UIRibbon.dll image (SHA256 941DCFCD96B3D9799945A5AB1B4D4B7D6859682A0AF9DF38223568D7F3C46A2F); a different image leaves ordinary Explorer chrome intact. Clean-PC, mixed-DPI and multiple-monitor hardware acceptance has not been completed. Touchpad assignments may require signing out and back in if Windows cannot refresh its gesture cache immediately; Options reports the pending state. Physical gestures still require a manual test.
 
