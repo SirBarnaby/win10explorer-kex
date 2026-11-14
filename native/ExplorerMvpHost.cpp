@@ -11,6 +11,7 @@
 
 namespace {
 constexpr UINT RefreshWindow=WM_APP+40;
+constexpr UINT_PTR AttachTimer=1,ShellTimer=2;
 HWND host{},selected{};
 HMODULE extension{};
 HOOKPROC hookProcedure{};
@@ -50,7 +51,7 @@ void Queue(HWND window) {
     if((patch::LoadConfig().flags&patch::ExplorerTabs)&&
        !GetPropW(window,L"Win10NativePatch.ExplorerController.v2")) {
         pending.try_emplace(window,0);
-        SetTimer(host,1,200,nullptr);
+        SetTimer(host,AttachTimer,200,nullptr);
     }
 }
 void Refresh() {
@@ -101,6 +102,77 @@ bool DetachAll(bool preserveSession,ULONG_PTR request) {
     hooks.clear();pending.clear();
     return true;
 }
+// Keep-alive. A second copy of this program (the guard) has no window and no
+// timer: it sleeps on the starter's process handle and starts the starter again
+// if it ends without having released the guard. The starter watches the guard
+// the same way, so ending either one alone brings it back within a second.
+// `released` is set on every intended stop (Options, setup, sign-out).
+HANDLE guard{},released{};
+unsigned strikes{},guardFailures{},shellWaits{};
+ULONGLONG guardStarted{};
+std::wstring OwnPath() {
+    std::wstring path(32768,L'\0');const DWORD length=GetModuleFileNameW(nullptr,path.data(),static_cast<DWORD>(path.size()));
+    path.resize(length<path.size()?length:0);return path;
+}
+// Starts another copy of this program. `inherit`, when given, is the only
+// handle the copy receives; every other handle here stays private.
+bool Launch(const std::wstring& arguments,HANDLE inherit,HANDLE* process) {
+    const std::wstring app=OwnPath();if(app.empty())return false;
+    std::wstring command=L"\""+app+L"\""+(arguments.empty()?L"":L" "+arguments);
+    STARTUPINFOEXW start{};start.StartupInfo.cb=sizeof(start);start.StartupInfo.dwFlags=STARTF_USESHOWWINDOW;start.StartupInfo.wShowWindow=SW_HIDE;
+    std::vector<BYTE> attributes;SIZE_T size{};
+    if(inherit) {
+        InitializeProcThreadAttributeList(nullptr,1,0,&size);attributes.resize(size);
+        start.lpAttributeList=reinterpret_cast<LPPROC_THREAD_ATTRIBUTE_LIST>(attributes.data());
+        if(!InitializeProcThreadAttributeList(start.lpAttributeList,1,0,&size))return false;
+        if(!UpdateProcThreadAttribute(start.lpAttributeList,0,PROC_THREAD_ATTRIBUTE_HANDLE_LIST,&inherit,sizeof(inherit),nullptr,nullptr)){DeleteProcThreadAttributeList(start.lpAttributeList);return false;}
+    }
+    PROCESS_INFORMATION info{};
+    const bool started=CreateProcessW(app.c_str(),command.data(),nullptr,nullptr,inherit!=nullptr,CREATE_NO_WINDOW|(inherit?EXTENDED_STARTUPINFO_PRESENT:0),
+                                      nullptr,patch::ModuleDirectory().c_str(),&start.StartupInfo,&info)!=FALSE;
+    if(inherit)DeleteProcThreadAttributeList(start.lpAttributeList);
+    if(!started)return false;
+    CloseHandle(info.hThread);if(process)*process=info.hProcess;else CloseHandle(info.hProcess);return true;
+}
+// Windows is signing out or shutting down: nothing is started again.
+bool Ending(){return GetSystemMetrics(SM_SHUTTINGDOWN)!=0;}
+void StartGuard() {
+    if(!released||guard||Ending())return;
+    guardStarted=GetTickCount64();
+    Launch(L"--guard "+std::to_wstring(GetCurrentProcessId())+L" "+std::to_wstring(reinterpret_cast<ULONG_PTR>(released))+L" "+std::to_wstring(strikes),released,&guard);
+}
+void GuardEnded() {
+    CloseHandle(guard);guard=nullptr;
+    // A guard that keeps ending at once is not started a fourth time.
+    guardFailures=GetTickCount64()-guardStarted<10000?guardFailures+1:0;
+    if(guardFailures<3)StartGuard();
+}
+bool Number(const std::wstring& text,ULONG_PTR& value) {
+    wchar_t* end{};value=static_cast<ULONG_PTR>(wcstoull(text.c_str(),&end,10));return !text.empty()&&end&&!*end;
+}
+// `--guard <starter pid> <released event> <strikes>`
+int Guard(const std::vector<std::wstring>& args) {
+    ULONG_PTR pid{},event{},count{};
+    if(!Number(args[1],pid)||!Number(args[2],event)||!Number(args[3],count)||!pid||!event)return 2;
+    HANDLE starter=OpenProcess(SYNCHRONIZE|PROCESS_QUERY_LIMITED_INFORMATION,FALSE,static_cast<DWORD>(pid));
+    if(!starter)return 0;
+    std::wstring image(32768,L'\0');DWORD size=static_cast<DWORD>(image.size());
+    if(!QueryFullProcessImageNameW(starter,0,image.data(),&size)||_wcsicmp(image.c_str(),OwnPath().c_str())){CloseHandle(starter);return 2;}
+    const HANDLE handles[]{starter,reinterpret_cast<HANDLE>(event)};
+    const bool ended=WaitForMultipleObjects(2,handles,FALSE,INFINITE)==WAIT_OBJECT_0&&WaitForSingleObject(handles[1],0)!=WAIT_OBJECT_0;
+    FILETIME created{},exited{},kernel{},user{};
+    const bool timed=ended&&GetProcessTimes(starter,&created,&exited,&kernel,&user);
+    CloseHandle(starter);
+    if(!ended||!(patch::LoadConfig().flags&patch::ExplorerTabs))return 0;
+    // A starter that ends within half a minute of starting counts as a strike;
+    // three in a row end the attempts until the next sign-in, Options or setup.
+    const auto ticks=[](const FILETIME& time){return (static_cast<ULONGLONG>(time.dwHighDateTime)<<32)|time.dwLowDateTime;};
+    const unsigned next=timed&&ticks(exited)-ticks(created)<300000000ull?static_cast<unsigned>(count)+1:0;
+    if(next>=3)return 1;
+    Sleep(next*1000);
+    if(Ending())return 0;
+    return Launch(L"--recovered "+std::to_wstring(next),nullptr,nullptr)?0:1;
+}
 LRESULT CALLBACK HostProc(HWND window,UINT message,WPARAM w,LPARAM l) {
     if(message==patch::SettingsChangedMessage()) {Refresh();return 1;}
     if(taskbarCreated&&message==taskbarCreated) {
@@ -123,18 +195,27 @@ LRESULT CALLBACK HostProc(HWND window,UINT message,WPARAM w,LPARAM l) {
         else Refresh();
         return 0;
     case WM_TIMER:
-        if(w==1) {
+        if(w==ShellTimer) {
+            // Started before the desktop shell: look again once it is there.
+            if(GetShellWindow()){KillTimer(window,ShellTimer);if(shellHook)RegisterShellHookWindow(window);Refresh();}
+            else if(++shellWaits>=300)KillTimer(window,ShellTimer);
+            return 0;
+        }
+        if(w==AttachTimer) {
             for(auto i=pending.begin();i!=pending.end();) {
                 if(!ExplorerFrame(i->first)||GetPropW(i->first,L"Win10NativePatch.ExplorerController.v2")||
                    !(patch::LoadConfig().flags&patch::ExplorerTabs)||i->second++>=10)i=pending.erase(i);
                 else {Attach(i->first);++i;}
             }
-            if(pending.empty())KillTimer(window,1);
+            if(pending.empty())KillTimer(window,AttachTimer);
         }
         return 0;
     case WM_CLOSE: {
+        // Only a stop made through StopHost ends the starter. A plain close
+        // posted by another program is ignored; the lab's single-window mode
+        // closes itself that way.
         const auto request=static_cast<ULONG_PTR>(l);
-        if((request||w==1)&&(!request||reinterpret_cast<ULONG_PTR>(GetPropW(window,patch::mvp::StopRequest))!=request))return 0;
+        if(request?reinterpret_cast<ULONG_PTR>(GetPropW(window,patch::mvp::StopRequest))!=request:(w||!selected))return 0;
         if(DetachAll(w==1,request)){
             if(request){
                 if(!SetPropW(window,patch::mvp::StopCommitted,reinterpret_cast<HANDLE>(request))){
@@ -148,6 +229,10 @@ LRESULT CALLBACK HostProc(HWND window,UINT message,WPARAM w,LPARAM l) {
         }
         return 0;
     }
+    case WM_ENDSESSION:
+        // Signing out is an intended stop: the guard must not start a new copy.
+        if(w&&released)SetEvent(released);
+        return 0;
     case WM_DESTROY:
         if(shellHook)DeregisterShellHookWindow(window);
         PostQuitMessage(0);return 0;
@@ -193,9 +278,11 @@ int Probe(const std::wstring& path) {
 }
 }
 int WINAPI wWinMain(HINSTANCE instance,HINSTANCE,PWSTR,int) {
+    bool recovered=false;
     int count{};auto argv=CommandLineToArgvW(GetCommandLineW(),&count);
     std::vector<std::wstring> args;if(argv){for(int i=1;i<count;i++)args.emplace_back(argv[i]);LocalFree(argv);}
     if(args.size()==2&&args[0]==L"--probe")return Probe(args[1]);
+    if(args.size()==4&&args[0]==L"--guard")return Guard(args);
     if(args.size()==1&&args[0]==L"--stop") {
         HWND target=FindWindowW(patch::mvp::HostClass,nullptr);if(!target)return 0;
         DWORD pid{};GetWindowThreadProcessId(target,&pid);HANDLE process=OpenProcess(SYNCHRONIZE,FALSE,pid);
@@ -206,12 +293,20 @@ int WINAPI wWinMain(HINSTANCE instance,HINSTANCE,PWSTR,int) {
         wchar_t* end{};auto value=wcstoull(args[1].c_str(),&end,10);
         selected=reinterpret_cast<HWND>(static_cast<ULONG_PTR>(value));
         if(!value||!end||*end||!ExplorerFrame(selected))return 2;
+    } else if(args.size()==2&&args[0]==L"--recovered") {
+        ULONG_PTR previous{};if(!Number(args[1],previous)||previous>2)return 2;
+        strikes=static_cast<unsigned>(previous);recovered=true;
     } else if(!args.empty())return 2;
 #ifndef NATIVE_LAB_ANY_BUILD
     if(!patch::SupportedWindows())return 3;
 #endif
     HANDLE mutex=CreateMutexW(nullptr,FALSE,L"Local\\Win10NativePatch.ExplorerMvpHost.v1");
+    // Started by the guard: give the ended starter a moment to let go of the name.
+    for(int attempt=0;recovered&&mutex&&GetLastError()==ERROR_ALREADY_EXISTS&&attempt<20;++attempt) {
+        CloseHandle(mutex);Sleep(100);mutex=CreateMutexW(nullptr,FALSE,L"Local\\Win10NativePatch.ExplorerMvpHost.v1");
+    }
     if(!mutex)return 1;if(GetLastError()==ERROR_ALREADY_EXISTS){CloseHandle(mutex);return 0;}
+    const bool guarded=!selected;
     extension=LoadLibraryExW((patch::ModuleDirectory()+L"\\ExplorerTabs.dll").c_str(),nullptr,LOAD_WITH_ALTERED_SEARCH_PATH);
     if(extension)hookProcedure=reinterpret_cast<HOOKPROC>(GetProcAddress(extension,"MvpExplorerHook"));
     if(!hookProcedure){if(extension)FreeLibrary(extension);CloseHandle(mutex);return 4;}
@@ -225,8 +320,26 @@ int WINAPI wWinMain(HINSTANCE instance,HINSTANCE,PWSTR,int) {
     shellHook=RegisterWindowMessageW(L"SHELLHOOK");
     const bool shellHooked=shellHook&&RegisterShellHookWindow(host);
     if(!shellHooked){shellHook=0;events=SetWinEventHook(EVENT_OBJECT_CREATE,EVENT_OBJECT_HIDE,nullptr,WindowEvent,0,0,WINEVENT_OUTOFCONTEXT|WINEVENT_SKIPOWNPROCESS);}
-    Refresh();MSG message{};
-    while(GetMessageW(&message,nullptr,0,0)>0){TranslateMessage(&message);DispatchMessageW(&message);}
+    Refresh();
+    if(!GetShellWindow())SetTimer(host,ShellTimer,1000,nullptr);
+    if(guarded) {
+        SECURITY_ATTRIBUTES inheritable{sizeof(inheritable),nullptr,TRUE};
+        released=CreateEventW(&inheritable,TRUE,FALSE,nullptr);StartGuard();
+    }
+    MSG message{};bool running=true;
+    while(running) {
+        const DWORD watched=guard?1:0;
+        if(MsgWaitForMultipleObjects(watched,&guard,FALSE,INFINITE,QS_ALLINPUT)==WAIT_OBJECT_0&&watched){GuardEnded();continue;}
+        while(PeekMessageW(&message,nullptr,0,0,PM_REMOVE)) {
+            if(message.message==WM_QUIT){running=false;break;}
+            TranslateMessage(&message);DispatchMessageW(&message);
+        }
+    }
+    // Release the guard and let it leave first, so no copy of this program is
+    // still running (or holding its file) once the starter has exited.
+    if(released)SetEvent(released);
+    if(guard){WaitForSingleObject(guard,2000);CloseHandle(guard);}
+    if(released)CloseHandle(released);
     if(events)UnhookWinEvent(events);
     FreeLibrary(extension);CloseHandle(mutex);return 0;
 }

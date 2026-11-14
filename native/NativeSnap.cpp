@@ -438,9 +438,10 @@ LRESULT CALLBACK WindowProc(HWND h, UINT message, WPARAM w, LPARAM l) {
     if(message==patch::SettingsChangedMessage()) {
         if(arranging||reloadingKeys)return 2; // Busy, retry without changing the request.
         bool ok=RegisterKeys(h,true);
-        if(ok&&activeBindings.empty()&&!(activeConfig.flags&patch::KeyboardShortcuts)){RemoveIdleStartup();PostMessageW(h,WM_CLOSE,0,0);}
+        if(ok&&activeBindings.empty()&&!(activeConfig.flags&patch::KeyboardShortcuts)){RemoveIdleStartup();PostMessageW(h,patch::SnapStopMessage(),0,0);}
         return ok?1:0;
     }
+    if(message==patch::SnapStopMessage()){DestroyWindow(h);return 0;}
     switch(message) {
     case WM_HOTKEY:
         {
@@ -468,7 +469,7 @@ LRESULT CALLBACK WindowProc(HWND h, UINT message, WPARAM w, LPARAM l) {
         }
         return 0;
     case WM_TIMER:if(w==5){SettleResize();return 0;}if(w==6){PostMessageW(h,WM_APP+1,0,0);return 0;}break;
-    case WM_CLOSE: DestroyWindow(h);return 0;
+    case WM_CLOSE: return 0; // Not a stop request; see patch::SnapStopMessage.
     case WM_DESTROY: stopping=true;requests.clear();UnregisterKeys(h);PostQuitMessage(0);return 0;
     case WM_DISPLAYCHANGE: states.clear();resizing.reset();KillTimer(h,5);return 0;
     }
@@ -618,7 +619,9 @@ int WINAPI wWinMain(HINSTANCE instance,HINSTANCE,PWSTR,int) {
             HWND h=FindWindow(kClass,nullptr);if(!h)return 0;
             DWORD pid{};GetWindowThreadProcessId(h,&pid);
             HANDLE process=OpenProcess(SYNCHRONIZE,FALSE,pid);
-            if(!PostMessage(h,WM_CLOSE,0,0)){if(process)CloseHandle(process);return 1;}
+            // The plain close is for a receiver from version 0.1.0, which knows no stop request.
+            const bool requested=PostMessage(h,patch::SnapStopMessage(),0,0)!=FALSE,closed=PostMessage(h,WM_CLOSE,0,0)!=FALSE;
+            if(!requested&&!closed){if(process)CloseHandle(process);return 1;}
             if(!process)return 1;
             bool stopped=WaitForSingleObject(process,3000)==WAIT_OBJECT_0;CloseHandle(process);return stopped?0:1;
         }

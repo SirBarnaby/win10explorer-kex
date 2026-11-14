@@ -282,8 +282,9 @@ bool StopWindow(const wchar_t* windowClass,const std::wstring& expected,std::wst
         if(patch::mvp::StopHost(window,process.value,preserveSession))return true;
         error=L"Explorer integration did not finish stopping. Its stop request was cancelled; wait a moment and try again.";return false;
     }
-    const bool posted=PostMessageW(window,WM_CLOSE,0,0)!=FALSE;
-    if(posted&&WaitForSingleObject(process.value,5000)==WAIT_OBJECT_0)return true;
+    // The plain close is for a receiver from version 0.1.0, which knows no stop request.
+    const bool requested=PostMessageW(window,patch::SnapStopMessage(),0,0)!=FALSE,closed=PostMessageW(window,WM_CLOSE,0,0)!=FALSE;
+    if((requested||closed)&&WaitForSingleObject(process.value,5000)==WAIT_OBJECT_0)return true;
     error=L"A feature is still stopping. Explorer was not restarted. Wait a moment and try again.";return false;
 }
 bool StopRuntime(const std::wstring& directory,std::wstring& error,bool preserveSession=false){return CheckRuntime(directory,error)&&StopWindow(patch::mvp::HostClass,Join(directory,L"ExplorerMvpHost.exe"),error,preserveSession)&&StopWindow(patch::SnapWindowClass,Join(directory,L"NativeSnap.exe"),error);}
@@ -351,6 +352,16 @@ bool RetireLegacy(const Paths& paths,const Snapshot& state,bool& stopped,std::ws
     if(!StoreValue(RunKey,LegacyRun,Value{})){error=L"The previous receiver's startup entry could not be retired.";return false;}
     if(legacy){stopped=true;if(!PostMessageW(legacy,WM_CLOSE,0,0)||WaitForSingleObject(process.value,5000)!=WAIT_OBJECT_0){error=L"The previous receiver is still stopping. Its startup entry will be restored.";return false;}}return true;
 }
+// The features an install selects. `tabs` and `gestures` are the command-line
+// or checkbox choices: 1 on, 0 off, -1 not given. Without a saved
+// configuration this is a first install: tabs on, snapping off unless the
+// swipes of an earlier version are still assigned.
+DWORD InstallFlags(bool configured,DWORD flags,bool swipesActive,int tabs,int gestures) {
+    if(!configured)flags=patch::Config{}.flags|(swipesActive?patch::TouchpadGestures:0);
+    if(tabs>=0)flags=tabs?flags|patch::ExplorerTabs:flags&~DWORD(patch::ExplorerTabs);
+    if(gestures>=0)flags=gestures?flags|patch::TouchpadGestures:flags&~DWORD(patch::TouchpadGestures);
+    return flags;
+}
 Result Install(const Options& options) {
     SetupLock lock;if(!lock.owned)return {1,L"Another Explorer MVP setup is running."};if(!patch::SupportedWindows())return {1,L"Explorer MVP supports Windows 10 22H2 x64 (build 19045)."};
     Paths paths;Snapshot before;std::wstring error,previous,target;std::uint64_t bytes{};
@@ -360,9 +371,8 @@ Result Install(const Options& options) {
     // restore-session choice survive every update and feature toggle.
     // A first install starts with snapping off. Someone coming from the first
     // version with its swipes still active keeps them.
-    if(!before.config.present){next=patch::Config{};if(patch::ReadGestureStatus().privateBindingsActive)next.flags|=patch::TouchpadGestures;}
-    if(options.tabs>=0){if(options.tabs)next.flags|=patch::ExplorerTabs;else next.flags&=~patch::ExplorerTabs;}
-    if(options.gestures>=0){if(options.gestures)next.flags|=patch::TouchpadGestures;else next.flags&=~patch::TouchpadGestures;}
+    if(!before.config.present)next=patch::Config{};
+    next.flags=InstallFlags(before.config.present,next.flags,patch::ReadGestureStatus().privateBindingsActive,options.tabs,options.gestures);
     Incoming incoming;std::wstring source;
     if(!incoming.Source(paths,source,error)||!StagePackage(paths,source,target,bytes,error))return {1,error};
     migration::Legacy legacy;
@@ -486,6 +496,16 @@ int SelfTest(const std::wstring& report) {
     test("run-with-arguments",!OwnedCommand(Quote(exe)+L" --anything",exe));test("other-run-program",!OwnedCommand(Quote(exe+L".other"),exe));
     test("default-dialog",Parse({},options)&&options.action==Options::Action::Dialog);
     test("snapping-off-by-default",patch::Config{}.flags==patch::ExplorerTabs);
+    {
+        using namespace patch;const DWORD both=ExplorerTabs|TouchpadGestures,extras=KeyboardShortcuts|RestoreTabs|NoTabAnimations;
+        test("first-install-tabs-only",InstallFlags(false,0,false,-1,-1)==ExplorerTabs);
+        test("first-install-keeps-assigned-swipes",InstallFlags(false,0,true,-1,-1)==both);
+        test("first-install-snapping-on-request",InstallFlags(false,0,false,-1,1)==both);
+        test("update-keeps-snapping-on",InstallFlags(true,both|extras,false,-1,-1)==(both|extras));
+        test("update-keeps-snapping-off",InstallFlags(true,ExplorerTabs|extras,true,-1,-1)==(ExplorerTabs|extras));
+        test("update-keeps-tabs-off",InstallFlags(true,TouchpadGestures,false,-1,-1)==TouchpadGestures);
+        test("update-explicit-choices",InstallFlags(true,both|extras,false,0,0)==extras&&InstallFlags(true,extras,false,1,1)==(both|extras));
+    }
     test("install-default-choices",Parse({L"--install"},options)&&options.tabs==-1&&options.gestures==-1);
     test("independent-choices",Parse({L"--install",L"--no-tabs",L"--gestures"},options)&&options.tabs==0&&options.gestures==1);
     test("opposite-choices",Parse({L"--install",L"--tabs",L"--no-gestures"},options)&&options.tabs==1&&options.gestures==0);

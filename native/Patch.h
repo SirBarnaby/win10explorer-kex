@@ -58,6 +58,9 @@ bool SupportedWindows();
 bool TabsInstalled();
 Diagnostics ReadDiagnostics();
 UINT SettingsChangedMessage();
+// The snap receiver ends only on this request. A plain WM_CLOSE posted by
+// another program is ignored.
+inline UINT SnapStopMessage(){static UINT message=RegisterWindowMessageW(L"Win10NativePatch.SnapStop.v1");return message;}
 void NotifySettingsChanged();
 void OpenOptions(HWND owner=nullptr);
 std::wstring ModuleDirectory();
