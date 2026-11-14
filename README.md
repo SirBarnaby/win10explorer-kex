@@ -126,7 +126,7 @@ Disk use is about 4 MB per installed version. Earlier versions are kept, at abou
 ## Common questions
 
 **How does it work?**
-A small hidden program, `ExplorerMvpHost.exe`, starts when you sign in and loads `ExplorerTabs.dll` into File Explorer when a folder window opens. Inside Explorer, the add-on creates the tab strip as a child of the Explorer window. To make room for it, it redirects one internal callback in `UIRibbon.dll` and hooks two drawing functions in `uxtheme.dll` (`BeginBufferedPaint` and `EndBufferedPaint`). These changes are made in memory only; no file in the Windows folder is modified.
+A small hidden program, `ExplorerMvpHost.exe`, starts when you sign in and loads `ExplorerTabs.dll` into File Explorer when a folder window opens. A second copy of it waits without using any CPU, and starts it again within about a second if it is ended, so Task Manager shows `ExplorerMvpHost.exe` twice. Inside Explorer, the add-on creates the tab strip as a child of the Explorer window. To make room for it, it redirects one internal callback in `UIRibbon.dll` and hooks two drawing functions in `uxtheme.dll` (`BeginBufferedPaint` and `EndBufferedPaint`). These changes are made in memory only; no file in the Windows folder is modified.
 
 **What happens after a Windows update?**
 Most monthly updates leave the two files alone, and the tabs keep working. If an update replaces `UIRibbon.dll` or `uxtheme.dll`, the add-on notices that the file is no longer the tested one and turns the title-bar tabs off, or moves them to the row under the Ribbon. Explorer then looks as it does without the add-on. Tabs come back with a release tested against the new files.
@@ -151,6 +151,7 @@ Other extensions are left alone. If the QTTabBar tab bar from this project's fir
 - Dragging a tab out to its own window can occasionally drop it back on its own strip. Drag it out again.
 - After a graphics driver reset, the strip may stay empty until the pointer moves over it. If drawing keeps failing, the window goes back to Windows' own title bar.
 - Uninstalling may need you to close open folder windows first, or to sign out once so the touchpad gestures are put back.
+- To go back to 0.1.0 while touchpad snapping is on, uninstall first. The older setup cannot stop the newer snap receiver.
 
 ## Building from source
 

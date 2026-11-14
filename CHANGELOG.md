@@ -1,18 +1,24 @@
 # Patch notes
 
-## 0.1.1 (13 November 2026)
+## 0.1.1 (14 November 2026)
 
 [ExplorerMvpSetup.exe](https://github.com/SirBarnaby/win10explorer-kex/releases/download/v0.1.1/ExplorerMvpSetup.exe)
 
 **Fixed**
 
-- Tabs could stop appearing in new folder windows until the next sign-in. Setup and Options started the hidden starter as their own child process; when setup had been run from a terminal, a script or a remote tool, Windows ended the starter together with that program. The starter and the snap receiver are now started by the Windows desktop itself, so they keep running.
-- The starter checks folder windows again when Explorer restarts or starts after it.
+- Tabs could stop appearing in new folder windows until the next sign-in. When setup or Options was run from a terminal, a script or a remote tool, Windows ended the hidden starter together with that program. In that case setup now has the Windows desktop start it, so it keeps running.
+- If the starter is ended anyway, for example from Task Manager, it comes back within about a second. A second, idle copy watches it; it uses no CPU while it waits. After three quick failures in a row it stops trying until you sign in again or apply settings in Options or setup.
+- The starter and the snap receiver no longer quit when another program sends them a plain close message. They stop only when setup, Options or sign-out asks them to.
+- The starter checks folder windows again when Explorer restarts, or when Explorer starts after it.
 
 **Changed**
 
-- Touchpad snapping is an optional extra and is off on a new install. Turn it on in Options or tick it in setup. An update keeps the choice you already made.
+- Touchpad snapping is an optional extra and is off on a new install. Turn it on with **Touchpad snap gestures** in Options, or tick it in setup. An update keeps the choice you already made, and all your other settings.
 - While snapping is off, its receiver does not run and has no startup entry.
+
+**Known issue**
+
+- To go back to 0.1.0 while touchpad snapping is on, uninstall first. The older setup cannot stop the newer snap receiver.
 
 ## 0.1.0 (12 November 2026)
 
