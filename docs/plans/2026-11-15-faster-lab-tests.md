@@ -1,6 +1,22 @@
 # Plan: faster Sandbox tests without weaker tests
 
-Status: proposal, 15 November 2026. Nothing here is built yet.
+Status: steps 1-3 built on 15 November 2026 (lab scripts and the snap fixture; no shipped binary changed); validation runs in progress. Steps 4-5 not started.
+
+## What was built
+
+- `sandbox/Invoke-LabRun.ps1`: one host command for a whole lab cycle (fresh guest through WMI, component gate, stages, records into an evidence folder, guest closes itself). Exit code 0 / 1 / 2 = passed / stage failed / lab error.
+- `Close-Guest.ps1` (guest): `shutdown /s /t 0 /f`. Verified: the Sandbox window closes by itself in about 12 s.
+- `Lab-Common.ps1` (guest): `Open-LabFrame` waits for the exact new folder window (by folder URL, loaded state) instead of a fixed sleep and a single look; used by every stage that opens a frame. `Install-LabRelease` lets final-combined install the release itself when run alone.
+- `Start-NormalShell.ps1`: the sign-in shell's parent (userinit.exe) exits right after sign-in, so a shell with no live parent is the normal one. It is no longer ended and restarted, which had made later expanded/caption-ink checks fail.
+- Snap fixture (`native/SnapIntegrationTests.cpp`): focus is taken with thread input attached, verified, retried up to 3 times and each attempt traced; Snap Assist is dismissed when it takes focus after a snap; sleeps after snaps and divider drags became waits for the frame to settle, bounded by the old values; each 150 ms budget is judged on the median of 3 runs (all recorded), and "no restored middle" must hold on every run.
+- Footprint: 30 s idle + 30 s churn, CPU from `QueryProcessCycleTime` converted with a calibrated cycles-per-ms, so a 0.05 % budget is measurable in 30 s (millisecond CPU time ticks in 15.6 ms steps).
+- Suite start: the quiet-processor wait is capped at 90 s (fresh guests measured 19-26 s).
+- Setup and migration record how long each setup call takes, and the frida launcher records where its time goes (`timingMs`), to decide step 4 on data.
+
+What was not changed, on purpose:
+
+- strip-timing keeps its fixed 1.8 s / 2.2 s switch rounds. `sandbox/Analyze-Timing.ps1` counts product marks inside each input-to-next-input window, so a shorter window would change what is measured, not only how long it takes.
+- The behaviour-mode waits in final-combined stay until the parity run shows the frame waits alone are not enough.
 
 ## Where the time goes today
 
@@ -56,7 +72,7 @@ This is where most reruns come from. Each change makes the tests both faster and
 
 | Stage | Change | Estimate |
 | --- | --- | --- |
-| strip-timing | state waits in the 13 switch rounds and phases | 277 → ~90 s |
+| strip-timing | kept as is: the analyser's windows are the fixed waits (see "What was built") | 277 s |
 | final-combined | state waits in the 8 behaviour runs | 289 → ~140 s |
 | strip-overflow, -reorder, -drag, -switching | state waits | 277 → ~130 s |
 | footprint | 30 s idle + 30 s churn, measured by CPU cycles and wake-ups instead of milliseconds | 309 → ~90 s |
@@ -69,7 +85,7 @@ Notes:
 - Footprint: a 30 s window still catches anything that wakes more often than every 30 s. CPU cycle counts (`QueryProcessCycleTime`) are far more precise than millisecond CPU time, so the shorter window loses no sensitivity for what the check is for: an idle starter that does not spin.
 - Native spoof launcher: Microsoft Detours (open source, MIT) or a small injected hook on `RtlGetVersion`. It does the same thing frida does today, without starting Python and the frida runtime 11 times. Measure frida's share first; if it is small, skip this item.
 
-Estimated result: a full suite of about 12-14 minutes instead of 31.5.
+Estimated result: a full suite of about 15-17 minutes instead of 31.5 (strip-timing stays at its length).
 
 ## Step 4: run less on small releases
 
