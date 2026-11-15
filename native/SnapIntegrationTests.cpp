@@ -55,37 +55,20 @@ LRESULT CALLBACK WindowProc(HWND h,UINT m,WPARAM w,LPARAM l){
 }
 RECT Frame(HWND h){RECT r{};if(FAILED(DwmGetWindowAttribute(h,DWMWA_EXTENDED_FRAME_BOUNDS,&r,sizeof(r))))GetWindowRect(h,&r);return r;}
 bool Near(long a,long b){return abs(a-b)<=3;}
-// Waits for a state instead of a fixed time: returns as soon as `condition`
-// holds, or false once `ms` has passed. The old fixed wait is the bound.
-template<class Condition> bool WaitUntil(Condition condition,unsigned ms){
-    const ULONGLONG until=GetTickCount64()+ms;
-    for(;;){if(condition())return true;if(GetTickCount64()>=until)return false;Pump(10);}
-}
-bool SnapAssistShown(){
-    wchar_t name[64]{};GetClassNameW(GetForegroundWindow(),name,64);
-    return !wcscmp(name,L"MultitaskingViewFrame")||!wcscmp(name,L"ForegroundStaging");
-}
 bool DismissSnapAssist(){
     // Windows 10 Snap Assist offers windows for the other half after a snap.
     // A user dismisses it before acting on another window; so does the fixture.
-    if(!SnapAssistShown())return false;
+    wchar_t name[64]{};GetClassNameW(GetForegroundWindow(),name,64);
+    if(wcscmp(name,L"MultitaskingViewFrame")&&wcscmp(name,L"ForegroundStaging"))return false;
     INPUT esc[2]{};for(auto& i:esc){i.type=INPUT_KEYBOARD;i.ki.wVk=VK_ESCAPE;}esc[1].ki.dwFlags=KEYEVENTF_KEYUP;
-    SendInput(2,esc,sizeof(INPUT));WaitUntil([]{return !SnapAssistShown();},600);Pump(50);trace.push_back("snap assist dismissed");return true;
+    SendInput(2,esc,sizeof(INPUT));Pump(400);trace.push_back("snap assist dismissed");return true;
 }
-// Snap Assist opens a few hundred milliseconds after a side snap. Meeting it
-// here, rather than during the next command, keeps that command's focus from
-// being taken mid-way (15 Nov 2026: "--apply right" cancelled by it).
-void SettleSnapAssist(unsigned ms=700){if(WaitUntil(SnapAssistShown,ms))DismissSnapAssist();}
-// Windows lets a process take the foreground only in some states. Joining the
-// current foreground thread's input for the call is the documented way in.
-bool TakeForeground(HWND h){
-    HWND current=GetForegroundWindow();const DWORD self=GetCurrentThreadId(),other=current?GetWindowThreadProcessId(current,nullptr):0;
-    const bool joined=other&&other!=self&&AttachThreadInput(self,other,TRUE);
-    BringWindowToTop(h);SetForegroundWindow(h);
-    if(joined)AttachThreadInput(self,other,FALSE);
-    return WaitUntil([h]{return GetForegroundWindow()==h;},500);
-}
-bool ClickToFront(HWND h){
+bool Focus(HWND h){
+    DismissSnapAssist();
+    BOOL cloaked{};DwmGetWindowAttribute(h,DWMWA_CLOAKED,&cloaked,sizeof(cloaked));
+    trace.push_back("visible="+std::to_string(IsWindowVisible(h))+" enabled="+std::to_string(IsWindowEnabled(h))+" cloaked="+std::to_string(cloaked)+" style="+std::to_string(GetWindowLongPtrW(h,GWL_STYLE))+" ex="+std::to_string(GetWindowLongPtrW(h,GWL_EXSTYLE)));
+    SetForegroundWindow(h);Pump(100);
+    if(GetForegroundWindow()==h)return true;
     SetWindowPos(h,HWND_TOPMOST,0,0,0,0,SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE);
     RECT r=Frame(h);BOOL cursor=SetCursorPos((r.left+r.right)/2,(r.top+r.bottom)/2);DWORD cursorError=GetLastError();
     INPUT click[2]{};for(auto& i:click)i.type=INPUT_MOUSE;
@@ -94,31 +77,10 @@ bool ClickToFront(HWND h){
     POINT point{};GetCursorPos(&point);HWND hit=WindowFromPoint(point);wchar_t hitClass[100]{};GetClassNameW(hit,hitClass,100);
     std::string type;for(auto ch:hitClass){if(!ch)break;type+=ch<128?static_cast<char>(ch):'?';}
     trace.push_back("click sent="+std::to_string(sent)+" error="+std::to_string(inputError)+" cursor="+std::to_string(cursor)+" cursorError="+std::to_string(cursorError)+" x="+std::to_string(point.x)+" y="+std::to_string(point.y)+" hit="+std::to_string(reinterpret_cast<ULONG_PTR>(hit))+" class="+type);
-    bool focused=sent==2&&WaitUntil([h]{return GetForegroundWindow()==h;},500);
+    if(sent!=2)return false;
+    Pump(200);bool focused=GetForegroundWindow()==h;
     SetWindowPos(h,HWND_NOTOPMOST,0,0,0,0,SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE);
     return focused;
-}
-// Puts `h` in front for the next command. Up to three attempts, each recorded
-// in the trace; the product checks that follow are unchanged.
-bool Focus(HWND h){
-    for(int attempt=1;attempt<=3;++attempt){
-        DismissSnapAssist();
-        BOOL cloaked{};DwmGetWindowAttribute(h,DWMWA_CLOAKED,&cloaked,sizeof(cloaked));
-        trace.push_back("visible="+std::to_string(IsWindowVisible(h))+" enabled="+std::to_string(IsWindowEnabled(h))+" cloaked="+std::to_string(cloaked)+" style="+std::to_string(GetWindowLongPtrW(h,GWL_STYLE))+" ex="+std::to_string(GetWindowLongPtrW(h,GWL_EXSTYLE)));
-        if(TakeForeground(h)||ClickToFront(h)){if(attempt>1)trace.push_back("focus attempt="+std::to_string(attempt));return true;}
-        wchar_t name[64]{};GetClassNameW(GetForegroundWindow(),name,64);std::string fg;for(wchar_t c:name){if(!c)break;fg+=c<128?static_cast<char>(c):'?';}
-        trace.push_back("focus attempt="+std::to_string(attempt)+" failed fg="+fg);
-    }
-    return false;
-}
-// After a command that may move `h`: returns once its frame has changed and
-// then held still for 150 ms, or after `ms` when nothing moves (a check that
-// expects no movement waits the full bound, as before).
-void WaitSettled(HWND h,RECT before,BOOL zoomedBefore,unsigned ms){
-    const ULONGLONG start=GetTickCount64();
-    if(!WaitUntil([&]{RECT now=Frame(h);return !EqualRect(&now,&before)||IsZoomed(h)!=zoomedBefore;},ms))return;
-    RECT last=Frame(h);ULONGLONG still=GetTickCount64();
-    while(GetTickCount64()-start<ms+600){Pump(10);RECT now=Frame(h);if(!EqualRect(&now,&last)){last=now;still=GetTickCount64();}else if(GetTickCount64()-still>=150)break;}
 }
 bool NativeSide(HWND h,WORD key){
     bool focused=Focus(h);
@@ -126,9 +88,8 @@ bool NativeSide(HWND h,WORD key){
     if(!focused)return false;
     INPUT in[4]{};for(auto& i:in)i.type=INPUT_KEYBOARD;
     in[0].ki.wVk=VK_LWIN;in[1].ki.wVk=key;in[2].ki.wVk=key;in[2].ki.dwFlags=KEYEVENTF_KEYUP;in[3].ki.wVk=VK_LWIN;in[3].ki.dwFlags=KEYEVENTF_KEYUP;
-    RECT before=Frame(h);const BOOL zoomed=IsZoomed(h);
     UINT sent=SendInput(4,in,sizeof(INPUT));DWORD error=GetLastError();
-    WaitSettled(h,before,zoomed,1000);SettleSnapAssist();
+    Pump(1000);
     trace.push_back("sent="+std::to_string(sent)+" error="+std::to_string(error)+" arranged="+std::to_string(arranged(h))+" zoomed="+std::to_string(IsZoomed(h)));
     return sent==4&&arranged&&arranged(h);
 }
@@ -157,7 +118,7 @@ bool DragDivider(long from,long to,WORD immediate=0){
     trace.push_back("divider requestedFrom="+std::to_string(from)+" currentLeft="+std::to_string(startLeft.right)+" currentRight="+std::to_string(startRight.left)+" target="+std::to_string(to));
     from=startLeft.right-1;
     sizing=false;
-    bool delivered=false;std::atomic<bool> done=false;
+    bool delivered=false;
     std::thread input([&]{
         MovePointer(from,y);Sleep(900);
         HWND hit=WindowFromPoint(POINT{from,y});wchar_t type[128]{};GetClassNameW(hit,type,128);std::string name;for(wchar_t c:type){if(!c)break;name+=c<128?static_cast<char>(c):'?';}
@@ -175,11 +136,9 @@ bool DragDivider(long from,long to,WORD immediate=0){
         ULONGLONG ended=GetTickCount64()+1500;while(sizing&&GetTickCount64()<ended)Sleep(5);
         releasedBoundary=Frame(windows[0]).right;
         if(immediate)SendGestureKeys(immediate);
-        delivered=down&&up;done=true;
+        delivered=down&&up;
     });
-    // The input thread's own steps are bounded (about 4.3 s at most); wait for
-    // it to finish instead of a fixed 4.4 s, then let the frames settle.
-    WaitUntil([&]{return done.load();},6000);input.join();Pump(300);
+    Pump(4400);input.join();Pump(300);
     trace.push_back("divider afterLeft="+std::to_string(Frame(windows[0]).right)+" afterRight="+std::to_string(Frame(windows[1]).left));return delivered;
 }
 bool PairAt(long boundary){RECT a=Frame(windows[0]),b=Frame(windows[1]);return Near(a.left,work.left)&&Near(a.right,boundary)&&Near(b.left,boundary)&&Near(b.right,work.right)&&Near(a.top,work.top)&&Near(b.top,work.top)&&Near(a.bottom,work.bottom)&&Near(b.bottom,work.bottom);}
@@ -201,7 +160,6 @@ bool Product(HWND h,const wchar_t* action){
     HWND fg=GetForegroundWindow();wchar_t fgClass[64]{};GetClassNameW(fg,fgClass,64);std::string fgName;for(wchar_t c:fgClass){if(!c)break;fgName+=c<128?static_cast<char>(c):'?';}
     RECT f=Frame(h);
     trace.push_back("product status="+std::to_string(status)+" arranged="+std::to_string(arranged(h))+" frame="+Rect(f)+" fg="+fgName);
-    if(status==0)SettleSnapAssist();
     return status==0;
 }
 bool SendGestureKeys(WORD arrow){
@@ -212,8 +170,7 @@ bool SendGestureKeys(WORD arrow){
 }
 bool Gesture(HWND h,WORD arrow){
     if(!Focus(h))return false;
-    RECT before=Frame(h);const BOOL zoomed=IsZoomed(h);
-    bool sent=SendGestureKeys(arrow);WaitSettled(h,before,zoomed,1100);SettleSnapAssist(400);return sent;
+    bool sent=SendGestureKeys(arrow);Pump(1100);return sent;
 }
 MotionRun MeasureGesture(const char* name,WORD arrow,RECT destination){
     bool focused=Focus(windows[0]);motionSamples.clear();motionStart=GetTickCount64();measuring=true;
@@ -227,7 +184,7 @@ MotionRun MeasureGesture(const char* name,WORD arrow,RECT destination){
     unsigned middle=0;for(const auto& sample:motionSamples)if(sample.frame.left>work.left+3&&sample.frame.right<work.right-3)++middle;
     RECT finalFrame=Frame(windows[0]);
     trace.push_back(std::string(name)+" final="+std::to_string(finalFrame.left)+","+std::to_string(finalFrame.top)+","+std::to_string(finalFrame.right)+","+std::to_string(finalFrame.bottom)+" foreground="+std::to_string(reinterpret_cast<ULONG_PTR>(GetForegroundWindow()))+" arranged="+std::to_string(arranged(windows[0])));
-    MotionRun run{name,finished?elapsed:2000,middle};motionRuns.push_back(run);Pump(150);SettleSnapAssist(500);return run;
+    MotionRun run{name,finished?elapsed:2000,middle};motionRuns.push_back(run);Pump(400);return run;
 }
 std::string Rect(const RECT& r){return "["+std::to_string(r.left)+","+std::to_string(r.top)+","+std::to_string(r.right)+","+std::to_string(r.bottom)+"]";}
 }
@@ -273,36 +230,26 @@ int wmain(int argc,wchar_t** argv){
     ULONGLONG productStartMs=GetTickCount64()-started;
     check("product_enters_native_snap_from_floating",productStart&&arranged(windows[0])&&arranged(windows[1]));
     check("product_initial_sides_are_complementary",PairAt(snap::Tile(work,false,0,startingShare).right));
-    // Each 150 ms motion budget is judged on the median of three runs, all of
-    // them recorded in motionRuns: one slow guest frame no longer fails it, a
-    // slow product still does. "No restored middle" must hold on every run.
-    auto restoreFloating=[&]{for(int i=0;i<2;++i){ShowWindow(windows[i],SW_RESTORE);SetWindowPos(windows[i],nullptr,work.left+80+i*200,work.top+80+i*70,650,400,SWP_NOACTIVATE|SWP_NOZORDER);}Pump(300);};
-    auto median=[](std::vector<ULONGLONG> values){std::sort(values.begin(),values.end());return values[values.size()/2];};
-    const RECT tileLeft=snap::Tile(work,false,0,startingShare),tileRight=snap::Tile(work,true,0,startingShare);
-    std::vector<ULONGLONG> floatingMs,rightMs,leftMs,maximizedMs;unsigned rightMiddle=0,leftMiddle=0,maximizedMiddle=0;
-    for(int run=0;run<3;++run){restoreFloating();floatingMs.push_back(MeasureGesture("floating_to_left",VK_LEFT,tileLeft).ms);}
-    check("floating_snap_completes_within_150_ms",median(floatingMs)<150);
-    for(int run=0;run<3;++run){
-        auto right=MeasureGesture("left_to_right",VK_RIGHT,tileRight);rightMs.push_back(right.ms);rightMiddle+=right.middle;
-        auto left=MeasureGesture("right_to_left",VK_LEFT,tileLeft);leftMs.push_back(left.ms);leftMiddle+=left.middle;
-    }
-    check("left_to_right_has_no_restored_middle",rightMiddle==0);
-    check("left_to_right_completes_within_150_ms",median(rightMs)<150);
-    check("right_to_left_has_no_restored_middle",leftMiddle==0);
-    check("right_to_left_completes_within_150_ms",median(leftMs)<150);
-    for(int run=0;run<3;++run){
-        ShowWindow(windows[0],SW_MAXIMIZE);Pump(300);
-        auto maximized=MeasureGesture("maximized_to_left",VK_LEFT,tileLeft);maximizedMs.push_back(maximized.ms);maximizedMiddle+=maximized.middle;
-    }
-    check("maximized_snap_has_no_restored_middle",maximizedMiddle==0);
-    check("maximized_snap_completes_within_150_ms",median(maximizedMs)<150);
+    for(int i=0;i<2;++i){ShowWindow(windows[i],SW_RESTORE);SetWindowPos(windows[i],nullptr,work.left+80+i*200,work.top+80+i*70,650,400,SWP_NOACTIVATE|SWP_NOZORDER);}Pump(300);
+    auto floating=MeasureGesture("floating_to_left",VK_LEFT,snap::Tile(work,false,0,startingShare));
+    check("floating_snap_completes_within_150_ms",floating.ms<150);
+    auto right=MeasureGesture("left_to_right",VK_RIGHT,snap::Tile(work,true,0,startingShare));
+    check("left_to_right_has_no_restored_middle",right.middle==0);
+    check("left_to_right_completes_within_150_ms",right.ms<150);
+    auto left=MeasureGesture("right_to_left",VK_LEFT,snap::Tile(work,false,0,startingShare));
+    check("right_to_left_has_no_restored_middle",left.middle==0);
+    check("right_to_left_completes_within_150_ms",left.ms<150);
+    ShowWindow(windows[0],SW_MAXIMIZE);Pump(300);
+    auto maximized=MeasureGesture("maximized_to_left",VK_LEFT,snap::Tile(work,false,0,startingShare));
+    check("maximized_snap_has_no_restored_middle",maximized.middle==0);
+    check("maximized_snap_completes_within_150_ms",maximized.ms<150);
     for(int i=0;i<2;++i){ShowWindow(windows[i],SW_RESTORE);SetWindowPos(windows[i],nullptr,work.left+80+i*200,work.top+80+i*70,650,400,SWP_NOACTIVATE|SWP_NOZORDER);}Pump(300);
     bool native=NativeSide(windows[0],VK_LEFT)&&NativeSide(windows[1],VK_RIGHT);
     check("native_route_arranges_both_windows",native);
     long half=work.left+(work.right-work.left)/2,forty=work.left+(work.right-work.left)*4/10,sixty=work.left+(work.right-work.left)*6/10;
     check("native_pair_starts_complementary",PairAt(half));
-    for(int i=0;i<2;++i){RECT o{},client{};GetWindowRect(windows[i],&o);GetClientRect(windows[i],&client);
-        trace.push_back("native"+std::to_string(i)+" outer="+Rect(o)+" frame="+Rect(Frame(windows[i]))+" client="+Rect(client));}
+    for(int i=0;i<2;++i){RECT o{},c{};GetWindowRect(windows[i],&o);GetClientRect(windows[i],&c);
+        trace.push_back("native"+std::to_string(i)+" outer="+Rect(o)+" frame="+Rect(Frame(windows[i]))+" client="+Rect(c));}
     bool firstDrag=native&&DragDivider(Frame(windows[0]).right-1,forty);
     RECT nativeLeft=Frame(windows[0]),nativeRight=Frame(windows[1]);
     check("windows_shared_divider_resizes_both",firstDrag&&SharedResize(half,forty));
@@ -311,8 +258,8 @@ int wmain(int argc,wchar_t** argv){
     DWORD firstShare=preferences.Load(display);
     check("native_user_resize_is_remembered",!display.empty()&&Near(snap::Tile(work,false,0,firstShare).right,nativeLeft.right));
     bool positioned=Place(windows[0],RECT{work.left,work.top,half,work.bottom})&&Place(windows[1],RECT{half,work.top,work.right,work.bottom});Pump(500);
-    for(int i=0;i<2;++i){RECT o{},client{};GetWindowRect(windows[i],&o);GetClientRect(windows[i],&client);
-        trace.push_back("placed"+std::to_string(i)+" outer="+Rect(o)+" frame="+Rect(Frame(windows[i]))+" client="+Rect(client));}
+    for(int i=0;i<2;++i){RECT o{},c{};GetWindowRect(windows[i],&o);GetClientRect(windows[i],&c);
+        trace.push_back("placed"+std::to_string(i)+" outer="+Rect(o)+" frame="+Rect(Frame(windows[i]))+" client="+Rect(c));}
     check("setwindowpos_preserves_arranged_state",positioned&&arranged(windows[0])&&arranged(windows[1]));
     check("adjusted_pair_has_complementary_frames",PairAt(half));
     check("programmatic_adjustment_does_not_replace_preference",preferences.Load(display)==firstShare);
