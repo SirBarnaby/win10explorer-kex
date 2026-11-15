@@ -101,7 +101,7 @@ $basis=[ordered]@{
  snapping="snap-generic success=$($g['snap-generic.json'].success)"
  combinedExplorerSnapping="snap-explorer-pair success=$($g['snap-explorer-pair.json'].success) with two real Explorer frames carrying the active header"
  setupRehearsal='setup-rehearsal: install, update with multi-tab windows, tabs off/on, cancelled stop, legacy block'
- switching="switching $(ChecksOf 'switching') checks; timing fixture $(ChecksOf 'timing'); logs evidence/refine-20261110/u10/guest/timing-*.log"
+ switching="switching $(ChecksOf 'switching') checks; timing fixture $(ChecksOf 'timing'); logs $((Relative $EvidenceDirectory) -replace '\\','/')/timing-*.log"
  overflow="overflow $(ChecksOf 'overflow') checks with $($overflow.tabs) tabs at $($overflow.dpi) DPI, tab width $($overflow.tabWidth) px"
  motion="reorder $(ChecksOf 'reorder') (motion on $($reorder.motionOnMs) ms, off $($reorder.motionOffMs) ms), physical drag $(ChecksOf 'drag'), Animate tabs option mirrors config"
  colours="caption-ink harness exit $($ink.exit)"

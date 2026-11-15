@@ -1,6 +1,6 @@
 # Patch notes
 
-## 0.1.1 (14 November 2026)
+## 0.1.1 (15 November 2026)
 
 [ExplorerMvpSetup.exe](https://github.com/SirBarnaby/win10explorer-kex/releases/download/v0.1.1/ExplorerMvpSetup.exe)
 
